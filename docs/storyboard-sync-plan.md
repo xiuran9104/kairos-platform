@@ -10,7 +10,7 @@
 
 ### 已完成
 
-- 完成 Rust Toon 与 Toonflow-app 分镜制作页面、接口和数据结构的首轮对比。
+- 完成 Kairos Platform 与 Toonflow-app 分镜制作页面、接口和数据结构的首轮对比。
 - 新增独立 `StoryboardPanel.vue`，避免继续把分镜交互堆入项目详情页。
 - 分镜卡片已接入：
   - 单条选择与全选。
@@ -31,7 +31,7 @@
   - 删除空视频轨道。
   - 非空轨道重新汇总时长。
 - `cargo fmt --check` 通过。
-- `cargo check -p rust-toon-toon-server` 通过；仅存在仓库原有 warning。
+- `cargo check -p kairos-platform-toon-server` 通过；仅存在仓库原有 warning。
 - 新增分镜组件及本次涉及的模板没有新增 TypeScript 报错。
 
 ### 当前验证限制
@@ -52,7 +52,7 @@
    - 分镜卡片选择与批量操作。
    - 单条生成、失败状态和重试。
    - 合成预览与图片编辑流入口。
-4. 在 Rust Toon 测试项目中准备可恢复的分镜数据，验证：
+4. 在 Kairos Platform 测试项目中准备可恢复的分镜数据，验证：
    - 同名 Track 是否共享一个 `trackId`。
    - 轨道时长是否等于组内分镜时长总和。
    - 轮询是否从“生成中”正确收敛到“已完成”或“生成失败”。
@@ -99,7 +99,7 @@ pnpm --dir apps/web --filter @vben/web-antd run build
 ## 建议实施顺序
 
 1. 完成 Toonflow-app 启动和浏览器实测。
-2. 完成 Rust Toon P0 端到端测试及后端集成测试。
+2. 完成 Kairos Platform P0 端到端测试及后端集成测试。
 3. 修复前端全量 typecheck。
 4. 实现图片编辑流回写与预览下载。
 5. 实施 P1 布局和 Track 分组。

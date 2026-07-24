@@ -19,14 +19,20 @@ members = [
     "crates/modules/system-server",
     "crates/modules/toon-api",
     "crates/modules/toon-server",
+    "crates/modules/pent-api",
+    "crates/modules/pent-core",
+    "crates/modules/pent-server",
+    "crates/modules/scan-api",
+    "crates/modules/scan-server",
     "services/gateway",
+    "services/pent-agent",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://example.com/rust-toon"
+repository = "https://example.com/kairos-platform"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -42,28 +48,34 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
+ipnetwork = "0.20"
 rand_core = { version = "0.6", features = ["getrandom"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 redis = { version = "0.32", default-features = false, features = ["aio", "tokio-comp"] }
 rust_xlsxwriter = "0.96"
-rust-toon-framework-common = { path = "crates/framework/common" }
-rust-toon-framework-database = { path = "crates/framework/database" }
-rust-toon-framework-mq = { path = "crates/framework/mq" }
-rust-toon-framework-redis = { path = "crates/framework/redis" }
-rust-toon-framework-security = { path = "crates/framework/security" }
-rust-toon-framework-telemetry = { path = "crates/framework/telemetry" }
-rust-toon-framework-tenant = { path = "crates/framework/tenant" }
-rust-toon-framework-web = { path = "crates/framework/web" }
-rust-toon-infra-api = { path = "crates/modules/infra-api" }
-rust-toon-infra-server = { path = "crates/modules/infra-server" }
-rust-toon-ai-api = { path = "crates/modules/ai-api" }
-rust-toon-ai-server = { path = "crates/modules/ai-server" }
-rust-toon-media-api = { path = "crates/modules/media-api" }
-rust-toon-media-server = { path = "crates/modules/media-server" }
-rust-toon-system-api = { path = "crates/modules/system-api" }
-rust-toon-system-server = { path = "crates/modules/system-server" }
-rust-toon-toon-api = { path = "crates/modules/toon-api" }
-rust-toon-toon-server = { path = "crates/modules/toon-server" }
+kairos-platform-framework-common = { path = "crates/framework/common" }
+kairos-platform-framework-database = { path = "crates/framework/database" }
+kairos-platform-framework-mq = { path = "crates/framework/mq" }
+kairos-platform-framework-redis = { path = "crates/framework/redis" }
+kairos-platform-framework-security = { path = "crates/framework/security" }
+kairos-platform-framework-telemetry = { path = "crates/framework/telemetry" }
+kairos-platform-framework-tenant = { path = "crates/framework/tenant" }
+kairos-platform-framework-web = { path = "crates/framework/web" }
+kairos-platform-infra-api = { path = "crates/modules/infra-api" }
+kairos-platform-infra-server = { path = "crates/modules/infra-server" }
+kairos-platform-ai-api = { path = "crates/modules/ai-api" }
+kairos-platform-ai-server = { path = "crates/modules/ai-server" }
+kairos-platform-media-api = { path = "crates/modules/media-api" }
+kairos-platform-media-server = { path = "crates/modules/media-server" }
+kairos-platform-system-api = { path = "crates/modules/system-api" }
+kairos-platform-system-server = { path = "crates/modules/system-server" }
+kairos-platform-toon-api = { path = "crates/modules/toon-api" }
+kairos-platform-toon-server = { path = "crates/modules/toon-server" }
+kairos-platform-pent-api = { path = "crates/modules/pent-api" }
+kairos-platform-pent-core = { path = "crates/modules/pent-core" }
+kairos-platform-pent-server = { path = "crates/modules/pent-server" }
+kairos-platform-scan-api = { path = "crates/modules/scan-api" }
+kairos-platform-scan-server = { path = "crates/modules/scan-server" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

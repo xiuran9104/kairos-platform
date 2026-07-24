@@ -6,7 +6,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use rust_toon_framework_database::PgPool;
+use kairos_platform_framework_database::PgPool;
 
 #[derive(Clone)]
 pub struct AuditState {
@@ -71,7 +71,7 @@ pub async fn record(
                 trace_id, application_name, request_method, request_url,
                 user_agent, operate_module, begin_time, end_time, duration,
                 result_code, result_msg
-             ) VALUES($1,'rust-toon-gateway',$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+             ) VALUES($1,'kairos-platform-gateway',$2,$3,$4,$5,$6,$7,$8,$9,$10)",
         )
         .bind(trace_id)
         .bind(method)

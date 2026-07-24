@@ -6,23 +6,44 @@ This file is the handoff guide for AI coding agents working in this repository. 
 
 - Backend: Rust workspace, gateway entrypoint at `services/gateway`.
 - Frontend: Vben Admin app at `apps/web`, main app package `@vben/web-antd`.
-- Database migrations: `sql/postgresql`, executed automatically by the Rust gateway on startup. `0001_initial.sql` is the consolidated schema and baseline data.
-- Bootstrap reference: `sql/bootstrap/current.sql` is a reference-only `pg_dump` snapshot and is never loaded by the application. The migration chain is sufficient to initialize a new server without `current.sql`.
+- Database bootstrap: `sql/postgresql/0001_initial.sql` is the complete `pg_dump` snapshot and the sole initialization source for a new PostgreSQL data volume.
+- Numbered files such as `0002_*.sql` may be created temporarily while developing or upgrading an existing database. The gateway does not execute them automatically.
 - Local infrastructure: PostgreSQL, Redis, NATS, and MinIO via `script/docker/docker-compose.yml`.
 
-Do not mount `sql/postgresql` into PostgreSQL init scripts. The gateway owns database initialization through SQLx, and PostgreSQL should start as an empty database.
+Do not mount the `sql/postgresql` directory into PostgreSQL init scripts. Mount only
+`sql/postgresql/0001_initial.sql` as `/docker-entrypoint-initdb.d/0001_initial.sql`;
+the official PostgreSQL image imports it when creating a new data volume.
 
 ## Database Change Workflow
 
 Whenever a database schema or baseline-data change is made:
 
-1. Add a new numbered migration under `sql/postgresql`; never edit a migration that has already been released or applied.
-2. Make the migration idempotent so both upgraded databases and empty-database bootstrap are supported.
-3. Run `bash script/test-database-migrations.sh` to prove an empty PostgreSQL instance reaches the latest schema and baseline data without importing `current.sql`.
-4. After applying all migrations to a clean reference database, export a fresh `sql/bootstrap/current.sql` with `pg_dump` for review and comparison. The gateway must remain fully functional when this snapshot is absent.
-5. Update the expected migration count and relevant baseline assertions in `crates/framework/database/tests/migrations.rs`.
+1. Create a temporary numbered SQL file such as `0002_<change>.sql` when the
+   change needs a reviewable or repeatable upgrade step.
+2. Apply the SQL change to the maintained reference database.
+3. Run `bash script/export-database-bootstrap.sh` to replace
+   `sql/postgresql/0001_initial.sql` with a complete owner/ACL-independent dump.
+4. Review the dump for secrets and transient data that must not be distributed.
+5. After confirming the change is present in `0001_initial.sql`, delete the
+   temporary `0002_*.sql`, `0003_*.sql`, and later files that have been consolidated.
+6. Run `bash script/test-database-migrations.sh`; despite its historical name,
+   this test now proves the snapshot initializes an empty PostgreSQL instance.
+7. Update relevant bootstrap assertions in
+   `crates/framework/database/tests/migrations.rs`.
 
-The migration history was intentionally reset to the consolidated `0001_initial.sql`; existing databases must be recreated once. After this reset is released, do not rewrite `0001` or any subsequently applied migration.
+Changes to an already initialized production database must be applied through an
+explicit, reviewed upgrade procedure before exporting the next snapshot. Replacing
+`0001_initial.sql` only affects newly created PostgreSQL data volumes.
+
+Before a production database upgrade, create a timestamped backup that is separate
+from the initialization snapshot:
+
+```bash
+DATABASE_URL='postgres://...' bash script/backup-database.sh
+```
+
+Backups default to `backups/postgresql/`, are ignored by Git, and must be copied to
+durable encrypted storage according to the deployment's retention policy.
 
 ## Local Development Startup
 
@@ -35,13 +56,13 @@ docker compose -f script/docker/docker-compose.yml up -d
 Start the backend gateway:
 
 ```bash
-export DATABASE_URL='postgres://rust_toon:rust_toon@127.0.0.1:5432/rust_toon'
+export DATABASE_URL='postgres://kairos_platform:kairos_platform@127.0.0.1:5432/kairos_platform'
 export REDIS_URL='redis://127.0.0.1:6379'
 export JWT_SECRET='local-development-jwt-secret-change-me-32bytes'
 export BOOTSTRAP_ADMIN_USERNAME='admin'
 export BOOTSTRAP_ADMIN_PASSWORD='Admin#123456'
 export RUST_LOG='info'
-cargo run -p rust-toon-gateway
+cargo run -p kairos-platform-gateway
 ```
 
 In a second terminal, start the frontend:
@@ -97,8 +118,8 @@ Install prerequisites:
 Clone and enter the repository:
 
 ```bash
-git clone <repo-url> rust-toon
-cd rust-toon
+git clone <repo-url> kairos-platform
+cd kairos-platform
 ```
 
 Start infrastructure. For a single-server deployment, the repository compose file is enough:
@@ -109,10 +130,10 @@ docker compose -f script/docker/docker-compose.yml up -d
 
 For managed PostgreSQL or Redis, skip those compose services and set `DATABASE_URL` / `REDIS_URL` to the managed endpoints.
 
-Create a backend environment file outside git, for example `/etc/rust-toon/gateway.env`:
+Create a backend environment file outside git, for example `/etc/kairos-platform/gateway.env`:
 
 ```bash
-DATABASE_URL=postgres://rust_toon:rust_toon@127.0.0.1:5432/rust_toon
+DATABASE_URL=postgres://kairos_platform:kairos_platform@127.0.0.1:5432/kairos_platform
 REDIS_URL=redis://127.0.0.1:6379
 JWT_SECRET=replace-with-a-strong-random-secret-at-least-32-bytes
 GATEWAY_HOST=0.0.0.0
@@ -125,35 +146,35 @@ BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-initial-password
 Build the backend:
 
 ```bash
-cargo build --release -p rust-toon-gateway
+cargo build --release -p kairos-platform-gateway
 ```
 
-Run once manually to verify migrations and initial admin creation:
+Run once manually to verify the imported database and initial admin creation:
 
 ```bash
 set -a
-. /etc/rust-toon/gateway.env
+. /etc/kairos-platform/gateway.env
 set +a
-./target/release/rust-toon-gateway
+./target/release/kairos-platform-gateway
 ```
 
-After the first successful login, remove `BOOTSTRAP_ADMIN_PASSWORD` from `/etc/rust-toon/gateway.env` and restart the service.
+After the first successful login, remove `BOOTSTRAP_ADMIN_PASSWORD` from `/etc/kairos-platform/gateway.env` and restart the service.
 
 ## systemd Service
 
-Use systemd or another process manager in production. Example `/etc/systemd/system/rust-toon-gateway.service`:
+Use systemd or another process manager in production. Example `/etc/systemd/system/kairos-platform-gateway.service`:
 
 ```ini
 [Unit]
-Description=Rust Toon Gateway
+Description=Kairos Platform Gateway
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/rust-toon
-EnvironmentFile=/etc/rust-toon/gateway.env
-ExecStart=/opt/rust-toon/target/release/rust-toon-gateway
+WorkingDirectory=/opt/kairos-platform
+EnvironmentFile=/etc/kairos-platform/gateway.env
+ExecStart=/opt/kairos-platform/target/release/kairos-platform-gateway
 Restart=always
 RestartSec=5
 
@@ -165,8 +186,8 @@ Enable and start:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now rust-toon-gateway
-sudo systemctl status rust-toon-gateway
+sudo systemctl enable --now kairos-platform-gateway
+sudo systemctl status kairos-platform-gateway
 curl -fsS http://127.0.0.1:8080/health
 ```
 

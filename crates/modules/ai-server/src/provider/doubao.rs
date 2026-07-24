@@ -1,4 +1,4 @@
-use rust_toon_ai_api::{MediaResponse, ModelConfig};
+use kairos_platform_ai_api::{MediaResponse, ModelConfig};
 use serde_json::{Map, Value, json};
 
 pub struct DouBaoMediaProvider;
@@ -189,7 +189,7 @@ impl DouBaoMediaProvider {
 #[cfg(test)]
 mod tests {
     use super::{DouBaoMediaProvider, normalize_seedream_size};
-    use rust_toon_ai_api::ModelConfig;
+    use kairos_platform_ai_api::ModelConfig;
     use serde_json::json;
 
     fn config() -> ModelConfig {

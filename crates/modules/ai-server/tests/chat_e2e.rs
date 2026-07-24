@@ -9,8 +9,8 @@ use axum::{
     routing::post,
 };
 use http_body_util::BodyExt;
-use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
-use rust_toon_framework_security::{
+use kairos_platform_framework_database::{DatabaseConfig, connect, ensure_initialized};
+use kairos_platform_framework_security::{
     CurrentUser, DataScope, Permission, PermissionSet, SecurityConfig, TokenService,
 };
 use serde_json::{Value, json};
@@ -61,7 +61,7 @@ async fn request(app: Router, token: &str, uri: &str, value: Value) -> (StatusCo
 async fn chat_json_and_sse_persist_complete_messages() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("TEST_DATABASE_URL")?;
     let pool = connect(&DatabaseConfig::new(url, 1, 5, Duration::from_secs(10))?).await?;
-    migrate(&pool).await?;
+    ensure_initialized(&pool).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let model_url = format!("http://{}", listener.local_addr()?);
     tokio::spawn(async move {
@@ -96,7 +96,10 @@ async fn chat_json_and_sse_persist_complete_messages() -> Result<(), Box<dyn std
             data_scope: DataScope::All,
         })
         .expect("issue E2E access token");
-    let app = rust_toon_ai_server::routes(rust_toon_ai_server::AiState::new(pool.clone(), tokens));
+    let app = kairos_platform_ai_server::routes(kairos_platform_ai_server::AiState::new(
+        pool.clone(),
+        tokens,
+    ));
     let (status, body) = request(
         app.clone(),
         &token,

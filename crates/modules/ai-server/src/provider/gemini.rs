@@ -1,7 +1,7 @@
 use super::ChatProvider;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rust_toon_ai_api::{ChatRequest, ChatResponse, ModelConfig};
+use kairos_platform_ai_api::{ChatRequest, ChatResponse, ModelConfig};
 use serde_json::{Value, json};
 
 pub struct GeminiProvider;
@@ -138,7 +138,7 @@ impl GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::body;
-    use rust_toon_ai_api::{ChatMessage, ChatRequest};
+    use kairos_platform_ai_api::{ChatMessage, ChatRequest};
     #[test]
     fn maps_assistant_to_model() {
         let v = body(&ChatRequest {

@@ -1,8 +1,8 @@
 use base64::Engine;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use kairos_platform_framework_web::AppError;
 use reqwest::{Method, Url, header};
-use rust_toon_framework_web::AppError;
 use sha2::{Digest, Sha256};
 
 use axum::{
@@ -27,10 +27,11 @@ fn config() -> MinioConfig {
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string())
             .trim_end_matches('/')
             .to_string(),
-        access_key: std::env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "rust_toon".to_string()),
+        access_key: std::env::var("MINIO_ACCESS_KEY")
+            .unwrap_or_else(|_| "kairos_platform".to_string()),
         secret_key: std::env::var("MINIO_SECRET_KEY")
-            .unwrap_or_else(|_| "rust_toon_password".to_string()),
-        bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "rust-toon".to_string()),
+            .unwrap_or_else(|_| "kairos_platform_password".to_string()),
+        bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "kairos-platform".to_string()),
         region: std::env::var("MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
     }
 }
@@ -230,11 +231,11 @@ mod tests {
     async fn minio_round_trip() {
         ensure_bucket().await.expect("create test bucket");
         let key = format!("toonflow/tests/{}.txt", uuid::Uuid::new_v4());
-        let uploaded = signed_request(Method::PUT, Some(&key), b"rust-toon".to_vec())
+        let uploaded = signed_request(Method::PUT, Some(&key), b"kairos-platform".to_vec())
             .await
             .expect("upload object");
         assert!(uploaded.status().is_success());
         let (_, bytes) = read_image(&key).await.expect("read object");
-        assert_eq!(bytes, b"rust-toon");
+        assert_eq!(bytes, b"kairos-platform");
     }
 }

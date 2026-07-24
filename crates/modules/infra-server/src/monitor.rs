@@ -1,8 +1,8 @@
 use std::fs;
 
 use axum::{Json, extract::State};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_web::AppError;
 use serde_json::{Value, json};
 use sqlx::Row;
 
@@ -113,7 +113,7 @@ pub(super) async fn rust_service(State(state): State<InfraState>) -> Json<ApiRes
         .map(|entries| entries.count())
         .unwrap_or(0);
     Json(ApiResponse::new(json!({
-        "service": "rust-toon-gateway",
+        "service": "kairos-platform-gateway",
         "version": env!("CARGO_PKG_VERSION"),
         "rust": option_env!("RUSTC_VERSION").unwrap_or("Rust"),
         "processId": std::process::id(),

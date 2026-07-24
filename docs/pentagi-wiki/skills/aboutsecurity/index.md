@@ -1,0 +1,275 @@
+---
+type: skill-index
+name: aboutsecurity-skill-index
+title: AboutSecurity Compiled Skill Index
+description: Index of AboutSecurity-derived wiki skills grouped by safety classification.
+when-to-use: Use when browsing AboutSecurity-derived skills by classification and category.
+source: wiki/skills/aboutsecurity
+tags: [aboutsecurity, skills, index, llmwiki]
+related: [policies/aboutsecurity-classification, policies/codex-skill-policy]
+---
+
+# AboutSecurity Compiled Skill Index
+
+This index is generated from `wiki/skills/aboutsecurity/`. The pages are safe summaries, not verbatim upstream skill bodies.
+
+## Counts
+
+- `codex-wrapper-ok`: 34
+- `wiki-compile-review`: 158
+- `raw-only`: 54
+
+## Safe wrapper candidate
+
+- [[skills/aboutsecurity/ai-security/agent-security]] - `ai-security/agent-security`
+- [[skills/aboutsecurity/ai-security/ai-data-security]] - `ai-security/ai-data-security`
+- [[skills/aboutsecurity/ai-security/ai-identity-security]] - `ai-security/ai-identity-security`
+- [[skills/aboutsecurity/ai-security/cot-injection]] - `ai-security/cot-injection`
+- [[skills/aboutsecurity/ai-security/cross-domain-attack-chain]] - `ai-security/cross-domain-attack-chain`
+- [[skills/aboutsecurity/ai-security/mcp-security]] - `ai-security/mcp-security`
+- [[skills/aboutsecurity/ai-security/prompt-injection]] - `ai-security/prompt-injection`
+- [[skills/aboutsecurity/ai-security/prompt-jailbreak]] - `ai-security/prompt-jailbreak`
+- [[skills/aboutsecurity/ai-security/prompt-leak]] - `ai-security/prompt-leak`
+- [[skills/aboutsecurity/code-audit/java/java-audit-pipeline]] - `code-audit/java/java-audit-pipeline`
+- [[skills/aboutsecurity/code-audit/java/java-auth-config-audit]] - `code-audit/java/java-auth-config-audit`
+- [[skills/aboutsecurity/code-audit/java/java-exploit-chain]] - `code-audit/java/java-exploit-chain`
+- [[skills/aboutsecurity/code-audit/java/java-file-audit]] - `code-audit/java/java-file-audit`
+- [[skills/aboutsecurity/code-audit/java/java-framework-audit]] - `code-audit/java/java-framework-audit`
+- [[skills/aboutsecurity/code-audit/java/java-frontend-audit]] - `code-audit/java/java-frontend-audit`
+- [[skills/aboutsecurity/code-audit/java/java-injection-audit]] - `code-audit/java/java-injection-audit`
+- [[skills/aboutsecurity/code-audit/java/java-serialization-audit]] - `code-audit/java/java-serialization-audit`
+- [[skills/aboutsecurity/code-audit/php/php-audit-pipeline]] - `code-audit/php/php-audit-pipeline`
+- [[skills/aboutsecurity/code-audit/php/php-auth-config-audit]] - `code-audit/php/php-auth-config-audit`
+- [[skills/aboutsecurity/code-audit/php/php-exploit-chain]] - `code-audit/php/php-exploit-chain`
+- [[skills/aboutsecurity/code-audit/php/php-file-audit]] - `code-audit/php/php-file-audit`
+- [[skills/aboutsecurity/code-audit/php/php-framework-audit]] - `code-audit/php/php-framework-audit`
+- [[skills/aboutsecurity/code-audit/php/php-frontend-audit]] - `code-audit/php/php-frontend-audit`
+- [[skills/aboutsecurity/code-audit/php/php-injection-audit]] - `code-audit/php/php-injection-audit`
+- [[skills/aboutsecurity/code-audit/php/php-serialization-audit]] - `code-audit/php/php-serialization-audit`
+- [[skills/aboutsecurity/dfir/emergency-response]] - `dfir/emergency-response`
+- [[skills/aboutsecurity/general/efficiency-rules]] - `general/efficiency-rules`
+- [[skills/aboutsecurity/general/judge-pentest]] - `general/judge-pentest`
+- [[skills/aboutsecurity/general/local-resources]] - `general/local-resources`
+- [[skills/aboutsecurity/general/report-generate]] - `general/report-generate`
+- [[skills/aboutsecurity/recon/js-api-extract]] - `recon/js-api-extract`
+- [[skills/aboutsecurity/recon/passive-recon]] - `recon/passive-recon`
+- [[skills/aboutsecurity/recon/target-profiling]] - `recon/target-profiling`
+- [[skills/aboutsecurity/threat-intel/ioc-analysis]] - `threat-intel/ioc-analysis`
+
+## Wiki compile with review
+
+- [[skills/aboutsecurity/cloud/aliyun-pentesting]] - `cloud/aliyun-pentesting`
+- [[skills/aboutsecurity/cloud/aws-iam-policy-analysis]] - `cloud/aws-iam-policy-analysis`
+- [[skills/aboutsecurity/cloud/aws-iam-privesc]] - `cloud/aws-iam-privesc`
+- [[skills/aboutsecurity/cloud/aws-pentesting]] - `cloud/aws-pentesting`
+- [[skills/aboutsecurity/cloud/aws-post-exploit]] - `cloud/aws-post-exploit`
+- [[skills/aboutsecurity/cloud/azure-ad-attack]] - `cloud/azure-ad-attack`
+- [[skills/aboutsecurity/cloud/azure-hybrid-lateral]] - `cloud/azure-hybrid-lateral`
+- [[skills/aboutsecurity/cloud/azure-pentesting]] - `cloud/azure-pentesting`
+- [[skills/aboutsecurity/cloud/cicd-pipeline-attack]] - `cloud/cicd-pipeline-attack`
+- [[skills/aboutsecurity/cloud/cloud-aksk-exploit]] - `cloud/cloud-aksk-exploit`
+- [[skills/aboutsecurity/cloud/cloud-iam-audit]] - `cloud/cloud-iam-audit`
+- [[skills/aboutsecurity/cloud/cloud-metadata]] - `cloud/cloud-metadata`
+- [[skills/aboutsecurity/cloud/docker-pentesting]] - `cloud/docker-pentesting`
+- [[skills/aboutsecurity/cloud/gcp-exploit]] - `cloud/gcp-exploit`
+- [[skills/aboutsecurity/cloud/gcp-pentesting]] - `cloud/gcp-pentesting`
+- [[skills/aboutsecurity/cloud/gcp-workspace-pivot]] - `cloud/gcp-workspace-pivot`
+- [[skills/aboutsecurity/cloud/huawei-pentesting]] - `cloud/huawei-pentesting`
+- [[skills/aboutsecurity/cloud/k8s-container-escape]] - `cloud/k8s-container-escape`
+- [[skills/aboutsecurity/cloud/k8s-ingress-nightmare]] - `cloud/k8s-ingress-nightmare`
+- [[skills/aboutsecurity/cloud/k8s-istio-bypass]] - `cloud/k8s-istio-bypass`
+- [[skills/aboutsecurity/cloud/k8s-network-recon]] - `cloud/k8s-network-recon`
+- [[skills/aboutsecurity/cloud/k8s-sidecar-attack]] - `cloud/k8s-sidecar-attack`
+- [[skills/aboutsecurity/cloud/k8s-storage-exploit]] - `cloud/k8s-storage-exploit`
+- [[skills/aboutsecurity/cloud/k8s-webhook-abuse]] - `cloud/k8s-webhook-abuse`
+- [[skills/aboutsecurity/cloud/oss-bucket-exploit]] - `cloud/oss-bucket-exploit`
+- [[skills/aboutsecurity/cloud/serverless-attack]] - `cloud/serverless-attack`
+- [[skills/aboutsecurity/cloud/tencent-pentesting]] - `cloud/tencent-pentesting`
+- [[skills/aboutsecurity/ctf/ctf-ai-ml]] - `ctf/ctf-ai-ml`
+- [[skills/aboutsecurity/ctf/ctf-crypto]] - `ctf/ctf-crypto`
+- [[skills/aboutsecurity/ctf/ctf-flag-hunting]] - `ctf/ctf-flag-hunting`
+- [[skills/aboutsecurity/ctf/ctf-flag-verification]] - `ctf/ctf-flag-verification`
+- [[skills/aboutsecurity/ctf/ctf-forensics]] - `ctf/ctf-forensics`
+- [[skills/aboutsecurity/ctf/ctf-malware]] - `ctf/ctf-malware`
+- [[skills/aboutsecurity/ctf/ctf-misc]] - `ctf/ctf-misc`
+- [[skills/aboutsecurity/ctf/ctf-osint]] - `ctf/ctf-osint`
+- [[skills/aboutsecurity/ctf/ctf-pwn]] - `ctf/ctf-pwn`
+- [[skills/aboutsecurity/ctf/ctf-reverse]] - `ctf/ctf-reverse`
+- [[skills/aboutsecurity/ctf/ctf-solve]] - `ctf/ctf-solve`
+- [[skills/aboutsecurity/ctf/ctf-source-audit]] - `ctf/ctf-source-audit`
+- [[skills/aboutsecurity/ctf/ctf-web-methodology]] - `ctf/ctf-web-methodology`
+- [[skills/aboutsecurity/ctf/ctf-web-recon]] - `ctf/ctf-web-recon`
+- [[skills/aboutsecurity/dfir/disk-forensics-evasion]] - `dfir/disk-forensics-evasion`
+- [[skills/aboutsecurity/dfir/log-evasion]] - `dfir/log-evasion`
+- [[skills/aboutsecurity/dfir/memory-forensics-evasion]] - `dfir/memory-forensics-evasion`
+- [[skills/aboutsecurity/exploit/advanced/ai-infrastructure-attack]] - `exploit/advanced/ai-infrastructure-attack`
+- [[skills/aboutsecurity/exploit/advanced/crypto-web-attack]] - `exploit/advanced/crypto-web-attack`
+- [[skills/aboutsecurity/exploit/advanced/http-smuggling-advanced]] - `exploit/advanced/http-smuggling-advanced`
+- [[skills/aboutsecurity/exploit/advanced/ot-ics-attack]] - `exploit/advanced/ot-ics-attack`
+- [[skills/aboutsecurity/exploit/advanced/race-condition-exploit]] - `exploit/advanced/race-condition-exploit`
+- [[skills/aboutsecurity/exploit/advanced/supply-chain-attack]] - `exploit/advanced/supply-chain-attack`
+- [[skills/aboutsecurity/exploit/advanced/supply-chain-audit]] - `exploit/advanced/supply-chain-audit`
+- [[skills/aboutsecurity/exploit/auth/401-403-bypass]] - `exploit/auth/401-403-bypass`
+- [[skills/aboutsecurity/exploit/auth/cookie-analysis]] - `exploit/auth/cookie-analysis`
+- [[skills/aboutsecurity/exploit/auth/cors-misconfiguration]] - `exploit/auth/cors-misconfiguration`
+- [[skills/aboutsecurity/exploit/auth/csrf-methodology]] - `exploit/auth/csrf-methodology`
+- [[skills/aboutsecurity/exploit/auth/idor-methodology]] - `exploit/auth/idor-methodology`
+- [[skills/aboutsecurity/exploit/auth/jwt-attack-methodology]] - `exploit/auth/jwt-attack-methodology`
+- [[skills/aboutsecurity/exploit/auth/mobile-backend]] - `exploit/auth/mobile-backend`
+- [[skills/aboutsecurity/exploit/auth/oauth-sso-attack]] - `exploit/auth/oauth-sso-attack`
+- [[skills/aboutsecurity/exploit/binary/binary-exploitation-methodology]] - `exploit/binary/binary-exploitation-methodology`
+- [[skills/aboutsecurity/exploit/binary/binary-exploitation-tools]] - `exploit/binary/binary-exploitation-tools`
+- [[skills/aboutsecurity/exploit/network-service/dns-pentesting]] - `exploit/network-service/dns-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/elasticsearch-attack]] - `exploit/network-service/elasticsearch-attack`
+- [[skills/aboutsecurity/exploit/network-service/ftp-pentesting]] - `exploit/network-service/ftp-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/imap-pentesting]] - `exploit/network-service/imap-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/kafka-attack]] - `exploit/network-service/kafka-attack`
+- [[skills/aboutsecurity/exploit/network-service/kerberos-pentesting]] - `exploit/network-service/kerberos-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/ldap-pentesting]] - `exploit/network-service/ldap-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/memcache-pentesting]] - `exploit/network-service/memcache-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/mongodb-attack]] - `exploit/network-service/mongodb-attack`
+- [[skills/aboutsecurity/exploit/network-service/mssql-pentesting]] - `exploit/network-service/mssql-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/mysql-pentesting]] - `exploit/network-service/mysql-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/pop-pentesting]] - `exploit/network-service/pop-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/postgresql-attack]] - `exploit/network-service/postgresql-attack`
+- [[skills/aboutsecurity/exploit/network-service/postgresql-pentesting]] - `exploit/network-service/postgresql-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/rdp-pentesting]] - `exploit/network-service/rdp-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/redis-attack]] - `exploit/network-service/redis-attack`
+- [[skills/aboutsecurity/exploit/network-service/redis-pentesting]] - `exploit/network-service/redis-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/smb-pentesting]] - `exploit/network-service/smb-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/smtp-pentesting]] - `exploit/network-service/smtp-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/snmp-pentesting]] - `exploit/network-service/snmp-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/sqlserver-attack]] - `exploit/network-service/sqlserver-attack`
+- [[skills/aboutsecurity/exploit/network-service/ssh-pentesting]] - `exploit/network-service/ssh-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/vnc-pentesting]] - `exploit/network-service/vnc-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/voip-pentesting]] - `exploit/network-service/voip-pentesting`
+- [[skills/aboutsecurity/exploit/network-service/winrm-pentesting]] - `exploit/network-service/winrm-pentesting`
+- [[skills/aboutsecurity/exploit/web-method/api-fuzz]] - `exploit/web-method/api-fuzz`
+- [[skills/aboutsecurity/exploit/web-method/business-logic-attack]] - `exploit/web-method/business-logic-attack`
+- [[skills/aboutsecurity/exploit/web-method/cache-poisoning-smuggling]] - `exploit/web-method/cache-poisoning-smuggling`
+- [[skills/aboutsecurity/exploit/web-method/deserialization-methodology]] - `exploit/web-method/deserialization-methodology`
+- [[skills/aboutsecurity/exploit/web-method/expression-language-injection]] - `exploit/web-method/expression-language-injection`
+- [[skills/aboutsecurity/exploit/web-method/file-upload-methodology]] - `exploit/web-method/file-upload-methodology`
+- [[skills/aboutsecurity/exploit/web-method/graphql-methodology]] - `exploit/web-method/graphql-methodology`
+- [[skills/aboutsecurity/exploit/web-method/http-host-header-attacks]] - `exploit/web-method/http-host-header-attacks`
+- [[skills/aboutsecurity/exploit/web-method/information-disclosure-methodology]] - `exploit/web-method/information-disclosure-methodology`
+- [[skills/aboutsecurity/exploit/web-method/java-deserialization-methodology]] - `exploit/web-method/java-deserialization-methodology`
+- [[skills/aboutsecurity/exploit/web-method/ldap-injection]] - `exploit/web-method/ldap-injection`
+- [[skills/aboutsecurity/exploit/web-method/lfi-rfi-methodology]] - `exploit/web-method/lfi-rfi-methodology`
+- [[skills/aboutsecurity/exploit/web-method/nosql-injection]] - `exploit/web-method/nosql-injection`
+- [[skills/aboutsecurity/exploit/web-method/php-bypass]] - `exploit/web-method/php-bypass`
+- [[skills/aboutsecurity/exploit/web-method/php-type-juggling]] - `exploit/web-method/php-type-juggling`
+- [[skills/aboutsecurity/exploit/web-method/privilege-escalation-web]] - `exploit/web-method/privilege-escalation-web`
+- [[skills/aboutsecurity/exploit/web-method/prototype-pollution-exploit]] - `exploit/web-method/prototype-pollution-exploit`
+- [[skills/aboutsecurity/exploit/web-method/python-prototype-pollution]] - `exploit/web-method/python-prototype-pollution`
+- [[skills/aboutsecurity/exploit/web-method/python-web-debug]] - `exploit/web-method/python-web-debug`
+- [[skills/aboutsecurity/exploit/web-method/sql-injection-methodology]] - `exploit/web-method/sql-injection-methodology`
+- [[skills/aboutsecurity/exploit/web-method/ssrf-methodology]] - `exploit/web-method/ssrf-methodology`
+- [[skills/aboutsecurity/exploit/web-method/ssti-methodology]] - `exploit/web-method/ssti-methodology`
+- [[skills/aboutsecurity/exploit/web-method/subdomain-takeover]] - `exploit/web-method/subdomain-takeover`
+- [[skills/aboutsecurity/exploit/web-method/web-vuln-scan]] - `exploit/web-method/web-vuln-scan`
+- [[skills/aboutsecurity/exploit/web-method/websocket-attack]] - `exploit/web-method/websocket-attack`
+- [[skills/aboutsecurity/exploit/web-method/xslt-injection]] - `exploit/web-method/xslt-injection`
+- [[skills/aboutsecurity/exploit/web-method/xss-methodology]] - `exploit/web-method/xss-methodology`
+- [[skills/aboutsecurity/exploit/web-method/xxe-injection-methodology]] - `exploit/web-method/xxe-injection-methodology`
+- [[skills/aboutsecurity/general/judge-ctf]] - `general/judge-ctf`
+- [[skills/aboutsecurity/general/red-team-assessment]] - `general/red-team-assessment`
+- [[skills/aboutsecurity/hardware/firmware-analysis]] - `hardware/firmware-analysis`
+- [[skills/aboutsecurity/mobile/android-app-pentesting]] - `mobile/android-app-pentesting`
+- [[skills/aboutsecurity/mobile/ios-exploiting]] - `mobile/ios-exploiting`
+- [[skills/aboutsecurity/mobile/ios-pentesting]] - `mobile/ios-pentesting`
+- [[skills/aboutsecurity/recon/recon-full]] - `recon/recon-full`
+- [[skills/aboutsecurity/recon/social-engineering]] - `recon/social-engineering`
+- [[skills/aboutsecurity/recon/subdomain-deep]] - `recon/subdomain-deep`
+- [[skills/aboutsecurity/threat-intel/apt-emulation]] - `threat-intel/apt-emulation`
+- [[skills/aboutsecurity/threat-intel/threat-hunting-evasion]] - `threat-intel/threat-hunting-evasion`
+- [[skills/aboutsecurity/tool/adinfo-enum]] - `tool/adinfo-enum`
+- [[skills/aboutsecurity/tool/bloodhound-enum]] - `tool/bloodhound-enum`
+- [[skills/aboutsecurity/tool/browser-xterm-interaction]] - `tool/browser-xterm-interaction`
+- [[skills/aboutsecurity/tool/ccupp-password-profiler]] - `tool/ccupp-password-profiler`
+- [[skills/aboutsecurity/tool/cdk-escape]] - `tool/cdk-escape`
+- [[skills/aboutsecurity/tool/dalfox-xss]] - `tool/dalfox-xss`
+- [[skills/aboutsecurity/tool/dirsearch-fuzz]] - `tool/dirsearch-fuzz`
+- [[skills/aboutsecurity/tool/dnsx-resolve]] - `tool/dnsx-resolve`
+- [[skills/aboutsecurity/tool/ffuf-fuzz]] - `tool/ffuf-fuzz`
+- [[skills/aboutsecurity/tool/fingerprintx-probe]] - `tool/fingerprintx-probe`
+- [[skills/aboutsecurity/tool/fscan-scan]] - `tool/fscan-scan`
+- [[skills/aboutsecurity/tool/gau-urlfetch]] - `tool/gau-urlfetch`
+- [[skills/aboutsecurity/tool/githacker-git-leak]] - `tool/githacker-git-leak`
+- [[skills/aboutsecurity/tool/gogo-scan]] - `tool/gogo-scan`
+- [[skills/aboutsecurity/tool/httpx-probe]] - `tool/httpx-probe`
+- [[skills/aboutsecurity/tool/iox-proxy]] - `tool/iox-proxy`
+- [[skills/aboutsecurity/tool/k8spider]] - `tool/k8spider`
+- [[skills/aboutsecurity/tool/katana-crawl]] - `tool/katana-crawl`
+- [[skills/aboutsecurity/tool/ksubdomain-brute]] - `tool/ksubdomain-brute`
+- [[skills/aboutsecurity/tool/mapcidr-cidr]] - `tool/mapcidr-cidr`
+- [[skills/aboutsecurity/tool/masscan-scan]] - `tool/masscan-scan`
+- [[skills/aboutsecurity/tool/naabu-portscan]] - `tool/naabu-portscan`
+- [[skills/aboutsecurity/tool/nerva-scan]] - `tool/nerva-scan`
+- [[skills/aboutsecurity/tool/nikto-scan]] - `tool/nikto-scan`
+- [[skills/aboutsecurity/tool/nmap-scan]] - `tool/nmap-scan`
+- [[skills/aboutsecurity/tool/nuclei-scan]] - `tool/nuclei-scan`
+- [[skills/aboutsecurity/tool/nxc-cme]] - `tool/nxc-cme`
+- [[skills/aboutsecurity/tool/padbuster-padding-oracle]] - `tool/padbuster-padding-oracle`
+- [[skills/aboutsecurity/tool/sqlmap-advanced]] - `tool/sqlmap-advanced`
+- [[skills/aboutsecurity/tool/subfinder-recon]] - `tool/subfinder-recon`
+- [[skills/aboutsecurity/tool/tlsx-probe]] - `tool/tlsx-probe`
+- [[skills/aboutsecurity/tool/uncover-search]] - `tool/uncover-search`
+- [[skills/aboutsecurity/tool/xray-scan]] - `tool/xray-scan`
+
+## Raw-only restricted
+
+- [[skills/aboutsecurity/evasion/c2-evasion-methodology]] - `evasion/c2-evasion-methodology`
+- [[skills/aboutsecurity/evasion/evasion-research]] - `evasion/evasion-research`
+- [[skills/aboutsecurity/evasion/evasion-technique-integrate]] - `evasion/evasion-technique-integrate`
+- [[skills/aboutsecurity/evasion/shellcode-loader-generate]] - `evasion/shellcode-loader-generate`
+- [[skills/aboutsecurity/evasion/sliver-c2]] - `evasion/sliver-c2`
+- [[skills/aboutsecurity/exploit/web-method/command-injection-methodology]] - `exploit/web-method/command-injection-methodology`
+- [[skills/aboutsecurity/exploit/web-method/waf-bypass-methodology]] - `exploit/web-method/waf-bypass-methodology`
+- [[skills/aboutsecurity/exploit/web-method/webshell-deploy]] - `exploit/web-method/webshell-deploy`
+- [[skills/aboutsecurity/exploit/web-method/webshell-management]] - `exploit/web-method/webshell-management`
+- [[skills/aboutsecurity/lateral/ad-acl-abuse]] - `lateral/ad-acl-abuse`
+- [[skills/aboutsecurity/lateral/ad-delegation-attack]] - `lateral/ad-delegation-attack`
+- [[skills/aboutsecurity/lateral/ad-domain-attack]] - `lateral/ad-domain-attack`
+- [[skills/aboutsecurity/lateral/ad-persistence]] - `lateral/ad-persistence`
+- [[skills/aboutsecurity/lateral/ad-trust-attack]] - `lateral/ad-trust-attack`
+- [[skills/aboutsecurity/lateral/adcs-certipy-attack]] - `lateral/adcs-certipy-attack`
+- [[skills/aboutsecurity/lateral/cred-spray]] - `lateral/cred-spray`
+- [[skills/aboutsecurity/lateral/database-lateral-pivot]] - `lateral/database-lateral-pivot`
+- [[skills/aboutsecurity/lateral/exchange-attack]] - `lateral/exchange-attack`
+- [[skills/aboutsecurity/lateral/internal-recon]] - `lateral/internal-recon`
+- [[skills/aboutsecurity/lateral/kerberoast-attack]] - `lateral/kerberoast-attack`
+- [[skills/aboutsecurity/lateral/kerberos-advanced-attack]] - `lateral/kerberos-advanced-attack`
+- [[skills/aboutsecurity/lateral/lateral-movement]] - `lateral/lateral-movement`
+- [[skills/aboutsecurity/lateral/multi-layer-network]] - `lateral/multi-layer-network`
+- [[skills/aboutsecurity/lateral/network-poisoning-attack]] - `lateral/network-poisoning-attack`
+- [[skills/aboutsecurity/lateral/ntlm-relay-attack]] - `lateral/ntlm-relay-attack`
+- [[skills/aboutsecurity/lateral/oa-system-attack]] - `lateral/oa-system-attack`
+- [[skills/aboutsecurity/lateral/sccm-mecm-attack]] - `lateral/sccm-mecm-attack`
+- [[skills/aboutsecurity/malware/c2-beacon-analysis]] - `malware/c2-beacon-analysis`
+- [[skills/aboutsecurity/malware/malware-analysis-methodology]] - `malware/malware-analysis-methodology`
+- [[skills/aboutsecurity/malware/sandbox-evasion-implement]] - `malware/sandbox-evasion-implement`
+- [[skills/aboutsecurity/postexploit/persist-maintain]] - `postexploit/persist-maintain`
+- [[skills/aboutsecurity/postexploit/post-exploit-linux]] - `postexploit/post-exploit-linux`
+- [[skills/aboutsecurity/postexploit/post-exploit-windows]] - `postexploit/post-exploit-windows`
+- [[skills/aboutsecurity/postexploit/product/argocd-tactics]] - `postexploit/product/argocd-tactics`
+- [[skills/aboutsecurity/postexploit/product/concourse-tactics]] - `postexploit/product/concourse-tactics`
+- [[skills/aboutsecurity/postexploit/product/database-tactics]] - `postexploit/product/database-tactics`
+- [[skills/aboutsecurity/postexploit/product/harbor-tactics]] - `postexploit/product/harbor-tactics`
+- [[skills/aboutsecurity/postexploit/product/middleware-tactics]] - `postexploit/product/middleware-tactics`
+- [[skills/aboutsecurity/postexploit/product/portainer-tactics]] - `postexploit/product/portainer-tactics`
+- [[skills/aboutsecurity/postexploit/product/rabbitmq-tactics]] - `postexploit/product/rabbitmq-tactics`
+- [[skills/aboutsecurity/postexploit/product/servicemesh-tactics]] - `postexploit/product/servicemesh-tactics`
+- [[skills/aboutsecurity/postexploit/product/sonarqube-tactics]] - `postexploit/product/sonarqube-tactics`
+- [[skills/aboutsecurity/postexploit/product/terraform-tactics]] - `postexploit/product/terraform-tactics`
+- [[skills/aboutsecurity/postexploit/tool-delivery]] - `postexploit/tool-delivery`
+- [[skills/aboutsecurity/tool/cobalt-strike]] - `tool/cobalt-strike`
+- [[skills/aboutsecurity/tool/hashcat-crack]] - `tool/hashcat-crack`
+- [[skills/aboutsecurity/tool/hydra-brute]] - `tool/hydra-brute`
+- [[skills/aboutsecurity/tool/impacket-toolkit]] - `tool/impacket-toolkit`
+- [[skills/aboutsecurity/tool/john-crack]] - `tool/john-crack`
+- [[skills/aboutsecurity/tool/msf-oneshot]] - `tool/msf-oneshot`
+- [[skills/aboutsecurity/tool/mythic-c2]] - `tool/mythic-c2`
+- [[skills/aboutsecurity/tool/responder-poison]] - `tool/responder-poison`
+- [[skills/aboutsecurity/tool/spray-dir-brute]] - `tool/spray-dir-brute`
+- [[skills/aboutsecurity/tool/zombie-brute]] - `tool/zombie-brute`

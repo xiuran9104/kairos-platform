@@ -244,6 +244,14 @@ function convertServerMenuToRouteRecordStringComponent(
         nameSet,
         menuPaths,
       );
+      // 菜单分组通常没有自己的页面。直接访问 `/pent/` 这类父路径时，
+      // 应进入第一个可见子页面，避免只渲染空的 BasicLayout。
+      const firstVisibleChild = buildMenu.children.find(
+        (child) => !child.meta?.hideInMenu,
+      );
+      if (firstVisibleChild) {
+        buildMenu.redirect = firstVisibleChild.path;
+      }
     }
 
     menus.push(buildMenu);

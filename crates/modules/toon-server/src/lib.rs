@@ -35,10 +35,10 @@ use axum::{
     middleware::from_fn_with_state,
     routing::{get, post, put},
 };
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_database::PgPool;
-use rust_toon_framework_security::{TokenService, authenticate};
-use rust_toon_toon_api::ToonCapability;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_database::PgPool;
+use kairos_platform_framework_security::{TokenService, authenticate};
+use kairos_platform_toon_api::ToonCapability;
 
 #[derive(Clone)]
 pub struct ToonState {
@@ -51,8 +51,8 @@ mod storyboard_database_tests {
     use std::time::Duration;
 
     use axum::{Json, extract::State};
-    use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
-    use rust_toon_framework_security::{
+    use kairos_platform_framework_database::{DatabaseConfig, connect, ensure_initialized};
+    use kairos_platform_framework_security::{
         CurrentUser, DataScope, Permission, PermissionSet, SecurityConfig, TokenService,
     };
 
@@ -96,7 +96,7 @@ mod storyboard_database_tests {
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
         let config = DatabaseConfig::new(url, 1, 5, Duration::from_secs(10)).unwrap();
         let pool = connect(&config).await.unwrap();
-        migrate(&pool).await.unwrap();
+        ensure_initialized(&pool).await.unwrap();
         let project_id = 9_100_001_i64;
         let script_id = 9_100_002_i64;
         sqlx::query("DELETE FROM toonflow.projects WHERE id=$1")

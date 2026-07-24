@@ -9,14 +9,14 @@
 | `DATABASE_MAX_CONNECTIONS` | 否 | `20` | 最大连接数 |
 | `DATABASE_ACQUIRE_TIMEOUT_SECONDS` | 否 | `5` | 获取连接超时 |
 | `JWT_SECRET` | 是 | 无 | 至少 32 字节 |
-| `JWT_ISSUER` | 否 | `rust-toon` | Token 签发方 |
-| `JWT_AUDIENCE` | 否 | `rust-toon-api` | Token 受众 |
+| `JWT_ISSUER` | 否 | `kairos-platform` | Token 签发方 |
+| `JWT_AUDIENCE` | 否 | `kairos-platform-api` | Token 受众 |
 | `JWT_ACCESS_TOKEN_TTL_SECONDS` | 否 | `900` | Access Token 有效期 |
 | `GATEWAY_HOST` | 否 | `0.0.0.0` | 网关监听地址 |
 | `GATEWAY_PORT` | 否 | `8080` | 网关端口 |
 | `WEB_PERMISSIVE_CORS` | 否 | `false` | 开发调试跨域开关，设为 `true`/`1`/`yes` 时允许任意来源 |
 | `REDIS_URL` | 否 | 无 | 不配置时缓存和限流自动关闭 |
-| `REDIS_KEY_PREFIX` | 否 | `rust-toon` | Redis 键前缀 |
+| `REDIS_KEY_PREFIX` | 否 | `kairos-platform` | Redis 键前缀 |
 | `BOOTSTRAP_ADMIN_USERNAME` | 否 | `admin` | 初始管理员用户名 |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 否 | 无 | 不配置时跳过管理员初始化 |
 | `RUST_LOG` | 否 | 框架默认 | tracing 日志过滤规则 |

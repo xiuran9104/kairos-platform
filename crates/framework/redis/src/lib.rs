@@ -10,7 +10,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 pub use rate_limit::{RateLimitConfig, RateLimitState, rate_limit};
 
-pub const DEFAULT_CACHE_PREFIX: &str = "rust-toon";
+pub const DEFAULT_CACHE_PREFIX: &str = "kairos-platform";
 
 #[derive(Debug, Clone)]
 pub struct RedisConfig {

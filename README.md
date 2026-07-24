@@ -1,12 +1,18 @@
-# Rust Toon
+# 启元智能中台（Kairos Platform）
 
-Rust Toon 是 Rust 后端与 Vben Admin 5 前端组成的动漫生产及通用 AI 管理平台。基础后台按 Yudao 的模块化思想实现，动漫工厂按 Toonflow 的业务流程实现；后端统一使用 Rust，前端统一使用 Vue 3、Vben 和 Ant Design Vue。
+启元智能中台是面向智能业务研发与运营的一体化技术平台。平台以 Rust/Axum
+作为统一服务底座，以 Vue 3、Vben 和 Ant Design Vue 提供管理控制面，并通过模块化
+能力承载系统治理、AI 模型与 Agent、资产运营、自动化扫描、授权渗透测试和 Toon
+内容生产等不同业务域。
 
 ## 功能组成
 
 - System：认证、用户、角色、权限、菜单、租户及后台管理能力。
 - Infra：配置、文件、任务、日志、数据源等基础设施能力。
 - AI：统一模型管理、聊天/SSE、工具调用、知识库、图片、Midjourney、音乐、语音、Embedding 和写作。
+- Pent：授权渗透任务、Agent 会话、工具路由、安全护栏、运行时编排与结果追踪。
+- Scan：扫描器、扫描任务、资产发现及异构扫描结果归一化。
+- Asset Ops：资产、机房、区域、端点、指纹与风险运营能力。
 - Toonflow：项目、小说、剧本、事件、资产、分镜、音频、视频、Agent、提示词、Skill 和任务中心。
 - Media：素材上传及媒体基础能力。
 
@@ -26,26 +32,28 @@ Rust Toon 是 Rust 后端与 Vben Admin 5 前端组成的动漫生产及通用 A
 docker compose -f script/docker/docker-compose.yml up -d
 ```
 
-启动 PostgreSQL、Redis、NATS 和 MinIO。容器只创建空数据库 `rust_toon`，
-数据库结构统一由 Rust 网关的 SQLx Migrator 自动管理。
+启动 PostgreSQL、Redis、NATS 和 MinIO。PostgreSQL 首次创建数据卷时会自动导入
+`sql/postgresql/0001_initial.sql` 全量快照。
 
 ### 2. 启动 Rust 网关
 
 ```bash
-export DATABASE_URL='postgres://rust_toon:rust_toon@127.0.0.1:5432/rust_toon'
+export DATABASE_URL='postgres://kairos_platform:kairos_platform@127.0.0.1:5432/kairos_platform'
 export REDIS_URL='redis://127.0.0.1:6379'
 export JWT_SECRET='replace-with-at-least-32-random-bytes'
 export BOOTSTRAP_ADMIN_USERNAME='admin'
 export BOOTSTRAP_ADMIN_PASSWORD='Admin#123456'
-cargo run -p rust-toon-gateway
+cargo run -p kairos-platform-gateway
 ```
 
-网关启动时自动执行 SQLx 迁移。`0001_initial.sql` 是已合并的当前完整表结构
-和基准数据，因此部署时不需要
-`sql/bootstrap/current.sql`。`current.sql` 仅作为人工核对用的快照，不会被应用加载。
+网关启动时只验证数据库已经初始化，不再自动执行 SQLx migration。全新环境必须先由
+PostgreSQL 导入 `sql/postgresql/0001_initial.sql`；如果已有旧数据卷，Compose 不会再次导入，
+需要备份后重建数据卷或按发布说明执行升级。
 
-后续修改数据库时，必须从 `0002` 开始新增更高版本的迁移文件，并在干净数据库
-完成全量迁移后重新导出 `current.sql` 参考快照。合并后的 `0001` 一旦发布就不能再修改。
+数据库发生结构或数据变化后，先更新维护中的参考数据库，再运行
+`bash script/export-database-bootstrap.sh` 导出新的全量初始化快照。
+开发期间可以临时创建 `0002_*.sql` 等增量脚本；确认其内容已经合并进新的
+`0001_initial.sql` 后即可删除，发布的新环境只执行完整的 `0001_initial.sql`。
 
 可选环境变量：
 - `DATABASE_MIN_CONNECTIONS`（默认 1）

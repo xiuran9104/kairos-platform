@@ -8,10 +8,10 @@ async fn embedding(pool: &PgPool, text: &str) -> Option<Vec<f32>> {
     .fetch_optional(pool)
     .await
     .ok()??;
-    rust_toon_ai_server::AiModelFactory::new(pool.clone())
+    kairos_platform_ai_server::AiModelFactory::new(pool.clone())
         .embedding(
             model_id,
-            rust_toon_ai_api::EmbeddingRequest {
+            kairos_platform_ai_api::EmbeddingRequest {
                 inputs: vec![text.to_string()],
             },
         )

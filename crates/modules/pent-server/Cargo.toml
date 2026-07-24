@@ -1,0 +1,29 @@
+[package]
+name = "kairos-platform-pent-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+kairos-platform-framework-common.workspace = true
+kairos-platform-framework-database.workspace = true
+kairos-platform-framework-web.workspace = true
+kairos-platform-pent-api.workspace = true
+kairos-platform-pent-core.workspace = true
+kairos-platform-ai-api.workspace = true
+kairos-platform-ai-server.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["io-util", "process", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+md-5 = "0.10"

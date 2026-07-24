@@ -1,5 +1,5 @@
 [package]
-name = "rust-toon-system-api"
+name = "kairos-platform-system-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

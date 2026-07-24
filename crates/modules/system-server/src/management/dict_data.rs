@@ -1,5 +1,5 @@
 use axum::Json;
-use rust_toon_framework_common::ApiResponse;
+use kairos_platform_framework_common::ApiResponse;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]

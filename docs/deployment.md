@@ -6,19 +6,20 @@ AI 编码助手接手项目时应先阅读仓库根目录的 [AI 启动交接指
 
 1. 执行 `docker compose -f script/docker/docker-compose.yml up -d`。
 2. 按 [配置文档](configuration.md) 导出数据库、JWT 和管理员环境变量。
-3. 执行 `cargo run -p rust-toon-gateway`（首次启动自动初始化数据库并执行全部迁移）。
+3. 执行 `cargo run -p kairos-platform-gateway`（PostgreSQL 首次创建数据卷时已导入全量快照）。
 4. 在 `apps/web` 执行 `pnpm install && pnpm dev:antd`。
 5. 检查 `GET http://127.0.0.1:8080/health`，然后访问 `http://127.0.0.1:5666`。
 
-数据库结构由网关的 SQLx Migrator 自动管理，启动时仅执行迁移，禁止同时把 SQL 文件挂载进 `/docker-entrypoint-initdb.d`。
+数据库由 PostgreSQL 官方镜像在首次创建数据卷时导入
+`sql/postgresql/0001_initial.sql`。Gateway 只验证关键表存在，不执行 migration。
 
 ## 后端生产构建
 
 ```bash
-cargo build --release -p rust-toon-gateway
+cargo build --release -p kairos-platform-gateway
 ```
 
-产物为 `target/release/rust-toon-gateway`。生产服务至少需要：
+产物为 `target/release/kairos-platform-gateway`。生产服务至少需要：
 
 - `DATABASE_URL`
 - 强随机 `JWT_SECRET`
@@ -30,11 +31,11 @@ cargo build --release -p rust-toon-gateway
 新服务器首次部署建议流程：
 
 1. 安装 Rust stable、Docker Compose、Node.js `22.18+` 或 `24.x`，并通过 Corepack 使用 pnpm `11+`。
-2. 克隆代码到固定目录，例如 `/opt/rust-toon`。
+2. 克隆代码到固定目录，例如 `/opt/kairos-platform`。
 3. 启动基础设施：`docker compose -f script/docker/docker-compose.yml up -d`。使用托管 PostgreSQL/Redis 时，改为在环境变量中指向托管地址。
-4. 创建 `/etc/rust-toon/gateway.env`，写入 `DATABASE_URL`、`REDIS_URL`、强随机 `JWT_SECRET`、`GATEWAY_HOST`、`GATEWAY_PORT`、`RUST_LOG` 和首次管理员变量。
-5. 执行 `cargo build --release -p rust-toon-gateway`。
-6. 手动加载环境变量运行一次 `target/release/rust-toon-gateway`，确认迁移成功和管理员可登录。
+4. 创建 `/etc/kairos-platform/gateway.env`，写入 `DATABASE_URL`、`REDIS_URL`、强随机 `JWT_SECRET`、`GATEWAY_HOST`、`GATEWAY_PORT`、`RUST_LOG` 和首次管理员变量。
+5. 执行 `cargo build --release -p kairos-platform-gateway`。
+6. 手动加载环境变量运行一次 `target/release/kairos-platform-gateway`，确认数据库验证成功和管理员可登录。
 7. 管理员创建后，从环境文件移除 `BOOTSTRAP_ADMIN_PASSWORD`。
 8. 使用 systemd、Docker 或 Kubernetes 托管网关进程。
 
@@ -42,15 +43,15 @@ systemd 示例：
 
 ```ini
 [Unit]
-Description=Rust Toon Gateway
+Description=Kairos Platform Gateway
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/rust-toon
-EnvironmentFile=/etc/rust-toon/gateway.env
-ExecStart=/opt/rust-toon/target/release/rust-toon-gateway
+WorkingDirectory=/opt/kairos-platform
+EnvironmentFile=/etc/kairos-platform/gateway.env
+ExecStart=/opt/kairos-platform/target/release/kairos-platform-gateway
 Restart=always
 RestartSec=5
 
@@ -62,8 +63,8 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now rust-toon-gateway
-sudo systemctl status rust-toon-gateway
+sudo systemctl enable --now kairos-platform-gateway
+sudo systemctl status kairos-platform-gateway
 curl -fsS http://127.0.0.1:8080/health
 ```
 
@@ -85,7 +86,7 @@ location / {
 }
 
 location /api/ {
-    proxy_pass http://rust-toon-gateway:8080/;
+    proxy_pass http://kairos-platform-gateway:8080/;
     proxy_http_version 1.1;
     proxy_buffering off; # SSE 必须关闭代理缓冲
     proxy_read_timeout 600s;
@@ -94,19 +95,53 @@ location /api/ {
 }
 ```
 
-## 数据库迁移
+## 数据库初始化与升级
 
-数据库结构由 Rust 网关启动时的 SQLx Migrator 统一管理，不依赖 Docker 卷挂载或外部 SQL 导入。
+`sql/postgresql/0001_initial.sql` 是新环境的唯一初始化基线，包含当前完整 schema 和数据。
 
-- 迁移文件位于 `sql/postgresql`，版本号必须是唯一整数前缀。
-- 网关连接数据库后、监听端口前自动执行迁移。
-- 空数据库首次启动时直接执行全部迁移。`0001_initial.sql` 提供当前完整 schema 和基准数据，不依赖 `sql/bootstrap/current.sql`。
-- 每次修改 schema 或基准数据都必须新增更高版本的迁移，并更新空库迁移测试的版本数和数据断言。
-- 全部迁移在干净参考库执行成功后，重新导出 `sql/bootstrap/current.sql` 用于人工比对；应用不得依赖该文件启动。
-- 发布前运行 `bash script/test-database-migrations.sh`，验证空 PostgreSQL 18 可完成全部迁移。
-- 已在生产执行的迁移不得修改；后续结构变化应新增更高版本迁移。
-- 本次迁移历史已合并为新的 `0001`，保留旧 `_sqlx_migrations` 记录的数据库需要清空后重建。
-- 正式升级前必须备份数据库，并先在备份副本验证升级。
+- Compose 将快照只读挂载到
+  `/docker-entrypoint-initdb.d/0001_initial.sql`。
+- PostgreSQL 只在数据目录为空时执行初始化脚本；已有数据卷不会重复导入。
+- Gateway 连接数据库后验证关键表，数据库未初始化时立即报错退出。
+- 开发或存量数据库升级期间可以临时创建 `0002_*.sql`、`0003_*.sql` 等增量
+  脚本；应用到参考数据库并重新导出 `0001_initial.sql` 后，确认变更已经合并，
+  再删除这些临时增量脚本。最终发布的新环境仍只使用 `0001_initial.sql` 初始化。
+- 数据库变化先应用到维护中的参考数据库，再运行
+  `bash script/export-database-bootstrap.sh` 生成最新快照。
+- 发布快照前必须检查凭据、Token、日志和其他不应分发的运行数据。
+- 发布前运行 `bash script/test-database-migrations.sh`，验证全量快照可以初始化空的
+  PostgreSQL 18。脚本名称暂时保留以兼容现有 CI。
+- 替换快照不会升级已有数据卷；生产升级必须先备份，并执行该版本单独提供的升级步骤。
+
+全新本地数据库需要显式删除旧数据卷后重新创建。删除数据卷会清除本地数据库，
+必须先执行 `bash script/export-database-bootstrap.sh` 或另行备份。
+
+### 生产数据库备份
+
+`0001_initial.sql` 是可分发的初始化基线，不代替生产备份。升级、重建数据卷或执行
+高风险数据操作前运行：
+
+```bash
+DATABASE_URL='postgres://user:password@host:5432/kairos_platform' \
+  bash script/backup-database.sh
+```
+
+脚本默认在 `backups/postgresql/` 生成类似
+`kairos_platform_20260724_103000.dump` 的 PostgreSQL custom-format 文件，
+文件权限为 `0600`，且不会覆盖 `0001_initial.sql`。可以通过
+`DATABASE_BACKUP_DIR=/secure/backup/path` 指定外部备份目录。
+
+恢复到一个已经创建的空数据库：
+
+```bash
+pg_restore \
+  --dbname='postgres://user:password@host:5432/kairos_platform_restore' \
+  --clean --if-exists \
+  /secure/backup/path/kairos_platform_20260724_103000.dump
+```
+
+本地 `backups/` 已加入 Git 忽略规则；生产备份仍需复制到有访问控制、加密和保留
+策略的持久存储。
 
 ## 首次管理员
 

@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn validates_pool_bounds() {
         let result = DatabaseConfig::new(
-            "postgres://localhost/rust_toon",
+            "postgres://localhost/kairos_platform",
             10,
             5,
             Duration::from_secs(1),
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn redacts_database_url_in_debug_output() {
         let config = DatabaseConfig::new(
-            "postgres://user:secret@localhost/rust_toon",
+            "postgres://user:secret@localhost/kairos_platform",
             1,
             5,
             Duration::from_secs(1),

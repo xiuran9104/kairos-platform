@@ -4,7 +4,7 @@ import path from 'node:path';
 
 const [sourceRoot, repositoryRoot, outputFile] = process.argv.slice(2);
 if (!sourceRoot || !repositoryRoot || !outputFile) {
-  throw new Error('usage: node sync-toonflow-content.mjs <Toonflow-app> <rust-toon> <migration.sql>');
+  throw new Error('usage: node sync-toonflow-content.mjs <Toonflow-app> <kairos-platform> <migration.sql>');
 }
 
 const sourceData = path.join(sourceRoot, 'data');

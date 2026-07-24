@@ -1,0 +1,24 @@
+[package]
+name = "kairos-platform-scan-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+ipnetwork.workspace = true
+kairos-platform-framework-common.workspace = true
+kairos-platform-framework-database.workspace = true
+kairos-platform-framework-web.workspace = true
+kairos-platform-scan-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+rand_core.workspace = true
+reqwest.workspace = true

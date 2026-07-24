@@ -1,5 +1,5 @@
 [package]
-name = "rust-toon-framework-security"
+name = "kairos-platform-framework-security"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ bcrypt.workspace = true
 chrono.workspace = true
 jsonwebtoken.workspace = true
 rand_core.workspace = true
-rust-toon-framework-common.workspace = true
+kairos-platform-framework-common.workspace = true
 serde.workspace = true
 uuid.workspace = true
 

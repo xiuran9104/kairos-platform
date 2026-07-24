@@ -13,7 +13,7 @@ interface Props extends BacktopProps {}
 defineOptions({ name: 'BackTop' });
 
 const props = withDefaults(defineProps<Props>(), {
-  bottom: 20,
+  bottom: 80,
   isGroup: false,
   right: 24,
   target: '',

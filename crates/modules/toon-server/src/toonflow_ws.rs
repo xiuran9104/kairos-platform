@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};

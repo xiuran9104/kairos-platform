@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use rust_toon_ai_api::{
+use kairos_platform_ai_api::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ImageRequest, MediaResponse,
     ModelConfig, SpeechRequest,
 };
@@ -63,6 +63,83 @@ pub trait ChatProvider: Send + Sync {
 
 pub struct OpenAiCompatibleProvider;
 
+const MODEL_CONNECT_ATTEMPTS: usize = 5;
+
+fn openai_compatible_client() -> Result<reqwest::Client, String> {
+    // Some OpenAI-compatible gateways reset HTTP/2 POST streams during TLS
+    // negotiation while serving the same endpoint normally over HTTP/1.1.
+    reqwest::Client::builder()
+        .http1_only()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|error| format!("创建模型 HTTP 客户端失败: {error:?}"))
+}
+
+async fn send_openai_json(
+    config: &ModelConfig,
+    path: &str,
+    body: &Value,
+    auth_header: &str,
+) -> Result<reqwest::Response, String> {
+    let client = openai_compatible_client()?;
+    let url = format!("{}{}", config.url.trim_end_matches('/'), path);
+    for attempt in 1..=MODEL_CONNECT_ATTEMPTS {
+        let mut request = client.post(&url).json(body);
+        if !config.api_key.is_empty() {
+            request = if auth_header.eq_ignore_ascii_case("authorization") {
+                request.bearer_auth(config.api_key.trim_start_matches("Bearer "))
+            } else {
+                request.header(auth_header, &config.api_key)
+            };
+        }
+        match request.send().await {
+            Ok(response) => return Ok(response),
+            Err(error) if should_retry_model_connection(&error, attempt) => {
+                let delay_ms = 250_u64 * (1_u64 << (attempt - 1));
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MODEL_CONNECT_ATTEMPTS,
+                    delay_ms,
+                    url,
+                    error = ?error,
+                    "model connection failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "模型服务连接失败（已尝试 {attempt}/{MODEL_CONNECT_ATTEMPTS} 次）: {error:?}"
+                ));
+            }
+        }
+    }
+    unreachable!("model connection retry loop always returns")
+}
+
+fn should_retry_model_connection(error: &reqwest::Error, attempt: usize) -> bool {
+    attempt < MODEL_CONNECT_ATTEMPTS && (error.is_connect() || error.is_timeout())
+}
+
+async fn model_json_response(
+    response: reqwest::Response,
+    error_label: &str,
+) -> Result<Value, String> {
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取模型响应失败 (HTTP {status}): {error:?}"))?;
+    let value: Value = serde_json::from_str(&text).map_err(|error| {
+        let preview = text.chars().take(2000).collect::<String>();
+        format!("模型返回非 JSON 响应 (HTTP {status}): {error}; body={preview}")
+    })?;
+    if !status.is_success() {
+        return Err(api_error(&value, error_label));
+    }
+    Ok(value)
+}
+
 impl OpenAiCompatibleProvider {
     pub async fn raw_chat_with_header(
         &self,
@@ -75,23 +152,8 @@ impl OpenAiCompatibleProvider {
             .get("textPath")
             .and_then(Value::as_str)
             .unwrap_or("/chat/completions");
-        let mut builder = reqwest::Client::new()
-            .post(format!("{}{}", config.url.trim_end_matches('/'), path))
-            .json(&body);
-        if !config.api_key.is_empty() {
-            builder = if auth_header.eq_ignore_ascii_case("authorization") {
-                builder.bearer_auth(config.api_key.trim_start_matches("Bearer "))
-            } else {
-                builder.header(auth_header, &config.api_key)
-            }
-        }
-        let response = builder.send().await.map_err(|e| e.to_string())?;
-        let status = response.status();
-        let value: Value = response.json().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(api_error(&value, "模型工具请求失败"));
-        }
-        Ok(value)
+        let response = send_openai_json(config, path, &body, auth_header).await?;
+        model_json_response(response, "模型工具请求失败").await
     }
     pub async fn chat_with_header(
         &self,
@@ -108,22 +170,8 @@ impl OpenAiCompatibleProvider {
         if let Some(limit) = request.max_tokens {
             body["max_tokens"] = json!(limit);
         }
-        let mut builder = reqwest::Client::new()
-            .post(format!("{}{}", config.url.trim_end_matches('/'), path))
-            .json(&body);
-        if !config.api_key.is_empty() {
-            builder = if auth_header.eq_ignore_ascii_case("authorization") {
-                builder.bearer_auth(config.api_key.trim_start_matches("Bearer "))
-            } else {
-                builder.header(auth_header, &config.api_key)
-            };
-        }
-        let response = builder.send().await.map_err(|e| e.to_string())?;
-        let status = response.status();
-        let value: Value = response.json().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(api_error(&value, "模型请求失败"));
-        }
+        let response = send_openai_json(config, path, &body, auth_header).await?;
+        let value = model_json_response(response, "模型请求失败").await?;
         let content = value
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -158,17 +206,7 @@ impl OpenAiCompatibleProvider {
         if let Some(limit) = request.max_tokens {
             body["max_tokens"] = json!(limit)
         }
-        let mut builder = reqwest::Client::new()
-            .post(format!("{}{}", config.url.trim_end_matches('/'), path))
-            .json(&body);
-        if !config.api_key.is_empty() {
-            builder = if auth_header.eq_ignore_ascii_case("authorization") {
-                builder.bearer_auth(config.api_key.trim_start_matches("Bearer "))
-            } else {
-                builder.header(auth_header, &config.api_key)
-            }
-        }
-        let response = builder.send().await.map_err(|e| e.to_string())?;
+        let response = send_openai_json(config, path, &body, auth_header).await?;
         if !response.status().is_success() {
             return Err(response
                 .text()
@@ -209,8 +247,8 @@ impl OpenAiCompatibleProvider {
         })
     }
     fn request(&self, config: &ModelConfig, path: &str) -> reqwest::RequestBuilder {
-        let mut request =
-            reqwest::Client::new().post(format!("{}{}", config.url.trim_end_matches('/'), path));
+        let client = openai_compatible_client().unwrap_or_else(|_| reqwest::Client::new());
+        let mut request = client.post(format!("{}{}", config.url.trim_end_matches('/'), path));
         if !config.api_key.is_empty() {
             request = request.bearer_auth(config.api_key.trim_start_matches("Bearer "));
         }
@@ -230,7 +268,7 @@ impl OpenAiCompatibleProvider {
         let mut body = json!({"model":config.model,"prompt":request.prompt,"size":size,"n":1});
         let path = if request.references.is_empty() {
             path
-        } else if config.platform == rust_toon_ai_api::AiPlatform::DouBao.code() {
+        } else if config.platform == kairos_platform_ai_api::AiPlatform::DouBao.code() {
             body["image"] = json!(request.references);
             path
         } else {

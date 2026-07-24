@@ -1,5 +1,5 @@
 [package]
-name = "rust-toon-infra-server"
+name = "kairos-platform-infra-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,10 @@ repository.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
-rust-toon-framework-common.workspace = true
-rust-toon-framework-database.workspace = true
-rust-toon-framework-web.workspace = true
-rust-toon-infra-api.workspace = true
+kairos-platform-framework-common.workspace = true
+kairos-platform-framework-database.workspace = true
+kairos-platform-framework-web.workspace = true
+kairos-platform-infra-api.workspace = true
 rust_xlsxwriter.workspace = true
 redis.workspace = true
 serde.workspace = true

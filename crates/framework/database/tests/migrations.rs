@@ -1,4 +1,4 @@
-use rust_toon_framework_database::{DatabaseConfig, connect, migrate};
+use kairos_platform_framework_database::{DatabaseConfig, connect, migrate};
 use sqlx::Row;
 
 #[tokio::test]

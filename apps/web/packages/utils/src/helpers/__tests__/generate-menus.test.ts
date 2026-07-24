@@ -287,4 +287,39 @@ describe('generateMenus', () => {
     expect(hiddenPage?.meta?.activePath).toBe('/ai/image');
     expect(hiddenPage?.meta?.hideInMenu).toBe(true);
   });
+
+  it('redirects a backend menu group to its first visible child', () => {
+    const backendMenus = [
+      {
+        children: [
+          {
+            children: [],
+            component: 'pent/dashboard/index.vue',
+            componentName: 'PentDashboard',
+            id: 30401,
+            keepAlive: true,
+            name: '仪表盘',
+            parentId: 30400,
+            path: 'dashboard',
+            sort: 1,
+            visible: true,
+          },
+        ],
+        component: '',
+        componentName: 'Pent',
+        id: 30400,
+        keepAlive: true,
+        name: '安全智能',
+        parentId: 0,
+        path: '/pent',
+        sort: 25,
+        visible: true,
+      },
+    ] as any;
+
+    const converted =
+      convertServerMenuToRouteRecordStringComponent(backendMenus);
+
+    expect(converted[0]?.redirect).toBe('/pent/dashboard');
+  });
 });

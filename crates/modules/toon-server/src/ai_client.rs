@@ -21,7 +21,7 @@ pub async fn text_tools(
     tools: Vec<Value>,
 ) -> Result<Value, String> {
     let (model, temperature, tokens) = agent_model(pool, key).await?;
-    rust_toon_ai_server::AiModelFactory::new(pool.clone())
+    kairos_platform_ai_server::AiModelFactory::new(pool.clone())
         .chat_tools(
             model,
             messages,
@@ -37,15 +37,15 @@ fn chat_request(
     user: &str,
     temperature: i32,
     tokens: i32,
-) -> rust_toon_ai_api::ChatRequest {
-    rust_toon_ai_api::ChatRequest {
+) -> kairos_platform_ai_api::ChatRequest {
+    kairos_platform_ai_api::ChatRequest {
         model: String::new(),
         messages: vec![
-            rust_toon_ai_api::ChatMessage {
+            kairos_platform_ai_api::ChatMessage {
                 role: "system".into(),
                 content: system.into(),
             },
-            rust_toon_ai_api::ChatMessage {
+            kairos_platform_ai_api::ChatMessage {
                 role: "user".into(),
                 content: user.into(),
             },
@@ -56,7 +56,7 @@ fn chat_request(
 }
 pub async fn text(pool: &PgPool, key: &str, system: &str, user: &str) -> Result<String, String> {
     let (model, temperature, tokens) = agent_model(pool, key).await?;
-    rust_toon_ai_server::AiModelFactory::new(pool.clone())
+    kairos_platform_ai_server::AiModelFactory::new(pool.clone())
         .chat(model, chat_request(system, user, temperature, tokens))
         .await
         .map(|x| x.content)
@@ -74,7 +74,7 @@ where
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     let (model, temperature, tokens) = agent_model(pool, key).await?;
-    rust_toon_ai_server::AiModelFactory::new(pool.clone())
+    kairos_platform_ai_server::AiModelFactory::new(pool.clone())
         .chat_stream(
             model,
             chat_request(system, user, temperature, tokens),
@@ -106,10 +106,10 @@ pub async fn image_with_references(
     size: &str,
     references: Vec<String>,
 ) -> Result<String, String> {
-    rust_toon_ai_server::AiModelFactory::new(pool.clone())
+    kairos_platform_ai_server::AiModelFactory::new(pool.clone())
         .image(
             model_id(configured, "图片")?,
-            rust_toon_ai_api::ImageRequest {
+            kairos_platform_ai_api::ImageRequest {
                 prompt: prompt.into(),
                 size: size.into(),
                 references,
@@ -121,7 +121,7 @@ pub async fn image_with_references(
 }
 pub async fn video(pool: &PgPool, configured: &str, payload: Value) -> Result<String, String> {
     let model_id = model_id(configured, "视频")?;
-    let factory = rust_toon_ai_server::AiModelFactory::new(pool.clone());
+    let factory = kairos_platform_ai_server::AiModelFactory::new(pool.clone());
     let response = factory
         .video(model_id, payload)
         .await
@@ -150,10 +150,10 @@ pub async fn speech(
     input: &str,
     voice: &str,
 ) -> Result<String, String> {
-    rust_toon_ai_server::AiModelFactory::new(pool.clone())
+    kairos_platform_ai_server::AiModelFactory::new(pool.clone())
         .speech(
             model_id(configured, "TTS")?,
-            rust_toon_ai_api::SpeechRequest {
+            kairos_platform_ai_api::SpeechRequest {
                 input: input.into(),
                 voice: voice.into(),
                 format: "mp3".into(),

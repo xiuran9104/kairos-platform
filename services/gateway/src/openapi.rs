@@ -5,7 +5,7 @@ pub async fn document() -> Json<Value> {
     Json(json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Rust Toon Gateway API",
+            "title": "Kairos Platform Gateway API",
             "version": "0.1.0"
         },
         "servers": [{ "url": "/api" }],

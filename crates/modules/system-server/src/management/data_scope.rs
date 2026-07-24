@@ -1,6 +1,6 @@
-use rust_toon_framework_database::PgPool;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_database::PgPool;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
 use serde_json::Value;
 use uuid::Uuid;
 

@@ -1208,6 +1208,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
+name = "ipnetwork"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf466541e9d546596ee94f9f69590f89473455f88372423e0008fc1a7daf100e"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1247,6 +1256,376 @@ dependencies = [
  "serde",
  "serde_json",
  "simple_asn1",
+]
+
+[[package]]
+name = "kairos-platform-ai-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kairos-platform-ai-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "futures-util",
+ "http-body-util",
+ "kairos-platform-ai-api",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-security",
+ "kairos-platform-framework-web",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "kairos-platform-framework-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "kairos-platform-framework-database"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kairos-platform-framework-mq"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "kairos-platform-framework-redis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "kairos-platform-framework-common",
+ "redis",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kairos-platform-framework-security"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "bcrypt",
+ "chrono",
+ "jsonwebtoken",
+ "kairos-platform-framework-common",
+ "rand_core 0.6.4",
+ "serde",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-framework-telemetry"
+version = "0.1.0"
+dependencies = [
+ "kairos-platform-framework-common",
+ "tracing",
+]
+
+[[package]]
+name = "kairos-platform-framework-tenant"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "kairos-platform-framework-web"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "kairos-platform-framework-common",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "kairos-platform-ai-server",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-redis",
+ "kairos-platform-framework-security",
+ "kairos-platform-framework-web",
+ "kairos-platform-infra-server",
+ "kairos-platform-media-server",
+ "kairos-platform-pent-server",
+ "kairos-platform-scan-server",
+ "kairos-platform-system-server",
+ "kairos-platform-toon-server",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kairos-platform-infra-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "kairos-platform-infra-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "chrono",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-web",
+ "kairos-platform-infra-api",
+ "redis",
+ "rust_xlsxwriter",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "zip 8.6.0",
+]
+
+[[package]]
+name = "kairos-platform-media-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kairos-platform-media-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-security",
+ "kairos-platform-framework-web",
+ "kairos-platform-media-api",
+ "serde_json",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-pent-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-security",
+ "kairos-platform-framework-web",
+ "kairos-platform-pent-api",
+ "kairos-platform-pent-core",
+ "kairos-platform-pent-server",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kairos-platform-pent-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-pent-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "kairos-platform-pent-api",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-pent-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures-util",
+ "kairos-platform-ai-api",
+ "kairos-platform-ai-server",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-web",
+ "kairos-platform-pent-api",
+ "kairos-platform-pent-core",
+ "md-5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-scan-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kairos-platform-scan-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "ipnetwork",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-web",
+ "kairos-platform-scan-api",
+ "rand_core 0.6.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-system-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kairos-platform-system-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "calamine",
+ "chrono",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-redis",
+ "kairos-platform-framework-security",
+ "kairos-platform-framework-web",
+ "kairos-platform-system-api",
+ "rust_xlsxwriter",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kairos-platform-toon-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "kairos-platform-toon-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "chrono",
+ "futures-util",
+ "hex",
+ "hmac 0.12.1",
+ "image",
+ "kairos-platform-ai-api",
+ "kairos-platform-ai-server",
+ "kairos-platform-framework-common",
+ "kairos-platform-framework-database",
+ "kairos-platform-framework-security",
+ "kairos-platform-framework-web",
+ "kairos-platform-toon-api",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1370,6 +1749,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "miniz_oxide"
@@ -1885,6 +2274,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1919,6 +2320,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -1974,269 +2376,6 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rust-toon-ai-api"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rust-toon-ai-server"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "chrono",
- "futures-util",
- "http-body-util",
- "reqwest",
- "rust-toon-ai-api",
- "rust-toon-framework-common",
- "rust-toon-framework-database",
- "rust-toon-framework-security",
- "rust-toon-framework-web",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tower",
-]
-
-[[package]]
-name = "rust-toon-framework-common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rust-toon-framework-database"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sqlx",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rust-toon-framework-mq"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "rust-toon-framework-redis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "redis",
- "rust-toon-framework-common",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rust-toon-framework-security"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "axum",
- "bcrypt",
- "chrono",
- "jsonwebtoken",
- "rand_core 0.6.4",
- "rust-toon-framework-common",
- "serde",
- "tokio",
- "tower",
- "uuid",
-]
-
-[[package]]
-name = "rust-toon-framework-telemetry"
-version = "0.1.0"
-dependencies = [
- "rust-toon-framework-common",
- "tracing",
-]
-
-[[package]]
-name = "rust-toon-framework-tenant"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "rust-toon-framework-web"
-version = "0.1.0"
-dependencies = [
- "axum",
- "rust-toon-framework-common",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rust-toon-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "rust-toon-ai-server",
- "rust-toon-framework-common",
- "rust-toon-framework-database",
- "rust-toon-framework-redis",
- "rust-toon-framework-security",
- "rust-toon-framework-web",
- "rust-toon-infra-server",
- "rust-toon-media-server",
- "rust-toon-system-server",
- "rust-toon-toon-server",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rust-toon-infra-api"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "rust-toon-infra-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64",
- "chrono",
- "redis",
- "rust-toon-framework-common",
- "rust-toon-framework-database",
- "rust-toon-framework-web",
- "rust-toon-infra-api",
- "rust_xlsxwriter",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "zip 8.6.0",
-]
-
-[[package]]
-name = "rust-toon-media-api"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rust-toon-media-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "rust-toon-framework-common",
- "rust-toon-framework-database",
- "rust-toon-framework-security",
- "rust-toon-framework-web",
- "rust-toon-media-api",
- "serde_json",
- "sqlx",
- "uuid",
-]
-
-[[package]]
-name = "rust-toon-system-api"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rust-toon-system-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "calamine",
- "chrono",
- "rust-toon-framework-common",
- "rust-toon-framework-database",
- "rust-toon-framework-redis",
- "rust-toon-framework-security",
- "rust-toon-framework-web",
- "rust-toon-system-api",
- "rust_xlsxwriter",
- "serde",
- "serde_json",
- "sqlx",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rust-toon-toon-api"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "rust-toon-toon-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64",
- "chrono",
- "futures-util",
- "hex",
- "hmac 0.12.1",
- "image",
- "reqwest",
- "rust-toon-ai-api",
- "rust-toon-ai-server",
- "rust-toon-framework-common",
- "rust-toon-framework-database",
- "rust-toon-framework-security",
- "rust-toon-framework-web",
- "rust-toon-toon-api",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -3069,6 +3208,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+
+[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3127,6 +3272,7 @@ checksum = "ea5fab0d6c3c01ae70085a09cb03d4c7a1d6314e2b3e075392783396d724ca0a"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

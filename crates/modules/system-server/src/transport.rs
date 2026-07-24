@@ -4,10 +4,10 @@ use axum::{
     middleware::from_fn_with_state,
     routing::{get, post},
 };
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::{CurrentUser, DataScope, authenticate};
-use rust_toon_framework_web::AppError;
-use rust_toon_system_api::{
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::{CurrentUser, DataScope, authenticate};
+use kairos_platform_framework_web::AppError;
+use kairos_platform_system_api::{
     CurrentUserResponse, LoginRequest, LogoutRequest, RefreshTokenRequest, SystemCapability,
     TokenResponse,
 };

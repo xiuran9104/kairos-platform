@@ -1,6 +1,6 @@
 use super::{ChatProvider, OpenAiCompatibleProvider};
 use async_trait::async_trait;
-use rust_toon_ai_api::{ChatRequest, ChatResponse, ModelConfig};
+use kairos_platform_ai_api::{ChatRequest, ChatResponse, ModelConfig};
 use serde_json::{Value, json};
 
 pub struct AzureOpenAiProvider;
@@ -52,7 +52,7 @@ impl AzureOpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::adapted;
-    use rust_toon_ai_api::ModelConfig;
+    use kairos_platform_ai_api::ModelConfig;
     use serde_json::json;
     #[test]
     fn builds_deployment_url() {

@@ -1,5 +1,5 @@
 [package]
-name = "rust-toon-toon-server"
+name = "kairos-platform-toon-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,13 +13,13 @@ image.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true
-rust-toon-framework-common.workspace = true
-rust-toon-framework-database.workspace = true
-rust-toon-framework-security.workspace = true
-rust-toon-framework-web.workspace = true
-rust-toon-ai-api.workspace = true
-rust-toon-ai-server.workspace = true
-rust-toon-toon-api.workspace = true
+kairos-platform-framework-common.workspace = true
+kairos-platform-framework-database.workspace = true
+kairos-platform-framework-security.workspace = true
+kairos-platform-framework-web.workspace = true
+kairos-platform-ai-api.workspace = true
+kairos-platform-ai-server.workspace = true
+kairos-platform-toon-api.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -13,8 +13,8 @@ pub struct SecurityConfig {
 impl SecurityConfig {
     pub fn from_env() -> Result<Self, SecurityConfigError> {
         let jwt_secret = env::var("JWT_SECRET").map_err(|_| SecurityConfigError::MissingSecret)?;
-        let issuer = env::var("JWT_ISSUER").unwrap_or_else(|_| "rust-toon".into());
-        let audience = env::var("JWT_AUDIENCE").unwrap_or_else(|_| "rust-toon-api".into());
+        let issuer = env::var("JWT_ISSUER").unwrap_or_else(|_| "kairos-platform".into());
+        let audience = env::var("JWT_AUDIENCE").unwrap_or_else(|_| "kairos-platform-api".into());
         let ttl_seconds = env::var("JWT_ACCESS_TOKEN_TTL_SECONDS")
             .ok()
             .map(|value| value.parse::<u64>())

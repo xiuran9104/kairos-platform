@@ -39,8 +39,8 @@ export const overridesPreferences = defineOverridesPreferences({
     fixed: false,
   },
   logo: {
-    source: '/static/rust-toon-logo.svg',
-    sourceDark: '/static/rust-toon-logo.svg',
+    source: '/static/kairos-platform-logo.svg',
+    sourceDark: '/static/kairos-platform-logo.svg',
   },
   copyright: {
     companyName: import.meta.env.VITE_APP_TITLE,

@@ -2,9 +2,9 @@ use crate::{
     ToonState, ai_client, shared::require, toonflow_asset_description, toonflow_prompt_store,
 };
 use axum::{Json, extract::State};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

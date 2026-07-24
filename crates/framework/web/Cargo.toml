@@ -1,5 +1,5 @@
 [package]
-name = "rust-toon-framework-web"
+name = "kairos-platform-framework-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 axum.workspace = true
-rust-toon-framework-common.workspace = true
+kairos-platform-framework-common.workspace = true
 serde.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

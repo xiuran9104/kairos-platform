@@ -1,0 +1,469 @@
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    routing::{delete, get, post},
+};
+use kairos_platform_framework_web::AppError;
+use kairos_platform_pent_api::{
+    ConfirmScopeRequest, CreateAgentSessionRequest, CreateConversationMessageRequest,
+    CreateRunInstructionRequest, CreateSessionRunRequest,
+};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::{ApiResponse, PentState};
+
+pub(crate) fn routes() -> Router<PentState> {
+    Router::new()
+        .route("/pent/sessions", get(list_sessions).post(create_session))
+        .route("/pent/sessions/{id}", get(get_session).delete(delete_session))
+        .route(
+            "/pent/sessions/{id}/messages",
+            get(list_messages).post(create_message),
+        )
+        .route("/pent/sessions/{id}/scope/confirm", post(confirm_scope))
+        .route("/pent/sessions/{id}/runs", post(create_session_run))
+        .route("/pent/runs/{id}/instructions", post(create_instruction))
+}
+
+async fn list_sessions(
+    State(state): State<PentState>,
+) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    let rows = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(s)
+         FROM pent_agent_sessions s
+         ORDER BY created_at DESC
+         LIMIT 100",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(ApiResponse::new(rows)))
+}
+
+async fn get_session(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let session = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(s) FROM pent_agent_sessions s WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| AppError::not_found("Agent Session 不存在"))?;
+    Ok(Json(ApiResponse::new(session)))
+}
+
+async fn delete_session(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+    sqlx::query("DELETE FROM pent_conversation_messages WHERE session_id = $1")
+        .bind(&id).execute(&mut *tx).await.map_err(internal)?;
+    sqlx::query("DELETE FROM pent_run_instructions WHERE session_id = $1")
+        .bind(&id).execute(&mut *tx).await.map_err(internal)?;
+    sqlx::query("DELETE FROM pent_runs WHERE session_id = $1")
+        .bind(&id).execute(&mut *tx).await.map_err(internal)?;
+    let affected = sqlx::query("DELETE FROM pent_agent_sessions WHERE id = $1")
+        .bind(&id).execute(&mut *tx).await.map_err(internal)?.rows_affected();
+    tx.commit().await.map_err(internal)?;
+    if affected == 0 {
+        return Err(AppError::not_found("Session 不存在"));
+    }
+    Ok(Json(ApiResponse::new(json!({"deleted": id}))))
+}
+
+async fn create_session(
+    State(state): State<PentState>,
+    Json(request): Json<CreateAgentSessionRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let objective = request.objective.trim();
+    if objective.is_empty() {
+        return Err(AppError::bad_request("测试目标不能为空"));
+    }
+    if request.targets.iter().any(|t| t.trim().is_empty()) {
+        return Err(AppError::bad_request("目标范围不能包含空值"));
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let proposal = json!({
+        "targets": request.targets,
+        "constraints": request.constraints,
+        "source": "user_input",
+        "confirmed": false
+    });
+    let message_id = Uuid::new_v4().to_string();
+    let assistant_message_id = Uuid::new_v4().to_string();
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+
+    sqlx::query(
+        "INSERT INTO pent_agent_sessions(
+             id, tenant_id, project_id, objective, constraints, budget,
+             scope_proposal, status, created_by
+         ) VALUES($1, 0, $2, $3, $4, $5, $6, 'draft', 'admin')",
+    )
+    .bind(&session_id)
+    .bind(request.project_id)
+    .bind(objective)
+    .bind(&request.constraints)
+    .bind(&request.budget)
+    .bind(&proposal)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    sqlx::query(
+        "INSERT INTO pent_conversation_messages(
+             id, session_id, role, message_type, content, payload, created_by
+         ) VALUES($1, $2, 'user', 'objective', $3, $4, 'admin')",
+    )
+    .bind(message_id)
+    .bind(&session_id)
+    .bind(objective)
+    .bind(json!({"scope_proposal": proposal}))
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    sqlx::query(
+        "INSERT INTO pent_conversation_messages(
+             id, session_id, role, message_type, content, payload, created_by
+         ) VALUES($1, $2, 'assistant', 'scope_proposal', $3, $4, 'system')",
+    )
+    .bind(assistant_message_id)
+    .bind(&session_id)
+    .bind("已生成候选测试范围。确认授权范围后即可启动 Agent。")
+    .bind(json!({"scope_proposal": proposal}))
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(ApiResponse::new(json!({
+        "id": session_id,
+        "status": "draft",
+        "scope_proposal": proposal
+    }))))
+}
+
+async fn list_messages(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    ensure_session_exists(&state, &id).await?;
+    let messages = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(m)
+         FROM pent_conversation_messages m
+         WHERE session_id = $1
+         ORDER BY created_at, id",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal)?;
+    Ok(Json(ApiResponse::new(messages)))
+}
+
+async fn create_message(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+    Json(request): Json<CreateConversationMessageRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    ensure_session_exists(&state, &id).await?;
+    let content = request.content.trim();
+    if content.is_empty() {
+        return Err(AppError::bad_request("消息内容不能为空"));
+    }
+
+    let message_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO pent_conversation_messages(
+             id, session_id, role, message_type, content, payload, created_by
+         ) VALUES($1, $2, 'user', $3, $4, $5, 'admin')",
+    )
+    .bind(&message_id)
+    .bind(&id)
+    .bind(&request.message_type)
+    .bind(content)
+    .bind(&request.payload)
+    .execute(&state.pool)
+    .await
+    .map_err(internal)?;
+
+    Ok(Json(ApiResponse::new(json!({
+        "id": message_id,
+        "session_id": id,
+        "status": "accepted"
+    }))))
+}
+
+async fn confirm_scope(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmScopeRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    if request.targets.is_empty() {
+        return Err(AppError::bad_request("至少需要一个授权目标"));
+    }
+    if request
+        .targets
+        .iter()
+        .any(|target| target.trim().is_empty())
+    {
+        return Err(AppError::bad_request("授权目标不能包含空值"));
+    }
+
+    let snapshot = json!({
+        "targets": request.targets,
+        "constraints": request.constraints,
+        "confirmed_at": chrono::Utc::now(),
+        "confirmed_by": "admin"
+    });
+    let affected = sqlx::query(
+        "UPDATE pent_agent_sessions
+         SET confirmed_scope_snapshot = $2, status = 'ready', updated_at = now()
+         WHERE id = $1 AND status IN ('draft', 'ready')",
+    )
+    .bind(&id)
+    .bind(&snapshot)
+    .execute(&state.pool)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::bad_request(
+            "Session 不存在或当前状态不能确认范围",
+        ));
+    }
+
+    Ok(Json(ApiResponse::new(json!({
+        "id": id,
+        "status": "ready",
+        "confirmed_scope_snapshot": snapshot
+    }))))
+}
+
+async fn create_session_run(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+    Json(request): Json<CreateSessionRunRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let row: Option<(Option<String>, String, Value, Value, Value)> = sqlx::query_as(
+        "SELECT project_id, objective, confirmed_scope_snapshot, constraints, budget
+         FROM pent_agent_sessions
+         WHERE id = $1 AND status = 'ready' AND confirmed_scope_snapshot IS NOT NULL",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?;
+    let (project_id, objective, scope, constraints, budget) =
+        row.ok_or_else(|| AppError::bad_request("请先确认授权范围"))?;
+
+    let task_id = Uuid::new_v4().to_string();
+    let run_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    let name = request
+        .name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| objective.chars().take(80).collect());
+    let priority = request.priority.unwrap_or_else(|| "medium".to_string());
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+
+    sqlx::query(
+        "INSERT INTO pent_tasks(
+             id, tenant_id, project_id, name, description, target_scope,
+             priority, status, created_by
+         ) VALUES($1, 0, $2, $3, $4, $5, $6, 'queued', 'admin')",
+    )
+    .bind(&task_id)
+    .bind(&project_id)
+    .bind(name)
+    .bind(&objective)
+    .bind(&scope)
+    .bind(priority)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    sqlx::query(
+        "INSERT INTO pent_runs(
+             id, task_id, tenant_id, user_id, project_id, session_id, status,
+             objective_snapshot, scope_snapshot, policy_snapshot, budget_snapshot
+         ) VALUES($1, $2, 0, 'admin', $3, $4, 'queued', $5, $6, $7, $8)",
+    )
+    .bind(&run_id)
+    .bind(&task_id)
+    .bind(&project_id)
+    .bind(&id)
+    .bind(&objective)
+    .bind(&scope)
+    .bind(json!({"constraints": constraints}))
+    .bind(&budget)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    sqlx::query(
+        "INSERT INTO pent_run_events(
+             event_id, run_id, sequence, event_type, payload
+         ) VALUES($1, $2, 0, 'run.created', $3)",
+    )
+    .bind(event_id)
+    .bind(&run_id)
+    .bind(json!({"session_id": id, "objective": objective}))
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    sqlx::query(
+        "UPDATE pent_agent_sessions
+         SET active_run_id = $2, status = 'running', updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(&id)
+    .bind(&run_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(ApiResponse::new(json!({
+        "session_id": id,
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": "queued"
+    }))))
+}
+
+async fn create_instruction(
+    State(state): State<PentState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<CreateRunInstructionRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let allowed = [
+        "steer",
+        "provide_context",
+        "request_review",
+        "request_summary",
+        "pause",
+        "resume",
+        "stop",
+    ];
+    if !allowed.contains(&request.instruction_type.as_str()) {
+        return Err(AppError::bad_request("不支持的运行指令类型"));
+    }
+    if request.content.trim().is_empty() {
+        return Err(AppError::bad_request("指令内容不能为空"));
+    }
+
+    let session_id: Option<String> =
+        sqlx::query_scalar("SELECT session_id FROM pent_runs WHERE id = $1")
+            .bind(&run_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?
+            .flatten();
+    let instruction_id = Uuid::new_v4().to_string();
+    let status = if request.instruction_type == "stop" {
+        "applied"
+    } else {
+        "pending"
+    };
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+
+    sqlx::query(
+        "INSERT INTO pent_run_instructions(
+             id, session_id, run_id, instruction_type, content, payload,
+             status, created_by, applied_at
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, 'admin',
+                  CASE WHEN $7 = 'applied' THEN now() ELSE NULL END)",
+    )
+    .bind(&instruction_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .bind(&request.instruction_type)
+    .bind(request.content.trim())
+    .bind(&request.payload)
+    .bind(status)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    let sequence: i64 = sqlx::query_scalar(
+        "SELECT coalesce(max(sequence), -1) + 1
+         FROM pent_run_events
+         WHERE run_id = $1",
+    )
+    .bind(&run_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    sqlx::query(
+        "INSERT INTO pent_run_events(
+             event_id, run_id, sequence, event_type, payload
+         ) VALUES($1, $2, $3, 'run.instruction.received', $4)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&run_id)
+    .bind(sequence)
+    .bind(json!({
+        "instruction_id": instruction_id,
+        "instruction_type": request.instruction_type,
+        "status": status
+    }))
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    if status == "applied" {
+        sqlx::query(
+            "UPDATE pent_runs
+             SET status = 'cancelled', completed_at = now(), updated_at = now()
+             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+        )
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if let Some(session_id) = &session_id {
+            sqlx::query(
+                "UPDATE pent_agent_sessions
+                 SET status = 'cancelled', updated_at = now()
+                 WHERE id = $1",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+        }
+    }
+
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(ApiResponse::new(json!({
+        "id": instruction_id,
+        "run_id": run_id,
+        "status": status
+    }))))
+}
+
+async fn ensure_session_exists(state: &PentState, id: &str) -> Result<(), AppError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pent_agent_sessions WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(internal)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::not_found("Agent Session 不存在"))
+    }
+}
+
+fn internal(error: sqlx::Error) -> AppError {
+    AppError::internal(error.to_string())
+}

@@ -1,5 +1,5 @@
 [package]
-name = "rust-toon-framework-redis"
+name = "kairos-platform-framework-redis"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 redis.workspace = true
-rust-toon-framework-common.workspace = true
+kairos-platform-framework-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

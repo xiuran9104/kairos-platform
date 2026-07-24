@@ -8,9 +8,9 @@ mod management;
 mod oauth2_token;
 mod transport;
 
-use rust_toon_framework_database::PgPool;
-use rust_toon_framework_redis::RedisClient;
-use rust_toon_framework_security::{PasswordService, TokenService};
+use kairos_platform_framework_database::PgPool;
+use kairos_platform_framework_redis::RedisClient;
+use kairos_platform_framework_security::{PasswordService, TokenService};
 
 #[derive(Clone)]
 pub struct SystemState {

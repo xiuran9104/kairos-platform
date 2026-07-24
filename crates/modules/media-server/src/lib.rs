@@ -2,10 +2,10 @@ mod assets;
 mod shared;
 
 use axum::{Json, Router, middleware::from_fn_with_state, routing::get};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_database::PgPool;
-use rust_toon_framework_security::{TokenService, authenticate};
-use rust_toon_media_api::MediaCapability;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_database::PgPool;
+use kairos_platform_framework_security::{TokenService, authenticate};
+use kairos_platform_media_api::MediaCapability;
 
 #[derive(Clone)]
 pub struct MediaState {

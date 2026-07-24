@@ -1,5 +1,5 @@
-use rust_toon_framework_security::{CurrentUser, Permission};
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_security::{CurrentUser, Permission};
+use kairos_platform_framework_web::AppError;
 use uuid::Uuid;
 
 pub fn require(user: &CurrentUser, code: &str) -> Result<(), AppError> {

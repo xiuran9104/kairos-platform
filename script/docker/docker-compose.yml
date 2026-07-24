@@ -1,42 +1,79 @@
 services:
   postgres:
-    image: postgres:18
-    container_name: rust-toon-postgres
+    image: pgvector/pgvector:pg18
+    container_name: kairos-platform-postgres
     environment:
-      POSTGRES_USER: rust_toon
-      POSTGRES_PASSWORD: rust_toon
-      POSTGRES_DB: rust_toon
+      POSTGRES_USER: kairos_platform
+      POSTGRES_PASSWORD: kairos_platform
+      POSTGRES_DB: kairos_platform
     ports:
       - "5432:5432"
     volumes:
-      - rust-toon-postgres:/var/lib/postgresql
+      - ../../sql/postgresql/0001_initial.sql:/docker-entrypoint-initdb.d/0001_initial.sql:ro
+      - kairos-platform-postgres:/var/lib/postgresql
 
   redis:
     image: redis:8
-    container_name: rust-toon-redis
+    container_name: kairos-platform-redis
     ports:
       - "6379:6379"
 
   nats:
     image: nats:2
-    container_name: rust-toon-nats
+    container_name: kairos-platform-nats
     ports:
       - "4222:4222"
       - "8222:8222"
 
   minio:
     image: minio/minio:latest
-    container_name: rust-toon-minio
+    container_name: kairos-platform-minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: rust_toon
-      MINIO_ROOT_PASSWORD: rust_toon_password
+      MINIO_ROOT_USER: kairos_platform
+      MINIO_ROOT_PASSWORD: kairos_platform_password
     ports:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      - rust-toon-minio:/data
+      - kairos-platform-minio:/data
+
+  neo4j:
+    image: neo4j:5.26.2
+    container_name: kairos-platform-neo4j
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/kairos_platform
+    volumes:
+      - kairos-platform-neo4j:/data
+    shm_size: 2g
+
+  graphiti:
+    image: vxcontrol/graphiti:latest
+    container_name: kairos-platform-graphiti
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: kairos_platform
+      NEO4J_DATABASE: neo4j
+      MODEL_NAME: ${GRAPHITI_MODEL_NAME:-qwen-plus}
+      OPENAI_BASE_URL: ${OPEN_AI_SERVER_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      OPENAI_API_KEY: ${OPEN_AI_KEY:-}
+      PORT: 8000
 
 volumes:
-  rust-toon-postgres:
-  rust-toon-minio:
+  kairos-platform-postgres:
+  kairos-platform-minio:
+  kairos-platform-neo4j:

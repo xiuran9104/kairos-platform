@@ -17,14 +17,14 @@ use axum::{
     middleware::from_fn_with_state,
     routing::{delete, get, post, put},
 };
-use rust_toon_ai_api::{
+use kairos_platform_ai_api::{
     AiModelType, AiPlatform, ChatMessage, ChatRequest, EmbeddingRequest, ImageRequest, ModelConfig,
     SpeechRequest,
 };
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_database::PgPool;
-use rust_toon_framework_security::{CurrentUser, Permission, TokenService, authenticate};
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_database::PgPool;
+use kairos_platform_framework_security::{CurrentUser, Permission, TokenService, authenticate};
+use kairos_platform_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;

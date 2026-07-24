@@ -1,8 +1,8 @@
 use crate::{AiModelFactory, AiState};
 use axum::{Json, Router, extract::State, routing::post};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -160,7 +160,7 @@ async fn action(
 async fn finish_submission(
     pool: &sqlx::PgPool,
     id: i64,
-    result: Result<rust_toon_ai_api::MediaResponse, AppError>,
+    result: Result<kairos_platform_ai_api::MediaResponse, AppError>,
 ) -> Result<(), AppError> {
     match result {
         Ok(result) => {

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::{Duration, Utc};
-use rust_toon_framework_database::PgPool;
+use kairos_platform_framework_database::PgPool;
 use sqlx::FromRow;
 use uuid::Uuid;
 

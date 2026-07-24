@@ -1,8 +1,8 @@
 use crate::{ToonState, shared::require};
 use axum::{Json, extract::State};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};

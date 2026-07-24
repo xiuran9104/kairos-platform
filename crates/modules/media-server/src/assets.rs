@@ -3,10 +3,10 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
-use rust_toon_media_api::{AssetSummary, CreateAssetRequest, UpdateAssetRequest};
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
+use kairos_platform_media_api::{AssetSummary, CreateAssetRequest, UpdateAssetRequest};
 use serde_json::Value;
 use sqlx::FromRow;
 use uuid::Uuid;

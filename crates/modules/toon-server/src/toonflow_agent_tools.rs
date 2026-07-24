@@ -3,9 +3,9 @@ use crate::{
     toonflow_asset_ai, toonflow_image_workflow, toonflow_ws::WsEmitter,
 };
 use axum::{Json, extract::State};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};

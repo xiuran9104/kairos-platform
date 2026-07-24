@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
-use rust_toon_framework_database::PgPool;
-use rust_toon_framework_security::{CurrentUser, DataScope, Permission, PermissionSet};
+use kairos_platform_framework_database::PgPool;
+use kairos_platform_framework_security::{CurrentUser, DataScope, Permission, PermissionSet};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -204,7 +204,7 @@ fn widest_scope(left: DataScope, right: DataScope) -> DataScope {
 
 #[cfg(test)]
 mod tests {
-    use rust_toon_framework_security::DataScope;
+    use kairos_platform_framework_security::DataScope;
 
     use super::widest_scope;
 

@@ -2,9 +2,9 @@ use crate::{ToonState, ai_client, shared::require, toonflow_image_edit_prompt};
 use axum::{Json, extract::State};
 use base64::Engine;
 use image::{DynamicImage, ImageFormat, RgbaImage, imageops};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 

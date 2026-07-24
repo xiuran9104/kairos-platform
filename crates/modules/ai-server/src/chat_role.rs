@@ -4,9 +4,9 @@ use axum::{
     extract::{Query, State},
     routing::{delete, get, post, put},
 };
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_security::CurrentUser;
-use rust_toon_framework_web::AppError;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_security::CurrentUser;
+use kairos_platform_framework_web::AppError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -166,7 +166,7 @@ async fn update(
         .id
         .ok_or_else(|| AppError::bad_request("id is required"))?;
     let admin = user.can(
-        &rust_toon_framework_security::Permission::new("ai:chat-role:update")
+        &kairos_platform_framework_security::Permission::new("ai:chat-role:update")
             .map_err(|_| AppError::internal("invalid policy"))?,
     );
     let result=sqlx::query("UPDATE ai.chat_roles SET model_id=$3,name=$4,avatar=$5,category=$6,sort=$7,description=$8,system_message=$9,welcome_message=$10,public_status=$11,status=$12,knowledge_ids=$13,tool_ids=$14,update_time=$15 WHERE id=$1 AND ($2 OR user_id=$16)").bind(role_id).bind(admin).bind(input.model_id).bind(input.name).bind(input.avatar.unwrap_or_default()).bind(input.category.unwrap_or_else(||"通用".into())).bind(input.sort.unwrap_or(0)).bind(input.description.unwrap_or_default()).bind(input.system_message.unwrap_or_default()).bind(input.welcome_message.unwrap_or_default()).bind(input.public_status.unwrap_or(false)).bind(input.status.unwrap_or(1)).bind(input.knowledge_ids).bind(input.tool_ids).bind(now()).bind(&user.user_id).execute(&state.pool).await.map_err(|_|AppError::internal("更新聊天角色失败"))?;

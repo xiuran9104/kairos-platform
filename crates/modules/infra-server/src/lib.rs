@@ -10,10 +10,10 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Datelike, Timelike, Utc};
-use rust_toon_framework_common::ApiResponse;
-use rust_toon_framework_database::PgPool;
-use rust_toon_framework_web::AppError;
-use rust_toon_infra_api::InfraCapability;
+use kairos_platform_framework_common::ApiResponse;
+use kairos_platform_framework_database::PgPool;
+use kairos_platform_framework_web::AppError;
+use kairos_platform_infra_api::InfraCapability;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -1830,7 +1830,7 @@ fn seal_secret(value: &str) -> String {
     }
     let key = env::var("SECRET_ENCRYPTION_KEY")
         .or_else(|_| env::var("JWT_SECRET"))
-        .unwrap_or_else(|_| "rust-toon-local-secret".to_owned());
+        .unwrap_or_else(|_| "kairos-platform-local-secret".to_owned());
     let key = key.as_bytes();
     let sealed = value
         .as_bytes()

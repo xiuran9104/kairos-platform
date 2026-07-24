@@ -1,5 +1,5 @@
 [package]
-name = "rust-toon-framework-tenant"
+name = "kairos-platform-framework-tenant"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

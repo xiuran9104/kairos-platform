@@ -1,8 +1,8 @@
-# Rust Toon 技术方案
+# Kairos Platform 技术方案
 
 ## 目标
 
-Rust Toon 对齐 yudao-cloud 的工程思想，但使用 Rust 技术栈实现：后端采用 `framework + modules + gateway` 的 workspace 结构，前端使用 Vben Admin 5.x，部署脚本和 SQL 脚本独立放置。
+Kairos Platform 对齐 yudao-cloud 的工程思想，但使用 Rust 技术栈实现：后端采用 `framework + modules + gateway` 的 workspace 结构，前端使用 Vben Admin 5.x，部署脚本和 SQL 脚本独立放置。
 
 ## 总体架构
 
@@ -67,6 +67,9 @@ script/
 - `gateway`：统一入口，只组合模块路由和横切中间件，不放业务规则。
 - `framework`：类似 yudao-cloud 的 starter，沉淀通用能力。
 
+Axum 网关的生产化演进、流量治理、审计队列和可观测性实施计划见
+[Axum 网关优化方案](./Axum网关优化方案.md)。
+
 模块内部后续继续按下列目录演进：
 
 ```text
@@ -120,9 +123,9 @@ views/
 后端：
 
 ```bash
-export DATABASE_URL=postgres://rust_toon:rust_toon@localhost:5432/rust_toon
+export DATABASE_URL=postgres://kairos_platform:kairos_platform@localhost:5432/kairos_platform
 export JWT_SECRET='replace-with-at-least-32-random-bytes'
-cargo run -p rust-toon-gateway
+cargo run -p kairos-platform-gateway
 ```
 
 前端：
@@ -158,6 +161,7 @@ Bearer 认证中间件及 `CurrentUser` 请求提取器。JWT 强制校验签发
 过期时间，密钥不得少于 32 字节，默认有效期为 15 分钟。公开接口与受保护接口通过
 路由分层装配，不依赖容易遗漏的路径白名单。
 
-数据库框架统一读取 `DATABASE_URL` 及连接池参数，启动时可执行 SQLx migration，
-并提供数据库 readiness 探测。数据库 URL 的调试输出会自动脱敏。密码使用 Argon2id
+数据库框架统一读取 `DATABASE_URL` 及连接池参数，启动时验证
+`sql/postgresql/0001_initial.sql` 已完成初始化，并提供数据库 readiness 探测。数据库 URL
+的调试输出会自动脱敏。密码使用 Argon2id
 随机盐哈希，默认策略要求至少 12 位并包含大小写字母、数字和符号。
