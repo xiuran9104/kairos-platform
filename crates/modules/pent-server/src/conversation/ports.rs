@@ -21,6 +21,14 @@ pub struct ModelToolCall {
     pub arguments: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KnowledgeGuide {
+    pub id: String,
+    pub title: String,
+    pub source: Option<String>,
+    pub content: String,
+}
+
 #[async_trait]
 pub trait ConversationRepository: Send + Sync {
     async fn begin_turn(
@@ -28,6 +36,11 @@ pub trait ConversationRepository: Send + Sync {
         request: &AgentTurnRequest,
         intent: &ConversationIntent,
     ) -> anyhow::Result<(String, Option<String>)>;
+    async fn ensure_execution_run(
+        &self,
+        turn_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Option<String>>;
     async fn complete_turn(&self, result: &AgentTurnResult) -> anyhow::Result<()>;
     async fn fail_turn(
         &self,
@@ -44,6 +57,25 @@ pub trait ConversationRepository: Send + Sync {
         role: &str,
         content: &str,
         format: &str,
+    ) -> anyhow::Result<()>;
+    async fn record_tool_result(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        success: bool,
+        content: &str,
+        duration_ms: u64,
+    ) -> anyhow::Result<String>;
+    /// Persist the rolling run summary and the exact context references used to
+    /// resume the next turn.
+    async fn checkpoint_context(
+        &self,
+        turn_id: &str,
+        context: &ConversationContext,
+        run_summary: &str,
+        evidence_ids: &[String],
     ) -> anyhow::Result<()>;
 }
 
@@ -77,6 +109,12 @@ pub trait ConversationModelGateway: Send + Sync {
         context: &ConversationContext,
         intent: &ConversationIntent,
     ) -> anyhow::Result<ModelTurnOutput>;
+}
+
+#[async_trait]
+pub trait ConversationKnowledgeSource: Send + Sync {
+    async fn search_guides(&self, query: &str, limit: usize)
+    -> anyhow::Result<Vec<KnowledgeGuide>>;
 }
 
 #[async_trait]

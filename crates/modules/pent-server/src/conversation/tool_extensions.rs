@@ -385,7 +385,7 @@ fn http_client(timeout_seconds: u64) -> Result<reqwest::Client, reqwest::Error> 
         .timeout(std::time::Duration::from_secs(timeout_seconds))
         .danger_accept_invalid_certs(true)
         .user_agent("Kairos-Pent-Agent/1.0")
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
@@ -544,6 +544,7 @@ mod tests {
             "js_collect",
             &json!({"url": format!("{base_url}/")}).to_string(),
             &scope,
+            "test-session",
         )
         .await;
         assert!(js.success, "{}", js.content);
@@ -565,6 +566,7 @@ mod tests {
             "dir_fuzz",
             &json!({"url": format!("{base_url}/")}).to_string(),
             &scope,
+            "test-session",
         )
         .await;
         assert!(discovery.success, "{}", discovery.content);
@@ -587,6 +589,7 @@ mod tests {
             })
             .to_string(),
             &scope,
+            "test-session",
         )
         .await;
         assert!(upload.success, "{}", upload.content);

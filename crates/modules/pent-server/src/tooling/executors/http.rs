@@ -18,7 +18,10 @@ impl ToolExecutionBackend for HttpExecutor {
             tool_name: desc.tool_id.clone(),
             target: inv.target.clone(),
             status: ToolExecutionStatus::Failed,
-            summary: format!("HTTP executor not yet implemented for tool {}", desc.tool_id),
+            summary: format!(
+                "HTTP executor not yet implemented for tool {}",
+                desc.tool_id
+            ),
             observations: vec![],
             findings: vec![],
             artifacts: vec![],

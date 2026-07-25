@@ -81,24 +81,37 @@ pub(crate) async fn execute_session_run(
         }
         Err(error) => {
             let message = error.to_string();
+            let blocked = message.starts_with("RUN_BLOCKED:")
+                || message.starts_with("RUN_INCOMPLETE:")
+                || message.contains("budget exhausted");
+            let terminal_status = if blocked { "blocked" } else { "failed" };
             let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
             sqlx::query(
                 "UPDATE pent_runs
-                 SET status='failed', completed_at=now(), lease_expires_at=NULL,
+                 SET status=$2, failure_code=$3, failure_message=$4,
+                     completed_at=now(), lease_expires_at=NULL,
                      updated_at=now()
                  WHERE id=$1 AND status='running'",
             )
             .bind(run_id)
+            .bind(terminal_status)
+            .bind(if blocked {
+                "incomplete"
+            } else {
+                "conversation_failed"
+            })
+            .bind(&message)
             .execute(&mut *tx)
             .await
             .map_err(|error| error.to_string())?;
             sqlx::query(
                 "UPDATE pent_agent_sessions
-                 SET status='failed', active_run_id=NULL, updated_at=now()
+                 SET status=$3, active_run_id=NULL, updated_at=now()
                  WHERE id=$1 AND active_run_id=$2",
             )
             .bind(&session_id)
             .bind(run_id)
+            .bind(terminal_status)
             .execute(&mut *tx)
             .await
             .map_err(|error| error.to_string())?;

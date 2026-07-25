@@ -134,7 +134,8 @@ mod ai_model_tests {
     #[test]
     fn model_config_query_selects_correct_columns() {
         // Verify the query matches the actual ai.model_configs schema
-        let query = "SELECT model, url, api_key FROM ai.model_configs WHERE status = 0 ORDER BY id LIMIT 1";
+        let query =
+            "SELECT model, url, api_key FROM ai.model_configs WHERE status = 0 ORDER BY id LIMIT 1";
         assert!(query.contains("model")); // not model_name
         assert!(query.contains("url")); // not base_url
         assert!(query.contains("api_key"));
@@ -151,7 +152,11 @@ mod ai_model_tests {
         let prompt = format!(
             "安全分析。目标 {} 开放端口: {} 发现: {}",
             target,
-            ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
+            ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             findings.join(", ")
         );
         assert!(prompt.contains("10.0.0.1"));
@@ -177,7 +182,7 @@ mod ai_model_tests {
 
 #[cfg(test)]
 mod tool_execution_tests {
-    use crate::infrastructure::process::{ExecutionBackend, ContainerLimits, NetworkPolicy};
+    use crate::infrastructure::process::{ContainerLimits, ExecutionBackend, NetworkPolicy};
 
     #[test]
     fn container_limits_are_sensible() {
@@ -186,6 +191,7 @@ mod tool_execution_tests {
             memory_mb: 512,
             timeout_seconds: 300,
             network_access: NetworkPolicy::TargetOnly("example.com".into()),
+            network_name: Some("pent-target".into()),
             allowed_paths: vec!["/tmp".into()],
             backend: ExecutionBackend::Docker,
         };
@@ -202,6 +208,7 @@ mod tool_execution_tests {
             memory_mb: 1024,
             timeout_seconds: 120,
             network_access: NetworkPolicy::Full,
+            network_name: None,
             allowed_paths: vec![],
             backend: ExecutionBackend::Host,
         };
@@ -216,6 +223,7 @@ mod tool_execution_tests {
             memory_mb: 256,
             timeout_seconds: 60,
             network_access: NetworkPolicy::TargetOnly("target.test".into()),
+            network_name: Some("pent-target".into()),
             allowed_paths: vec!["/output".into()],
             backend: ExecutionBackend::Docker,
         };

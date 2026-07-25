@@ -5,7 +5,7 @@ import { getPentRuns, createPentRun, cancelPentRun, getPentRunEvents, getPentTas
 
 const runs = ref<any[]>([]); const tasks = ref<any[]>([]); const loading = ref(false);
 const createTaskVisible = ref(false); const createRunVisible = ref(false);
-const taskForm = ref({ name: '', target_scope: '["10.0.0.0/24"]', priority: 'medium' });
+const taskForm = ref({ name: '', target_scope: '["10.0.0.0/24"]', priority: 'medium', authorization_confirmed: false });
 const selectedTaskId = ref(''); const detailVisible = ref(false); const detailRun = ref<any>(null);
 const events = ref<any[]>([]); let eventTimer: any = null;
 
@@ -13,7 +13,11 @@ async function fetchRuns() { loading.value=true; try { runs.value=(await getPent
 onMounted(async () => { await fetchRuns(); tasks.value=(await getPentTasks()) as any[]; });
 onUnmounted(() => { if (eventTimer) clearInterval(eventTimer); });
 
-async function handleCreateTask() { await createPentTask(taskForm.value); message.success('任务创建成功'); createTaskVisible.value=false; tasks.value=(await getPentTasks()) as any[]; }
+async function handleCreateTask() {
+  if (!taskForm.value.authorization_confirmed) { message.warning('请先确认目标测试授权'); return; }
+  await createPentTask({...taskForm.value, target_scope: JSON.parse(taskForm.value.target_scope || '[]')});
+  message.success('任务创建成功'); createTaskVisible.value=false; tasks.value=(await getPentTasks()) as any[];
+}
 async function handleCreateRun() { if (selectedTaskId.value) { await createPentRun({task_id:selectedTaskId.value}); message.success('Run 已创建'); createRunVisible.value=false; fetchRuns(); } }
 
 async function showDetail(run: any) {
@@ -72,6 +76,7 @@ const columns = [{ title:'Run ID',dataIndex:'id',width:120,ellipsis:true },{ tit
         <a-form-item label="任务名称" required><a-input v-model:value="taskForm.name" /></a-form-item>
         <a-form-item label="目标范围" required><a-input v-model:value="taskForm.target_scope" /></a-form-item>
         <a-form-item label="优先级"><a-select v-model:value="taskForm.priority"><a-select-option value="low">低</a-select-option><a-select-option value="medium">中</a-select-option><a-select-option value="high">高</a-select-option><a-select-option value="critical">紧急</a-select-option></a-select></a-form-item>
+        <a-form-item required><a-checkbox v-model:checked="taskForm.authorization_confirmed">我确认已获得上述目标的安全测试授权</a-checkbox></a-form-item>
       </a-form>
     </a-modal>
     <a-modal v-model:open="createRunVisible" title="创建 Run" @ok="handleCreateRun" width="500px">

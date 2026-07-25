@@ -27,6 +27,14 @@ pub fn normalize_security_tool_output(
     match tool_name.to_ascii_lowercase().as_str() {
         "nmap" | "tcp_scan" => parse_nmap(&sanitized_output, &mut result),
         "nuclei" => parse_json_lines(&sanitized_output, target, "nuclei", &mut result),
+        "sqli_validate"
+        | "xss_validate"
+        | "csrf_validate"
+        | "command_injection_validate"
+        | "file_inclusion_validate"
+        | "file_upload_validate" => {
+            parse_json_lines(&sanitized_output, target, tool_name, &mut result)
+        }
         "afrog" => parse_json_lines(&sanitized_output, target, "afrog", &mut result),
         "ffuf" => parse_ffuf(&sanitized_output, &mut result),
         _ => {}

@@ -5,6 +5,7 @@ use kairos_platform_ai_api::ChatMessage;
 use kairos_platform_ai_server::AiModelFactory;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::{ConversationContext, ConversationIntent, ModelUsage};
+use kairos_platform_pent_core::conversation::DEFAULT_CONTEXT_TOKEN_BUDGET;
 use serde_json::Value;
 
 pub struct AiModelGateway {
@@ -21,28 +22,30 @@ impl AiModelGateway {
     }
 
     async fn resolve_model(&self, session_id: &str) -> anyhow::Result<(i64, Option<f64>, u32)> {
-        let project_id: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM pent_agent_sessions WHERE id = $1")
+        let (tenant_id, project_id): (i64, Option<String>) =
+            sqlx::query_as("SELECT tenant_id, project_id FROM pent_agent_sessions WHERE id = $1")
                 .bind(session_id)
                 .fetch_optional(&self.pool)
                 .await?
-                .flatten();
+                .ok_or_else(|| anyhow::anyhow!("Agent Session 不存在"))?;
         let binding: Option<(i64, Option<f32>, Option<i32>)> = sqlx::query_as(
             "SELECT model_config_id, temperature, max_output_tokens
              FROM pent_model_role_bindings
-             WHERE tenant_id = 0 AND model_role = 'conversation' AND enabled = true
-               AND project_id IN ($1, '')
-             ORDER BY CASE WHEN project_id = $1 THEN 0 ELSE 1 END
+             WHERE tenant_id = $1 AND model_role = 'conversation' AND enabled = true
+               AND project_id IN ($2, '')
+             ORDER BY CASE WHEN project_id = $2 THEN 0 ELSE 1 END
              LIMIT 1",
         )
+        .bind(tenant_id)
         .bind(project_id.unwrap_or_default())
         .fetch_optional(&self.pool)
         .await?;
         if let Some((id, temperature, max_tokens)) = binding {
+            let configured_max = max_tokens.unwrap_or(2000).clamp(1, 16_000) as u32;
             return Ok((
                 id,
                 temperature.map(f64::from),
-                max_tokens.unwrap_or(2000).clamp(1, 16_000) as u32,
+                conversation_output_token_limit(configured_max),
             ));
         }
         let id: i64 = sqlx::query_scalar(
@@ -53,8 +56,19 @@ impl AiModelGateway {
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?;
-        Ok((id, Some(0.3), 2000))
+        Ok((id, Some(0.3), conversation_output_token_limit(2000)))
     }
+}
+
+fn conversation_output_token_limit(configured: u32) -> u32 {
+    if std::env::var("PENTA_ENV").as_deref() == Ok("development") {
+        return std::env::var("PENTA_CONVERSATION_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(16_000)
+            .clamp(1, 16_000);
+    }
+    configured
 }
 
 #[async_trait]
@@ -65,23 +79,40 @@ impl ConversationModelGateway for AiModelGateway {
         _intent: &ConversationIntent,
     ) -> anyhow::Result<ModelTurnOutput> {
         let (model_id, temperature, max_tokens) = self.resolve_model(&context.session_id).await?;
+        let context_token_budget = std::env::var("PENTA_CONTEXT_TOKEN_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
+            .clamp(2_000, 128_000);
+        let model_context = context;
+        let memory_context = if model_context.run_summary.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\n## 运行摘要与长期记忆\n{}", model_context.run_summary)
+        };
         let mut messages = vec![ChatMessage {
             role: "system".into(),
-            content: context.system_instruction.clone(),
+            content: format!("{}{}", model_context.system_instruction, memory_context),
         }];
-        messages.extend(context.recent_messages.iter().map(|message| ChatMessage {
-            role: message.role.clone(),
-            content: message.content.clone(),
-        }));
+        messages.extend(
+            model_context
+                .recent_messages
+                .iter()
+                .map(|message| ChatMessage {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                }),
+        );
         let started = std::time::Instant::now();
 
         let tools = super::tool_catalog::load_conversation_tool_definitions(&self.pool).await?;
         let mut api_messages: Vec<Value> =
             messages.iter().map(|m| format_message_for_api(m)).collect();
 
-        // Safety: strip trailing unpaired tool_calls to avoid API errors.
-        // This can happen when a previous turn was interrupted mid-tool-execution.
-        strip_unpaired_tool_calls(&mut api_messages);
+        // Context trimming or an interrupted turn can leave either side of the
+        // tool protocol without its pair. Validate every group by tool_call_id.
+        sanitize_tool_message_groups(&mut api_messages);
+        trim_api_messages_preserving_tool_groups(&mut api_messages, context_token_budget);
         let response = self
             .factory
             .chat_tools(model_id, api_messages, tools, temperature, Some(max_tokens))
@@ -156,50 +187,122 @@ fn format_message_for_api(m: &kairos_platform_ai_api::ChatMessage) -> Value {
     serde_json::json!({"role": m.role, "content": m.content})
 }
 
-/// Remove any assistant messages with tool_calls that lack corresponding tool results.
-/// DeepSeek/OpenAI APIs reject mismatched tool_calls ↔ tool_result pairs.
-/// This walks backwards through ALL tool_calls groups, stripping any that are unpaired.
-fn strip_unpaired_tool_calls(api_messages: &mut Vec<Value>) {
-    // Find all positions of assistant tool_calls messages
-    let positions: Vec<usize> = api_messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| {
-            m.get("role").and_then(Value::as_str) == Some("assistant")
-                && m.get("tool_calls").is_some()
-        })
-        .map(|(i, _)| i)
-        .collect();
+/// Keep only complete `assistant.tool_calls` + consecutive `tool` response
+/// groups. This removes orphan results anywhere in history, not just at the
+/// beginning, and also removes interrupted assistant groups.
+fn sanitize_tool_message_groups(api_messages: &mut Vec<Value>) {
+    let source = std::mem::take(api_messages);
+    let mut sanitized = Vec::with_capacity(source.len());
+    let mut index = 0;
 
-    // Walk backwards — if any group is unpaired, strip from that point
-    for &pos in positions.iter().rev() {
-        let expected: usize = api_messages[pos]["tool_calls"]
-            .as_array()
-            .map(|a| a.len())
-            .unwrap_or(0);
-        // Count tool messages between this tool_calls and the NEXT assistant/user message
-        let next_boundary = api_messages[pos + 1..]
-            .iter()
-            .position(|m| {
-                let role = m.get("role").and_then(Value::as_str).unwrap_or("");
-                role == "assistant" || role == "user" || role == "system"
-            })
-            .map(|p| pos + 1 + p)
-            .unwrap_or(api_messages.len());
-        let tool_msgs_in_group: usize = api_messages[pos + 1..next_boundary]
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
-            .count();
-        if tool_msgs_in_group < expected {
-            api_messages.truncate(pos);
-            tracing::warn!(
-                expected,
-                actual = tool_msgs_in_group,
-                pos,
-                "stripped unpaired tool_calls group, truncating context"
-            );
+    while index < source.len() {
+        let message = &source[index];
+        let role = message.get("role").and_then(Value::as_str);
+        let tool_calls = message.get("tool_calls").and_then(Value::as_array);
+
+        if role == Some("assistant") && tool_calls.is_some() {
+            let expected: std::collections::HashSet<&str> = tool_calls
+                .into_iter()
+                .flatten()
+                .filter_map(|call| call.get("id").and_then(Value::as_str))
+                .collect();
+            let mut group_end = index + 1;
+            while group_end < source.len()
+                && source[group_end].get("role").and_then(Value::as_str) == Some("tool")
+            {
+                group_end += 1;
+            }
+            let actual: Vec<&str> = source[index + 1..group_end]
+                .iter()
+                .filter_map(|result| result.get("tool_call_id").and_then(Value::as_str))
+                .collect();
+            let actual_set: std::collections::HashSet<&str> = actual.iter().copied().collect();
+            let complete =
+                !expected.is_empty() && actual.len() == expected.len() && actual_set == expected;
+
+            if complete {
+                sanitized.extend(source[index..group_end].iter().cloned());
+            } else {
+                tracing::warn!(
+                    expected = expected.len(),
+                    actual = actual.len(),
+                    "removed incomplete tool message group from model context"
+                );
+            }
+            index = group_end;
+            continue;
         }
+
+        if role == Some("tool") {
+            tracing::warn!("removed orphan tool result from model context");
+            index += 1;
+            continue;
+        }
+
+        sanitized.push(message.clone());
+        index += 1;
     }
+
+    *api_messages = sanitized;
+}
+
+/// Trim complete protocol units from the oldest side. An assistant tool-call
+/// message and all consecutive tool results form one indivisible unit.
+fn trim_api_messages_preserving_tool_groups(api_messages: &mut Vec<Value>, token_budget: u64) {
+    if api_messages.is_empty() {
+        return;
+    }
+    let source = std::mem::take(api_messages);
+    let system_end = source
+        .iter()
+        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+    let mut units: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut index = system_end;
+    while index < source.len() {
+        let start = index;
+        if source[index].get("role").and_then(Value::as_str) == Some("assistant")
+            && source[index].get("tool_calls").is_some()
+        {
+            index += 1;
+            while index < source.len()
+                && source[index].get("role").and_then(Value::as_str) == Some("tool")
+            {
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+        units.push(start..index);
+    }
+
+    let fixed_tokens = source[..system_end]
+        .iter()
+        .map(estimate_api_message_tokens)
+        .sum::<u64>();
+    let available = token_budget.saturating_sub(fixed_tokens);
+    let mut selected_start = units.len();
+    let mut used = 0u64;
+    for (unit_index, unit) in units.iter().enumerate().rev() {
+        let cost = source[unit.clone()]
+            .iter()
+            .map(estimate_api_message_tokens)
+            .sum::<u64>();
+        if used.saturating_add(cost) > available && selected_start < units.len() {
+            break;
+        }
+        used = used.saturating_add(cost);
+        selected_start = unit_index;
+    }
+
+    api_messages.extend(source[..system_end].iter().cloned());
+    if selected_start < units.len() {
+        api_messages.extend(source[units[selected_start].start..].iter().cloned());
+    }
+}
+
+fn estimate_api_message_tokens(message: &Value) -> u64 {
+    message.to_string().chars().count().div_ceil(3) as u64
 }
 
 fn parse_chat_tools_response(response: &Value) -> (String, Vec<ModelToolCall>) {
@@ -252,4 +355,78 @@ fn parse_chat_tools_response(response: &Value) -> (String, Vec<ModelToolCall>) {
         .unwrap_or_default();
 
     (content, tool_calls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_tool_message_groups, trim_api_messages_preserving_tool_groups};
+    use serde_json::{Value, json};
+
+    fn call(id: &str) -> Value {
+        json!({
+            "role": "assistant",
+            "tool_calls": [{"id": id, "type": "function", "function": {
+                "name": "http_probe", "arguments": "{}"
+            }}]
+        })
+    }
+
+    fn result(id: &str) -> Value {
+        json!({"role": "tool", "tool_call_id": id, "content": "{}"})
+    }
+
+    #[test]
+    fn removes_orphan_tool_result_after_regular_message() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "u"}),
+            result("missing"),
+            json!({"role": "user", "content": "latest"}),
+        ];
+        sanitize_tool_message_groups(&mut messages);
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().all(|m| m["role"] != "tool"));
+    }
+
+    #[test]
+    fn preserves_complete_tool_group() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            call("call-1"),
+            result("call-1"),
+        ];
+        sanitize_tool_message_groups(&mut messages);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn removes_mismatched_or_incomplete_group() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            call("call-1"),
+            result("other-call"),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        sanitize_tool_message_groups(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn context_trimming_never_splits_tool_group() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "old"}),
+            call("call-1"),
+            result("call-1"),
+            json!({"role": "user", "content": "latest"}),
+        ];
+        trim_api_messages_preserving_tool_groups(&mut messages, 80);
+        let has_call = messages
+            .iter()
+            .any(|message| message.get("tool_calls").is_some());
+        let has_result = messages.iter().any(|message| message["role"] == "tool");
+        assert_eq!(has_call, has_result);
+        assert_eq!(messages.last().unwrap()["content"], "latest");
+    }
 }

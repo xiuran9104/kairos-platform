@@ -104,14 +104,54 @@ onMounted(fetchAll);
             </a-button>
           </template>
           <template v-if="Object.keys(runtimePolicy).length">
-            <a-descriptions :column="2" size="small" bordered>
-              <a-descriptions-item label="最大并发 Run">{{ runtimePolicy.max_concurrent_runs ?? '-' }}</a-descriptions-item>
-              <a-descriptions-item label="最大 Turn 数">{{ runtimePolicy.max_turns ?? '-' }}</a-descriptions-item>
-              <a-descriptions-item label="Token 预算">{{ runtimePolicy.token_budget ?? '-' }}</a-descriptions-item>
-              <a-descriptions-item label="超时 (分钟)">{{ runtimePolicy.timeout_minutes ?? '-' }}</a-descriptions-item>
-              <a-descriptions-item label="重规划阈值">{{ runtimePolicy.replan_threshold ?? '-' }}</a-descriptions-item>
-              <a-descriptions-item label="自动停止条件">{{ runtimePolicy.auto_stop_conditions ?? '-' }}</a-descriptions-item>
-            </a-descriptions>
+            <a-form :model="runtimePolicy" layout="vertical">
+              <a-row :gutter="16">
+                <a-col :xs="24" :md="12">
+                  <a-form-item label="最大并发 Run">
+                    <a-input-number v-model:value="runtimePolicy.max_concurrent_runs" :min="1" :max="100" class="w-full" />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :md="12">
+                  <a-form-item label="Worker 租约（秒）">
+                    <a-input-number v-model:value="runtimePolicy.lease_ttl_seconds" :min="30" :max="3600" class="w-full" />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :md="12">
+                  <a-form-item label="工具超时（秒）">
+                    <a-input-number v-model:value="runtimePolicy.max_tool_timeout_seconds" :min="10" :max="7200" class="w-full" />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :md="12">
+                  <a-form-item label="最大重试次数">
+                    <a-input-number v-model:value="runtimePolicy.max_retries_per_run" :min="0" :max="20" class="w-full" />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :md="12">
+                  <a-form-item label="重试基础延迟（秒）">
+                    <a-input-number v-model:value="runtimePolicy.retry_base_delay_seconds" :min="1" :max="3600" class="w-full" />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :md="12">
+                  <a-form-item label="审批有效期（秒）">
+                    <a-input-number v-model:value="runtimePolicy.approval_ttl_seconds" :min="60" :max="86400" class="w-full" />
+                  </a-form-item>
+                </a-col>
+              </a-row>
+              <a-form-item label="低风险工具自动放行">
+                <a-switch v-model:checked="runtimePolicy.auto_approve_low_risk" />
+              </a-form-item>
+              <a-form-item label="需要审批的风险等级">
+                <a-checkbox-group
+                  v-model:value="runtimePolicy.require_approval_for"
+                  :options="[
+                    { label: '低', value: 'low' },
+                    { label: '中', value: 'medium' },
+                    { label: '高', value: 'high' },
+                    { label: '严重', value: 'critical' },
+                  ]"
+                />
+              </a-form-item>
+            </a-form>
           </template>
           <a-empty v-else description="暂无运行策略">
             <a-alert type="info" show-icon message="运行策略 API 就绪后，此处可配置预算、并发、最大轮次、停止条件和重规划阈值。" :banner="false" />

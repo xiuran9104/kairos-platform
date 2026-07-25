@@ -3,6 +3,7 @@ use axum::{
     extract::{Path, State},
     routing::{delete, get, post},
 };
+use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
 use kairos_platform_pent_api::{
     ConfirmScopeRequest, CreateAgentSessionRequest, CreateConversationMessageRequest,
@@ -11,12 +12,15 @@ use kairos_platform_pent_api::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{ApiResponse, PentState};
+use crate::{ApiResponse, PentState, security};
 
 pub(crate) fn routes() -> Router<PentState> {
     Router::new()
         .route("/pent/sessions", get(list_sessions).post(create_session))
-        .route("/pent/sessions/{id}", get(get_session).delete(delete_session))
+        .route(
+            "/pent/sessions/{id}",
+            get(get_session).delete(delete_session),
+        )
         .route(
             "/pent/sessions/{id}/messages",
             get(list_messages).post(create_message),
@@ -28,13 +32,19 @@ pub(crate) fn routes() -> Router<PentState> {
 
 async fn list_sessions(
     State(state): State<PentState>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT to_jsonb(s)
          FROM pent_agent_sessions s
+         WHERE tenant_id=$1 AND ($2 OR created_by=$3)
          ORDER BY created_at DESC
          LIMIT 100",
     )
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
@@ -44,11 +54,17 @@ async fn list_sessions(
 async fn get_session(
     State(state): State<PentState>,
     Path(id): Path<String>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
     let session = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(s) FROM pent_agent_sessions s WHERE id = $1",
+        "SELECT to_jsonb(s) FROM pent_agent_sessions s
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4)",
     )
     .bind(id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(internal)?
@@ -59,16 +75,33 @@ async fn get_session(
 async fn delete_session(
     State(state): State<PentState>,
     Path(id): Path<String>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    security::ensure_session_access(&state.pool, &id, &user).await?;
     let mut tx = state.pool.begin().await.map_err(internal)?;
     sqlx::query("DELETE FROM pent_conversation_messages WHERE session_id = $1")
-        .bind(&id).execute(&mut *tx).await.map_err(internal)?;
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
     sqlx::query("DELETE FROM pent_run_instructions WHERE session_id = $1")
-        .bind(&id).execute(&mut *tx).await.map_err(internal)?;
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
     sqlx::query("DELETE FROM pent_runs WHERE session_id = $1")
-        .bind(&id).execute(&mut *tx).await.map_err(internal)?;
-    let affected = sqlx::query("DELETE FROM pent_agent_sessions WHERE id = $1")
-        .bind(&id).execute(&mut *tx).await.map_err(internal)?.rows_affected();
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    let affected = sqlx::query("DELETE FROM pent_agent_sessions WHERE id = $1 AND tenant_id=$2")
+        .bind(&id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?
+        .rows_affected();
     tx.commit().await.map_err(internal)?;
     if affected == 0 {
         return Err(AppError::not_found("Session 不存在"));
@@ -78,8 +111,10 @@ async fn delete_session(
 
 async fn create_session(
     State(state): State<PentState>,
+    user: CurrentUser,
     Json(request): Json<CreateAgentSessionRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
     let objective = request.objective.trim();
     if objective.is_empty() {
         return Err(AppError::bad_request("测试目标不能为空"));
@@ -98,19 +133,39 @@ async fn create_session(
     let message_id = Uuid::new_v4().to_string();
     let assistant_message_id = Uuid::new_v4().to_string();
     let mut tx = state.pool.begin().await.map_err(internal)?;
+    if let Some(project_id) = request.project_id.as_deref() {
+        let project_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pent_projects
+                 WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0
+             )",
+        )
+        .bind(project_id)
+        .bind(tenant_id)
+        .bind(security::tenant_wide(&user))
+        .bind(&user.user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if !project_exists {
+            return Err(AppError::bad_request("项目不存在或无权访问"));
+        }
+    }
 
     sqlx::query(
         "INSERT INTO pent_agent_sessions(
              id, tenant_id, project_id, objective, constraints, budget,
              scope_proposal, status, created_by
-         ) VALUES($1, 0, $2, $3, $4, $5, $6, 'draft', 'admin')",
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, 'draft', $8)",
     )
     .bind(&session_id)
+    .bind(tenant_id)
     .bind(request.project_id)
     .bind(objective)
     .bind(&request.constraints)
     .bind(&request.budget)
     .bind(&proposal)
+    .bind(&user.user_id)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
@@ -118,12 +173,13 @@ async fn create_session(
     sqlx::query(
         "INSERT INTO pent_conversation_messages(
              id, session_id, role, message_type, content, payload, created_by
-         ) VALUES($1, $2, 'user', 'objective', $3, $4, 'admin')",
+         ) VALUES($1, $2, 'user', 'objective', $3, $4, $5)",
     )
     .bind(message_id)
     .bind(&session_id)
     .bind(objective)
     .bind(json!({"scope_proposal": proposal}))
+    .bind(&user.user_id)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
@@ -152,8 +208,9 @@ async fn create_session(
 async fn list_messages(
     State(state): State<PentState>,
     Path(id): Path<String>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    ensure_session_exists(&state, &id).await?;
+    security::ensure_session_access(&state.pool, &id, &user).await?;
     let messages = sqlx::query_scalar::<_, Value>(
         "SELECT to_jsonb(m)
          FROM pent_conversation_messages m
@@ -170,9 +227,10 @@ async fn list_messages(
 async fn create_message(
     State(state): State<PentState>,
     Path(id): Path<String>,
+    user: CurrentUser,
     Json(request): Json<CreateConversationMessageRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    ensure_session_exists(&state, &id).await?;
+    security::ensure_session_access(&state.pool, &id, &user).await?;
     let content = request.content.trim();
     if content.is_empty() {
         return Err(AppError::bad_request("消息内容不能为空"));
@@ -182,13 +240,14 @@ async fn create_message(
     sqlx::query(
         "INSERT INTO pent_conversation_messages(
              id, session_id, role, message_type, content, payload, created_by
-         ) VALUES($1, $2, 'user', $3, $4, $5, 'admin')",
+         ) VALUES($1, $2, 'user', $3, $4, $5, $6)",
     )
     .bind(&message_id)
     .bind(&id)
     .bind(&request.message_type)
     .bind(content)
     .bind(&request.payload)
+    .bind(&user.user_id)
     .execute(&state.pool)
     .await
     .map_err(internal)?;
@@ -203,8 +262,10 @@ async fn create_message(
 async fn confirm_scope(
     State(state): State<PentState>,
     Path(id): Path<String>,
+    user: CurrentUser,
     Json(request): Json<ConfirmScopeRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
     if request.targets.is_empty() {
         return Err(AppError::bad_request("至少需要一个授权目标"));
     }
@@ -219,16 +280,21 @@ async fn confirm_scope(
     let snapshot = json!({
         "targets": request.targets,
         "constraints": request.constraints,
+        "confirmed": true,
         "confirmed_at": chrono::Utc::now(),
-        "confirmed_by": "admin"
+        "confirmed_by": user.user_id
     });
     let affected = sqlx::query(
         "UPDATE pent_agent_sessions
          SET confirmed_scope_snapshot = $2, status = 'ready', updated_at = now()
-         WHERE id = $1 AND status IN ('draft', 'ready')",
+         WHERE id=$1 AND tenant_id=$3 AND status IN ('draft', 'ready')
+           AND ($4 OR created_by=$5)",
     )
     .bind(&id)
     .bind(&snapshot)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
     .execute(&state.pool)
     .await
     .map_err(internal)?
@@ -249,14 +315,22 @@ async fn confirm_scope(
 async fn create_session_run(
     State(state): State<PentState>,
     Path(id): Path<String>,
+    user: CurrentUser,
     Json(request): Json<CreateSessionRunRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
     let row: Option<(Option<String>, String, Value, Value, Value)> = sqlx::query_as(
         "SELECT project_id, objective, confirmed_scope_snapshot, constraints, budget
          FROM pent_agent_sessions
-         WHERE id = $1 AND status = 'ready' AND confirmed_scope_snapshot IS NOT NULL",
+         WHERE id=$1 AND tenant_id=$2 AND status='ready'
+           AND ($3 OR created_by=$4)
+           AND confirmed_scope_snapshot IS NOT NULL
+           AND jsonb_array_length(confirmed_scope_snapshot->'targets') > 0",
     )
     .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(internal)?;
@@ -277,14 +351,16 @@ async fn create_session_run(
         "INSERT INTO pent_tasks(
              id, tenant_id, project_id, name, description, target_scope,
              priority, status, created_by
-         ) VALUES($1, 0, $2, $3, $4, $5, $6, 'queued', 'admin')",
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, 'queued', $8)",
     )
     .bind(&task_id)
+    .bind(tenant_id)
     .bind(&project_id)
     .bind(name)
     .bind(&objective)
     .bind(&scope)
     .bind(priority)
+    .bind(&user.user_id)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
@@ -293,10 +369,12 @@ async fn create_session_run(
         "INSERT INTO pent_runs(
              id, task_id, tenant_id, user_id, project_id, session_id, status,
              objective_snapshot, scope_snapshot, policy_snapshot, budget_snapshot
-         ) VALUES($1, $2, 0, 'admin', $3, $4, 'queued', $5, $6, $7, $8)",
+         ) VALUES($1, $2, $3, $4, $5, $6, 'queued', $7, $8, $9, $10)",
     )
     .bind(&run_id)
     .bind(&task_id)
+    .bind(tenant_id)
+    .bind(&user.user_id)
     .bind(&project_id)
     .bind(&id)
     .bind(&objective)
@@ -342,8 +420,10 @@ async fn create_session_run(
 async fn create_instruction(
     State(state): State<PentState>,
     Path(run_id): Path<String>,
+    user: CurrentUser,
     Json(request): Json<CreateRunInstructionRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    security::ensure_run_access(&state.pool, &run_id, &user).await?;
     let allowed = [
         "steer",
         "provide_context",
@@ -379,7 +459,7 @@ async fn create_instruction(
         "INSERT INTO pent_run_instructions(
              id, session_id, run_id, instruction_type, content, payload,
              status, created_by, applied_at
-         ) VALUES($1, $2, $3, $4, $5, $6, $7, 'admin',
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $8,
                   CASE WHEN $7 = 'applied' THEN now() ELSE NULL END)",
     )
     .bind(&instruction_id)
@@ -389,6 +469,7 @@ async fn create_instruction(
     .bind(request.content.trim())
     .bind(&request.payload)
     .bind(status)
+    .bind(&user.user_id)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
@@ -448,20 +529,6 @@ async fn create_instruction(
         "run_id": run_id,
         "status": status
     }))))
-}
-
-async fn ensure_session_exists(state: &PentState, id: &str) -> Result<(), AppError> {
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pent_agent_sessions WHERE id = $1)")
-            .bind(id)
-            .fetch_one(&state.pool)
-            .await
-            .map_err(internal)?;
-    if exists {
-        Ok(())
-    } else {
-        Err(AppError::not_found("Agent Session 不存在"))
-    }
 }
 
 fn internal(error: sqlx::Error) -> AppError {

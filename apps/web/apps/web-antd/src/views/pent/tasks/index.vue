@@ -4,12 +4,16 @@ import { ref, onMounted } from 'vue';
 import { message } from 'ant-design-vue';
 import { getPentTasks, createPentTask, cancelPentTask, deletePentTask, createPentRun } from '#/api/pent';
 const data = ref<any[]>([]); const loading = ref(false); const modalVisible = ref(false);
-const form = ref({ name: '', target_scope: '["10.0.0.0/24"]', priority: 'medium' });
+const form = ref({ name: '', target_scope: '["10.0.0.0/24"]', priority: 'medium', authorization_confirmed: false });
 const columns = [{ title:'名称',dataIndex:'name'},{ title:'状态',dataIndex:'status',width:90},{ title:'优先级',dataIndex:'priority',width:80},{ title:'创建时间',dataIndex:'created_at',width:180},{ title:'操作',key:'actions',width:200 }];
 const priorityColor:Record<string,string>={low:'green',medium:'orange',high:'red',critical:'#f5222d'};
 async function fetch() { loading.value=true; try { data.value=(await getPentTasks()) as any[]; } catch { message.error('加载失败'); } finally { loading.value=false; } }
 onMounted(fetch);
-async function handleCreate() { await createPentTask({...form.value,target_scope:JSON.parse(form.value.target_scope||'[]')}); message.success('创建成功'); modalVisible.value=false; fetch(); }
+async function handleCreate() {
+  if (!form.value.authorization_confirmed) { message.warning('请先确认目标测试授权'); return; }
+  await createPentTask({...form.value,target_scope:JSON.parse(form.value.target_scope||'[]')});
+  message.success('创建成功'); modalVisible.value=false; fetch();
+}
 async function handleRun(task:any) { await createPentRun({task_id:task.id}); message.success('Run 已创建'); }
 async function handleDelete(task:any) { await deletePentTask(task.id); message.success('已删除'); fetch(); }
 </script>
@@ -31,6 +35,7 @@ async function handleDelete(task:any) { await deletePentTask(task.id); message.s
         <a-form-item label="名称" required><a-input v-model:value="form.name" /></a-form-item>
         <a-form-item label="目标范围" required><a-textarea v-model:value="form.target_scope" /></a-form-item>
         <a-form-item label="优先级"><a-select v-model:value="form.priority"><a-select-option value="low">低</a-select-option><a-select-option value="medium">中</a-select-option><a-select-option value="high">高</a-select-option><a-select-option value="critical">紧急</a-select-option></a-select></a-form-item>
+        <a-form-item required><a-checkbox v-model:checked="form.authorization_confirmed">我确认已获得上述目标的安全测试授权</a-checkbox></a-form-item>
       </a-form>
     </a-modal>
   </div>

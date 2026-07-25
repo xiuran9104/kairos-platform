@@ -22,9 +22,15 @@ impl ConversationContextSource for PgContextSource {
             serde_json::Value,
             serde_json::Value,
             Option<String>,
+            serde_json::Value,
         ) = sqlx::query_as(
             "SELECT objective, scope_proposal, COALESCE(confirmed_scope_snapshot, '{}'::jsonb),
-                        constraints, active_run_id
+                        constraints, active_run_id,
+                        COALESCE(
+                            (SELECT budget_snapshot FROM pent_runs WHERE id=active_run_id),
+                            budget,
+                            '{}'::jsonb
+                        )
                  FROM pent_agent_sessions WHERE id = $1",
         )
         .bind(&req.session_id)
@@ -56,6 +62,37 @@ impl ConversationContextSource for PgContextSource {
             content: req.content.clone(),
             format: "text".into(),
         });
+
+        let mut run_summary = sqlx::query_scalar::<_, String>(
+            "SELECT run_summary FROM pent_context_snapshots
+             WHERE session_id=$1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&req.session_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_default();
+        let mut memory_refs = Vec::new();
+        if let Some(run_id) = session.4.as_deref() {
+            let memories: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id::text,content FROM pent_knowledge_documents
+                 WHERE source='conversation-memory' AND tags ? $1
+                 ORDER BY created_at DESC LIMIT 12",
+            )
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?;
+            if !memories.is_empty() {
+                memory_refs = memories.iter().map(|(id, _)| id.clone()).collect();
+                let recalled = memories
+                    .iter()
+                    .rev()
+                    .map(|(_, content)| content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                run_summary.push_str("\n\n## 长期记忆召回\n");
+                run_summary.push_str(&recalled);
+            }
+        }
 
         let estimated_tokens = messages
             .iter()
@@ -94,6 +131,7 @@ impl ConversationContextSource for PgContextSource {
 - js_collect: 收集页面引用的 JavaScript 文件
 - js_analyze: 从 JavaScript 中提取 API、上传路径、鉴权和技术线索
 - file_upload_validate: 明确授权后用无害标记文件验证上传和存储行为
+- knowledge_search: 检索平台 Wiki 验证方法；未验证线索、工具失败或缺少验证路径时必须调用
 
 ## 行为准则
 1. 用户给出目标后，**立即开始用工具执行信息收集**，不要反问"需要我执行吗"
@@ -103,17 +141,20 @@ impl ConversationContextSource for PgContextSource {
 5. 只有完成发现、分析、验证（或明确记录阻塞原因）后才能输出最终报告
 6. 只用中文回复用户，用英文和工具交互
 7. 如果目标明显超出授权范围，明确指出并停止对该目标的操作
-8. 最终报告区分已验证发现、未验证线索和无安全影响的正常行为"#,
+8. 发现未验证线索时，先调用 knowledge_search 检索对应 Wiki，再根据方法使用可用工具持续验证
+9. 每条未验证线索必须单独检索 Wiki，并至少执行两次非重复的实际工具验证；严重度只影响排序和评级，不能减少验证力度
+10. 多次验证后仍无法确认时，只能标记为“可能存在”，并逐项写明已尝试方法、Evidence、无法确认原因和下一步复核思路
+11. 最终报告区分已验证发现、未验证线索、安全配置问题和无安全影响的正常行为"#,
                 authorization_context
             ),
             objective_snapshot: session.0,
             scope_snapshot,
             policy_snapshot: session.3,
-            budget_snapshot: serde_json::json!({}),
-            run_summary: String::new(),
+            budget_snapshot: session.5,
+            run_summary,
             recent_messages: messages,
             evidence_refs: vec![],
-            memory_refs: vec![],
+            memory_refs,
             tool_ids: vec![],
             estimated_tokens,
         })

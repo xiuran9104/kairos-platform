@@ -45,15 +45,20 @@ async function initSession() {
       const msgs: any = await getPentSessionMessages(sessionId.value);
       const msgList = Array.isArray(msgs) ? msgs : (msgs?.data ?? []);
       if (msgList.length > 0) {
-        messages.value = msgList.map((m: any) => ({
-          id: m.id,
-          role: m.role,
-          type: m.format || m.message_type || 'text',
-          content: m.content,
-          payload: m.payload,
-          time: m.created_at ? new Date(m.created_at).toLocaleTimeString() : '',
-          status: m.status || 'completed',
-        }));
+        messages.value = msgList
+          .filter((m: any) => {
+            const type = m.format || m.message_type || 'text';
+            return m.role !== 'tool' && type !== 'tool_result' && type !== 'tool_calls';
+          })
+          .map((m: any) => ({
+            id: m.id,
+            role: m.role,
+            type: m.format || m.message_type || 'text',
+            content: m.content,
+            payload: m.payload,
+            time: m.created_at ? new Date(m.created_at).toLocaleTimeString() : '',
+            status: m.status || 'completed',
+          }));
       } else {
         messages.value = [{
           role: 'assistant', type: 'text',
@@ -140,6 +145,35 @@ async function sendMessage() {
       activeTurnId.value = turnId;
       // Track which message IDs we've already shown
       const seenIds = new Set(messages.value.filter((m: any) => m.id).map((m: any) => m.id));
+      const progressId = `scan_progress_${turnId}`;
+      const progress = {
+        completed: 0,
+        requested: 0,
+        tools: new Set<string>(),
+      };
+      const updateProgress = () => {
+        const toolNames = [...progress.tools];
+        const content = [
+          '🔄 扫描进行中',
+          `已完成 ${progress.completed}/${Math.max(progress.requested, progress.completed)} 次工具调用`,
+          toolNames.length > 0 ? `已使用：${toolNames.join('、')}` : '',
+          '原始结果正在写入 Evidence，扫描结束后统一生成报告。',
+        ].filter(Boolean).join('\n');
+        const existing = messages.value.find((item: any) => item.id === progressId);
+        if (existing) {
+          existing.content = content;
+          existing.time = new Date().toLocaleTimeString();
+        } else {
+          messages.value.push({
+            id: progressId,
+            role: 'assistant',
+            type: 'progress',
+            content,
+            time: new Date().toLocaleTimeString(),
+            status: 'streaming',
+          });
+        }
+      };
 
       // Keep polling for the backend's absolute turn limit (2 hours).
       // Long-running tool turns must not be reported as failed while the
@@ -156,7 +190,8 @@ async function sendMessage() {
         if (turn?.status === 'failed') {
           throw new Error(turn.error_message || '模型处理失败');
         }
-        // Show all new messages (assistant text, tool_calls, tool results)
+        // Tool calls/results update one progress row. Only assistant text is
+        // rendered as chat; raw observations remain in Evidence.
         if (turn?.messages && Array.isArray(turn.messages)) {
           for (const m of turn.messages) {
             if (m.role === 'user') continue; // skip user messages
@@ -169,22 +204,24 @@ async function sendMessage() {
             let displayRole = m.role;
 
             if (m.role === 'tool' || msgType === 'tool_result') {
-              // Parse tool result for nicer display
+              progress.completed += 1;
               try {
                 const payload = typeof m.content === 'string' ? JSON.parse(m.content) : m.content;
-                if (payload?.tool_name && payload?.result) {
-                  displayRole = 'tool';
-                  displayContent = `🔧 **${payload.tool_name}**\n${payload.result?.slice(0, 500) || ''}`;
-                }
-              } catch { /* raw text */ }
+                if (payload?.tool_name) progress.tools.add(payload.tool_name);
+              } catch { /* progress count is still valid */ }
+              updateProgress();
+              continue;
             } else if (msgType === 'tool_calls') {
               try {
                 const payload = typeof m.content === 'string' ? JSON.parse(m.content) : m.content;
                 if (payload?.tool_calls) {
                   const names = payload.tool_calls.map((tc: any) => tc.function?.name || 'unknown');
-                  displayContent = `🔍 调用工具: ${names.join(', ')}`;
+                  progress.requested += names.length;
+                  names.forEach((name: string) => progress.tools.add(name));
                 }
-              } catch { /* raw */ }
+              } catch { /* progress will update on results */ }
+              updateProgress();
+              continue;
             }
 
             if (displayContent?.trim()) {
@@ -209,7 +246,10 @@ async function sendMessage() {
           });
           break;
         }
-        if (turn?.status === 'completed') break;
+        if (turn?.status === 'completed') {
+          messages.value = messages.value.filter((item: any) => item.id !== progressId);
+          break;
+        }
         attempts++;
       }
 

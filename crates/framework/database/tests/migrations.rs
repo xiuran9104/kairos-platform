@@ -1,4 +1,4 @@
-use kairos_platform_framework_database::{DatabaseConfig, connect, migrate};
+use kairos_platform_framework_database::{DatabaseConfig, connect, ensure_initialized};
 use sqlx::Row;
 
 #[tokio::test]
@@ -8,7 +8,9 @@ async fn applies_all_migrations_to_empty_postgres() {
     let config = DatabaseConfig::new(url, 1, 5, std::time::Duration::from_secs(10))
         .expect("valid test database config");
     let pool = connect(&config).await.expect("connect test database");
-    migrate(&pool).await.expect("apply complete migration set");
+    ensure_initialized(&pool)
+        .await
+        .expect("database bootstrap is initialized");
 
     let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success")
         .fetch_one(&pool)
@@ -48,6 +50,10 @@ async fn applies_all_migrations_to_empty_postgres() {
         "infra_api_error_log",
         "infra_codegen_table",
         "infra_codegen_column",
+        "pent_runtime_policies",
+        "pent_runs",
+        "pent_tool_calls",
+        "pent_workers",
         "yudao_demo01_contact",
         "yudao_demo02_category",
         "yudao_demo03_student",
@@ -118,6 +124,96 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("read seeded administrators");
     assert!(administrators > 0);
+
+    let pent_roles: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM system_role
+         WHERE deleted=0
+           AND code IN ('pent_operator','pent_approver','pent_auditor')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read seeded Pent roles");
+    assert_eq!(
+        pent_roles, 9,
+        "all Pent operational roles must be seeded for every baseline tenant"
+    );
+
+    let pent_action_permissions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM system_menu
+         WHERE deleted=0 AND type=3
+           AND permission IN (
+               'pent:project:create','pent:task:create','pent:task:cancel',
+               'pent:run:execute','pent:approval:decide','pent:evidence:read',
+               'pent:artifact:download','pent:tool:manage',
+               'pent:rmos:feedback','pent:settings:manage'
+           )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read Pent action permissions");
+    assert_eq!(
+        pent_action_permissions, 10,
+        "all Pent action permissions must be seeded"
+    );
+
+    let pent_runtime_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='pent_runs'
+           AND column_name IN (
+               'retry_count','next_attempt_at','failure_code','failure_message',
+               'cancel_requested_at','execution_cursor'
+           )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect Pent run state columns");
+    assert_eq!(pent_runtime_columns, 6);
+
+    let finding_evidence_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='pent_findings'
+           AND column_name IN (
+               'description','fingerprint','confidence','false_positive_status',
+               'reviewed_by','reviewed_at','review_comment'
+           )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect Finding evidence and review columns");
+    assert_eq!(finding_evidence_columns, 7);
+
+    let medium_risk_requires_approval: bool = sqlx::query_scalar(
+        "SELECT require_approval_for ? 'medium'
+         FROM pent_runtime_policies WHERE tenant_id=0",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect default Pent approval policy");
+    assert!(medium_risk_requires_approval);
+
+    let active_validators: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pent_tool_definitions
+         WHERE lifecycle_status='active' AND tool_id IN (
+             'sqli_validate','xss_validate','csrf_validate',
+             'command_injection_validate','file_inclusion_validate',
+             'file_upload_validate'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect active vulnerability validators");
+    assert_eq!(active_validators, 6);
+
+    let pent_event_trigger_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM pg_trigger
+             WHERE tgname='trg_notify_pent_run_event' AND NOT tgisinternal
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect Pent event notification trigger");
+    assert!(pent_event_trigger_exists);
 
     let baseline_tenants: i64 =
         sqlx::query_scalar("SELECT count(*) FROM system_tenant WHERE deleted = 0")
@@ -212,7 +308,7 @@ async fn applies_all_migrations_to_empty_postgres() {
 
     let plain_sms_secrets: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM system_sms_channel
-         WHERE api_key NOT LIKE 'enc:v1:%'
+         WHERE (api_key IS NOT NULL AND api_key <> '' AND api_key NOT LIKE 'enc:v1:%')
             OR (api_secret IS NOT NULL AND api_secret <> '' AND api_secret NOT LIKE 'enc:v1:%')",
     )
     .fetch_one(&pool)

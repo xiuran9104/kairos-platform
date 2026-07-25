@@ -8,8 +8,8 @@ use kairos_platform_pent_api::{
 
 use super::{
     ConversationAuthorizationService, ConversationContextSource, ConversationEventSink,
-    ConversationInstructionSink, ConversationIntentDetector, ConversationModelGateway,
-    ConversationRepository, ModelTurnOutput,
+    ConversationInstructionSink, ConversationIntentDetector, ConversationKnowledgeSource,
+    ConversationModelGateway, ConversationRepository, ModelTurnOutput,
 };
 
 /// Maximum tool-calling rounds before forcing a stop.
@@ -18,6 +18,66 @@ use super::{
 const MAX_TOOL_ROUNDS: usize = 50;
 /// Absolute maximum runtime for a conversation turn (2 hours).
 const MAX_TURN_RUNTIME_SECS: u64 = 2 * 60 * 60;
+/// Tool observations sent back to the model are compact. The complete response
+/// has already been persisted as Evidence before this representation is used.
+const MAX_MODEL_TOOL_OBSERVATION_CHARS: usize = 8_000;
+const MAX_RUN_SUMMARY_CHARS: usize = 12_000;
+
+#[derive(Debug, Clone, Copy)]
+struct TurnBudget {
+    max_tool_rounds: usize,
+    max_duration_seconds: u64,
+    max_requests: usize,
+    max_tokens: u64,
+}
+
+impl TurnBudget {
+    fn from_snapshot(value: &serde_json::Value) -> Self {
+        if std::env::var("PENTA_UNLIMITED_BUDGETS")
+            .map(|value| value != "false")
+            .unwrap_or_else(|_| std::env::var("PENTA_ENV").as_deref() == Ok("development"))
+        {
+            return Self {
+                max_tool_rounds: usize::MAX,
+                max_duration_seconds: u64::MAX,
+                max_requests: usize::MAX,
+                max_tokens: u64::MAX,
+            };
+        }
+        let mut budget = Self {
+            max_tool_rounds: budget_u64(value, &["max_tool_rounds", "maxToolRounds"], 50)
+                .clamp(1, MAX_TOOL_ROUNDS as u64) as usize,
+            max_duration_seconds: budget_u64(
+                value,
+                &[
+                    "max_duration_seconds",
+                    "maxDurationSeconds",
+                    "max_time_seconds",
+                ],
+                MAX_TURN_RUNTIME_SECS,
+            )
+            .clamp(1, MAX_TURN_RUNTIME_SECS),
+            max_requests: budget_u64(value, &["max_requests", "maxRequests"], 200).clamp(1, 10_000)
+                as usize,
+            max_tokens: budget_u64(value, &["max_tokens", "maxTokens"], 200_000)
+                .clamp(1, 2_000_000),
+        };
+        if std::env::var("PENTA_ENV").as_deref() == Ok("development") {
+            budget.max_tokens = std::env::var("PENTA_DEV_MAX_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(2_000_000)
+                .clamp(1, 10_000_000);
+        }
+        budget
+    }
+}
+
+fn budget_u64(value: &serde_json::Value, keys: &[&str], default: u64) -> u64 {
+    keys.iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_u64))
+        .unwrap_or(default)
+}
 
 pub struct ConversationRuntime {
     repository: Arc<dyn ConversationRepository>,
@@ -25,6 +85,7 @@ pub struct ConversationRuntime {
     context_source: Arc<dyn ConversationContextSource>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
     model_gateway: Arc<dyn ConversationModelGateway>,
+    knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     instruction_sink: Arc<dyn ConversationInstructionSink>,
     events: Arc<dyn ConversationEventSink>,
 }
@@ -36,6 +97,7 @@ impl ConversationRuntime {
         context_source: Arc<dyn ConversationContextSource>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
         model_gateway: Arc<dyn ConversationModelGateway>,
+        knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         instruction_sink: Arc<dyn ConversationInstructionSink>,
         events: Arc<dyn ConversationEventSink>,
     ) -> Self {
@@ -45,6 +107,7 @@ impl ConversationRuntime {
             context_source,
             intent_detector,
             model_gateway,
+            knowledge_source,
             instruction_sink,
             events,
         }
@@ -91,6 +154,9 @@ impl ConversationRuntime {
     ) -> anyhow::Result<()> {
         self.authorization
             .reconcile_explicit_authorization(&request.session_id, &request.content)
+            .await?;
+        self.repository
+            .ensure_execution_run(turn_id, &request.session_id)
             .await?;
         let context = self.context_source.build(request).await?;
         let intent = self
@@ -254,8 +320,20 @@ impl ConversationRuntime {
         intent: &ConversationIntent,
     ) -> anyhow::Result<String> {
         let mut final_output: Option<super::ports::ModelTurnOutput> = None;
-        let mut all_tool_results_text = String::new();
         let turn_start = std::time::Instant::now();
+        let budget = TurnBudget::from_snapshot(&context.budget_snapshot);
+        let mut request_count = 0usize;
+        // Per-turn budget counts actual model API usage below. Historical
+        // messages are windowed by the model gateway and are already included
+        // in each provider-reported input_tokens value.
+        let mut token_count = 0u64;
+        let mut successful_observations = 0usize;
+        let mut stopped_by_budget: Option<&'static str> = None;
+        let mut rounds_used = 0usize;
+        let mut finished_normally = false;
+        let mut evidence_ids = Vec::new();
+        let mut run_summary = context.run_summary.clone();
+        let mut request_fingerprints = std::collections::HashSet::new();
 
         // ── Phase 0: Planning (like PentAGI CLI's should_prepare_tool_plan) ──
         let user_input = context
@@ -263,7 +341,8 @@ impl ConversationRuntime {
             .last()
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        let mut scan_progress = super::scan_progress::ScanProgress::new(&user_input);
+        let scan_goal = format!("{user_input}\n{}", context.objective_snapshot);
+        let mut scan_progress = super::scan_progress::ScanProgress::new(&scan_goal);
         if needs_planning(&user_input) {
             let plan = self
                 .generate_plan(turn_id, session_id, &user_input, &context, intent)
@@ -272,15 +351,16 @@ impl ConversationRuntime {
             self.repository
                 .write_intermediate_message(turn_id, session_id, "assistant", &plan, "text")
                 .await?;
-            all_tool_results_text.push_str(&format!("## 📋 攻击计划\n\n{}\n\n---\n\n", plan));
         }
 
-        for round in 0..MAX_TOOL_ROUNDS {
-            if turn_start.elapsed().as_secs() >= MAX_TURN_RUNTIME_SECS {
-                all_tool_results_text.push_str(&format!(
-                    "\n\n⏱ 已达到最大运行时间限制 ({} 分钟)，停止执行。",
-                    MAX_TURN_RUNTIME_SECS / 60
-                ));
+        for round in 0..budget.max_tool_rounds {
+            rounds_used = round + 1;
+            if turn_start.elapsed().as_secs() >= budget.max_duration_seconds {
+                stopped_by_budget = Some("time");
+                break;
+            }
+            if token_count >= budget.max_tokens {
+                stopped_by_budget = Some("tokens");
                 break;
             }
 
@@ -293,6 +373,9 @@ impl ConversationRuntime {
                     return Err(anyhow::anyhow!("模型调用失败: {error}"));
                 }
             };
+            token_count = token_count
+                .saturating_add(output.usage.input_tokens)
+                .saturating_add(output.usage.output_tokens);
 
             if !output.tool_calls.is_empty() {
                 // Write assistant tool_calls message to DB so SSE can stream it
@@ -330,22 +413,71 @@ impl ConversationRuntime {
                 });
 
                 for tc in &output.tool_calls {
+                    if request_count >= budget.max_requests {
+                        stopped_by_budget = Some("requests");
+                        break;
+                    }
+                    request_count += 1;
                     scan_progress.record_tool(&tc.name);
-                    let result = super::tool_executor::execute_tool(
+                    let tool_started = std::time::Instant::now();
+                    let fingerprint = tool_request_fingerprint(&tc.name, &tc.arguments);
+                    let result = if !request_fingerprints.insert(fingerprint) {
+                        super::tool_executor::ConversationToolResult {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            content: serde_json::json!({
+                                "duplicate_skipped": true,
+                                "message": "同一工具请求已在本轮执行，使用已有观察并推进下一阶段"
+                            })
+                            .to_string(),
+                            success: true,
+                        }
+                    } else if tc.name == "knowledge_search" {
+                        self.execute_knowledge_search(&tc.id, &tc.arguments).await
+                    } else {
+                        super::tool_executor::execute_tool(
+                            &tc.name,
+                            &tc.arguments,
+                            &context.scope_snapshot,
+                            session_id,
+                        )
+                        .await
+                    };
+                    let duplicate_skipped = result.content.contains(r#""duplicate_skipped":true"#);
+                    scan_progress.record_tool_result(&tc.name, result.success, duplicate_skipped);
+                    if result.success && has_effective_observation(&tc.name, &result.content) {
+                        successful_observations += 1;
+                    }
+                    let evidence_id = if let Some(run_id) = context.run_id.as_deref() {
+                        let evidence_id = self
+                            .repository
+                            .record_tool_result(
+                                run_id,
+                                &tc.id,
+                                &tc.name,
+                                &tc.arguments,
+                                result.success,
+                                &result.content,
+                                tool_started
+                                    .elapsed()
+                                    .as_millis()
+                                    .try_into()
+                                    .unwrap_or(u64::MAX),
+                            )
+                            .await?;
+                        evidence_ids.push(evidence_id.clone());
+                        Some(evidence_id)
+                    } else {
+                        None
+                    };
+                    append_run_summary(
+                        &mut run_summary,
+                        round + 1,
                         &tc.name,
-                        &tc.arguments,
-                        &context.scope_snapshot,
-                    )
-                    .await;
-                    let result_text = format!(
-                        "🔧 **{}** {}\n{}",
-                        tc.name,
-                        if result.success { "✅" } else { "❌" },
-                        truncate_for_display(&result.content, 2000)
+                        result.success,
+                        evidence_id.as_deref(),
+                        &result.content,
                     );
-                    all_tool_results_text.push_str(&result_text);
-                    all_tool_results_text.push('\n');
-
                     // Persist tool result for SSE
                     let display_content = serde_json::json!({
                         "tool_name": tc.name,
@@ -368,12 +500,19 @@ impl ConversationRuntime {
                         role: "tool".into(),
                         content: serde_json::json!({
                             "tool_call_id": tc.id,
-                            "result": result.content
+                            "result": compact_model_observation(&result.content)
                         })
                         .to_string(),
                         format: "tool_result".into(),
                     });
                 }
+                if stopped_by_budget.is_some() {
+                    break;
+                }
+                context.run_summary = run_summary.clone();
+                self.repository
+                    .checkpoint_context(turn_id, &context, &run_summary, &evidence_ids)
+                    .await?;
 
                 if !output.content.trim().is_empty() {
                     final_output = Some(output);
@@ -401,37 +540,273 @@ impl ConversationRuntime {
                 continue;
             }
             final_output = Some(output);
+            finished_normally = true;
             break;
         }
 
+        if let Some(kind) = stopped_by_budget {
+            anyhow::bail!(
+                "RUN_INCOMPLETE: {} budget exhausted (rounds={}, requests={}, tokens={})",
+                kind,
+                rounds_used,
+                request_count,
+                token_count
+            );
+        }
+        if !finished_normally {
+            anyhow::bail!(
+                "RUN_INCOMPLETE: max_tool_rounds exhausted ({})",
+                budget.max_tool_rounds
+            );
+        }
+        if request_count > 0 && successful_observations == 0 {
+            anyhow::bail!(
+                "RUN_BLOCKED: all tool calls failed or returned no effective observation"
+            );
+        }
         let output = final_output.ok_or_else(|| anyhow::anyhow!("模型未返回有效响应"))?;
 
-        let final_content =
-            if !all_tool_results_text.is_empty() && !output.content.trim().is_empty() {
-                format!(
-                    "{}\n\n---\n\n### 🔍 工具执行记录\n\n{}",
-                    output.content, all_tool_results_text
-                )
-            } else if !output.content.trim().is_empty() {
-                output.content.clone()
+        let final_content = if context.run_id.is_some() {
+            let report = if output.content.trim().is_empty() {
+                "本轮未生成文字结论；请依据 Evidence 进行复核。"
             } else {
-                format!("### 🔍 工具执行结果\n\n{}", all_tool_results_text)
+                output.content.trim()
             };
+            let run_reference = context.run_id.as_deref().unwrap_or("无");
+            format!(
+                "{report}\n\n---\n\n## 结构化证据索引\n\n\
+                 - 工具调用：{request_count}\n- 有效观察：{successful_observations}\n\
+                 - Evidence 数量：{}\n- Run：`{run_reference}`\n\n\
+                 各项发现应引用其 Evidence；完整证据可在该 Run 的 Evidence 页面复核。\
+                 原始响应未直接拼接进报告。",
+                evidence_ids.len()
+            )
+        } else if !output.content.trim().is_empty() {
+            output.content.clone()
+        } else {
+            format!(
+                "本轮完成了 {request_count} 次受控工具调用并形成 {successful_observations} 条有效观察。\
+                 原始响应已保存为 Evidence，报告不内联原始输出。"
+            )
+        };
 
         Ok(final_content)
     }
+
+    async fn execute_knowledge_search(
+        &self,
+        tool_call_id: &str,
+        arguments: &str,
+    ) -> super::tool_executor::ConversationToolResult {
+        let parsed = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
+        let query = parsed
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if query.is_empty() {
+            return super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "knowledge_search".into(),
+                content: serde_json::json!({"error":"query 不能为空"}).to_string(),
+                success: false,
+            };
+        }
+        match self.knowledge_source.search_guides(query, 4).await {
+            Ok(guides) => super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "knowledge_search".into(),
+                content: serde_json::json!({
+                    "query": query,
+                    "guide_count": guides.len(),
+                    "guides": guides,
+                    "instruction": "根据 Wiki 方法选择当前可用工具继续验证；不要仅复述知识。"
+                })
+                .to_string(),
+                success: !guides.is_empty(),
+            },
+            Err(error) => super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "knowledge_search".into(),
+                content: serde_json::json!({"error":error.to_string()}).to_string(),
+                success: false,
+            },
+        }
+    }
 }
 
-fn truncate_for_display(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        text.to_string()
+fn append_run_summary(
+    summary: &mut String,
+    round: usize,
+    tool_name: &str,
+    success: bool,
+    evidence_id: Option<&str>,
+    observation: &str,
+) {
+    let observation = serde_json::from_str::<serde_json::Value>(observation)
+        .ok()
+        .map(|value| {
+            for key in [
+                "status",
+                "status_code",
+                "reachable",
+                "url",
+                "target",
+                "findings",
+                "endpoints",
+                "security_hints",
+            ] {
+                if let Some(item) = value.get(key) {
+                    return format!("{key}={}", compact_summary_value(item));
+                }
+            }
+            "结构化观察已保存".to_string()
+        })
+        .unwrap_or_else(|| "非结构化观察已保存".to_string());
+    let line = format!(
+        "\n- 第{round}轮 `{tool_name}`：{}；{}；Evidence `{}`",
+        if success { "成功" } else { "失败" },
+        observation,
+        evidence_id.unwrap_or("无")
+    );
+    summary.push_str(&line);
+    if summary.chars().count() > MAX_RUN_SUMMARY_CHARS {
+        *summary = summary
+            .chars()
+            .rev()
+            .take(MAX_RUN_SUMMARY_CHARS)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        summary.insert_str(0, "[较早摘要已滚动压缩]\n");
+    }
+}
+
+fn compact_summary_value(value: &serde_json::Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() <= 300 {
+        text
     } else {
-        // Find a valid UTF-8 character boundary at or before max_chars
-        let mut end = max_chars;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…(截断，共 {} 字符)", &text[..end], text.len())
+        format!("{}…", text.chars().take(300).collect::<String>())
+    }
+}
+
+fn tool_request_fingerprint(tool_name: &str, arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return format!("{tool_name}:{arguments}");
+    };
+    if tool_name == "http_request" {
+        return serde_json::json!({
+            "tool": tool_name,
+            "method": value.get("method").and_then(serde_json::Value::as_str)
+                .unwrap_or("GET").to_ascii_uppercase(),
+            "url": value.get("url").and_then(serde_json::Value::as_str)
+                .unwrap_or("").trim_end_matches('/'),
+            "body": value.get("body").cloned().unwrap_or(serde_json::Value::Null),
+            "form": value.get("form").cloned().unwrap_or(serde_json::Value::Null),
+        })
+        .to_string();
+    }
+    format!("{tool_name}:{value}")
+}
+
+fn compact_model_observation(content: &str) -> String {
+    if content.chars().count() <= MAX_MODEL_TOOL_OBSERVATION_CHARS {
+        return content.to_string();
+    }
+    let prefix: String = content
+        .chars()
+        .take(MAX_MODEL_TOOL_OBSERVATION_CHARS)
+        .collect();
+    format!(
+        "{prefix}\n...[模型上下文已截断；完整原始响应已保存为 Evidence，共 {} 字符]",
+        content.chars().count()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_MODEL_TOOL_OBSERVATION_CHARS, compact_model_observation, has_effective_observation,
+        tool_request_fingerprint,
+    };
+
+    #[test]
+    fn empty_placeholder_js_is_not_an_effective_observation() {
+        assert!(!has_effective_observation(
+            "js_analyze",
+            r#"{"endpoints":[],"security_hints":[],"technology_hints":[]}"#
+        ));
+        assert!(has_effective_observation(
+            "js_analyze",
+            r#"{"endpoints":["/api/users"],"security_hints":[]}"#
+        ));
+    }
+
+    #[test]
+    fn blocked_results_are_not_effective() {
+        assert!(!has_effective_observation(
+            "dir_fuzz",
+            r#"{"blocked":true,"error":"disabled"}"#
+        ));
+    }
+
+    #[test]
+    fn compacts_tool_observation_for_model_context() {
+        let raw = "a".repeat(MAX_MODEL_TOOL_OBSERVATION_CHARS + 10);
+        let compact = compact_model_observation(&raw);
+        assert!(compact.contains("完整原始响应已保存为 Evidence"));
+        assert!(compact.len() < raw.len() + 100);
+    }
+
+    #[test]
+    fn http_request_fingerprint_ignores_rotating_cookie() {
+        let first = tool_request_fingerprint(
+            "http_request",
+            r#"{"url":"http://target.test/a","headers":{"Cookie":"session=one"}}"#,
+        );
+        let second = tool_request_fingerprint(
+            "http_request",
+            r#"{"headers":{"Cookie":"session=two"},"url":"http://target.test/a/"}"#,
+        );
+        assert_eq!(first, second);
+    }
+}
+
+fn has_effective_observation(tool_name: &str, content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return !content.trim().is_empty();
+    };
+    if value.get("blocked").and_then(serde_json::Value::as_bool) == Some(true)
+        || value.get("error").is_some()
+    {
+        return false;
+    }
+    match tool_name {
+        "js_analyze" => ["endpoints", "security_hints", "technology_hints"]
+            .iter()
+            .any(|key| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+            }),
+        "http_probe" => value
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|results| {
+                results.iter().any(|result| {
+                    result.get("status").is_some()
+                        || result.get("reachable").and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                })
+            }),
+        "dns_lookup" => value
+            .pointer("/records/A")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|records| !records.is_empty()),
+        _ => true,
     }
 }
 

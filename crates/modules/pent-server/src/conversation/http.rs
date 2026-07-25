@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::future::{AbortHandle, Abortable};
+use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
 use kairos_platform_pent_api::{AgentTurnRequest, ConversationMessageType};
 use serde_json::{Value, json};
@@ -26,7 +27,9 @@ pub fn routes() -> Router<PentState> {
 async fn list_turns(
     State(s): State<PentState>,
     Path(session_id): Path<String>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
     let rows = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',t.id,'status',t.status,'intent',t.intent,'error_code',t.error_code,'error_message',t.error_message,'retryable',t.retryable,'created_at',t.created_at,'messages',COALESCE((SELECT jsonb_agg(jsonb_build_object('role',m.role,'content',m.content,'status',m.status,'format',m.format,'sequence',m.sequence) ORDER BY m.sequence) FROM pent_conversation_messages m WHERE m.turn_id=t.id),'[]'::jsonb)) FROM pent_conversation_turns t WHERE t.session_id=$1 ORDER BY t.created_at")
         .bind(&session_id).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
@@ -35,8 +38,10 @@ async fn list_turns(
 async fn create_turn(
     State(s): State<PentState>,
     Path(session_id): Path<String>,
+    user: CurrentUser,
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
     let content = body["content"].as_str().unwrap_or("").trim().to_string();
     if content.is_empty() {
         return Err(AppError::bad_request("消息内容不能为空"));
@@ -117,7 +122,9 @@ async fn create_turn(
 async fn session_events(
     State(s): State<PentState>,
     Path(session_id): Path<String>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
     let rows = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',m.id,'role',m.role,'content',m.content,'turn_id',m.turn_id,'created_at',m.created_at) FROM pent_conversation_messages m WHERE m.session_id=$1 ORDER BY m.created_at LIMIT 200")
         .bind(&session_id).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
@@ -126,7 +133,9 @@ async fn session_events(
 async fn cancel_turn(
     State(s): State<PentState>,
     Path(turn_id): Path<String>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    crate::security::ensure_turn_access(&s.pool, &turn_id, &user).await?;
     let affected = sqlx::query(
         "UPDATE pent_conversation_turns
          SET status='cancelled', completed_at=now()
@@ -166,7 +175,9 @@ async fn cancel_turn(
 async fn retry_turn(
     State(s): State<PentState>,
     Path(turn_id): Path<String>,
+    user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    crate::security::ensure_turn_access(&s.pool, &turn_id, &user).await?;
     let row: Option<(String, String, String)> = sqlx::query_as(
         "SELECT t.session_id, t.message_type, m.content
          FROM pent_conversation_turns t
@@ -204,12 +215,17 @@ async fn retry_turn(
 async fn stream_turn(
     State(s): State<PentState>,
     Path(turn_id): Path<String>,
-) -> axum::response::sse::Sse<
-    impl futures_util::stream::Stream<
-        Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+    user: CurrentUser,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures_util::stream::Stream<
+            Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+        >,
     >,
+    AppError,
 > {
-    turn_sse(s.pool.clone(), turn_id)
+    crate::security::ensure_turn_access(&s.pool, &turn_id, &user).await?;
+    Ok(turn_sse(s.pool.clone(), turn_id))
 }
 
 #[derive(serde::Serialize)]

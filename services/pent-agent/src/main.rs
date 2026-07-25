@@ -3,13 +3,31 @@
 //! Provides Agent runtime, Flow orchestration, tool execution,
 //! evidence collection, and run-time permission approval.
 
+use axum::{
+    extract::{Request, State},
+    middleware::{Next, from_fn_with_state},
+    response::Response,
+};
 use kairos_platform_framework_common::{ServiceConfig, init_tracing, serve};
 use kairos_platform_framework_database::{DatabaseConfig, connect, ensure_initialized};
-use kairos_platform_framework_security::{SecurityConfig, TokenService};
+use kairos_platform_framework_security::{
+    SecurityConfig, SecurityError, TokenService, authenticate,
+};
 use kairos_platform_framework_web::{WebConfig, apply_web_layers};
 use kairos_platform_pent_server::{PentConfig, PentState, routes};
 
 const SERVICE_NAME: &str = "pent-agent";
+
+async fn authenticate_pent(
+    State(tokens): State<TokenService>,
+    request: Request,
+    next: Next,
+) -> Result<Response, SecurityError> {
+    if request.uri().path() == "/pent/health" {
+        return Ok(next.run(request).await);
+    }
+    authenticate(State(tokens), request, next).await
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,7 +47,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    let app = apply_web_layers(routes(state), WebConfig::from_env());
+    let app = routes(state).layer(from_fn_with_state(tokens, authenticate_pent));
+    let app = apply_web_layers(app, WebConfig::from_env());
 
     serve(ServiceConfig::from_env(SERVICE_NAME, 8081), app).await
 }

@@ -66,7 +66,10 @@ impl EmbeddingProvider {
         let client = reqwest::Client::new();
         let resp = client
             .post(&endpoint)
-            .header("Authorization", format!("Bearer {}", api_key.trim_start_matches("Bearer ")))
+            .header(
+                "Authorization",
+                format!("Bearer {}", api_key.trim_start_matches("Bearer ")),
+            )
             .json(&body)
             .send()
             .await
@@ -76,7 +79,12 @@ impl EmbeddingProvider {
         value
             .pointer("/data/0/embedding")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).map(|f| f as f32).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64())
+                    .map(|f| f as f32)
+                    .collect()
+            })
     }
 }
 

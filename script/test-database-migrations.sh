@@ -12,7 +12,7 @@ docker run -d --name "$container" \
   -e POSTGRES_PASSWORD=kairos_platform \
   -e POSTGRES_DB=kairos_platform_test \
   -v "$repo_root/sql/postgresql/0001_initial.sql:/docker-entrypoint-initdb.d/0001_initial.sql:ro" \
-  -p "$port:5432" postgres:18 >/dev/null
+  -p "$port:5432" pgvector/pgvector:pg18 >/dev/null
 for _ in $(seq 1 30); do
   # The image starts a temporary Unix-socket server during initdb. Waiting on
   # TCP avoids racing that temporary process before the published port is ready.

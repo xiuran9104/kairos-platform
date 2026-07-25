@@ -11,6 +11,7 @@ use adapters::{DeterministicIntentDetector, LoggingConversationEventSink};
 use authorization::PgConversationAuthorizationService;
 use context_source::PgContextSource;
 use instruction_sink::InstructionSink;
+use memory_adapter::MemoryAdapter;
 use model_gateway::AiModelGateway;
 use repository_postgres::PgConversationRepository;
 
@@ -23,6 +24,7 @@ pub(crate) fn build_runtime(
         Arc::new(PgContextSource::new(pool.clone())),
         Arc::new(DeterministicIntentDetector),
         Arc::new(AiModelGateway::new(pool.clone())),
+        Arc::new(MemoryAdapter::new(pool.clone())),
         Arc::new(InstructionSink::new(pool.clone())),
         Arc::new(LoggingConversationEventSink),
     )

@@ -42,8 +42,11 @@ async fn list_tools_v2(
             'revision',revision,'created_at',created_at
          ) FROM pent_tool_definitions
          WHERE lifecycle_status='active'
-         ORDER BY namespace, name LIMIT 200"
-    ).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+         ORDER BY namespace, name LIMIT 200",
+    )
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
 }
 
@@ -76,7 +79,15 @@ async fn update_tool_version(
     Path((tool_id, version)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let rev = sqlx::query_scalar::<_, i64>("SELECT revision FROM pent_tool_definitions WHERE tool_id=$1 AND version=$2 ").bind(&tool_id).bind(&version).fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.ok_or_else(|| AppError::not_found("not found"))?;
+    let rev = sqlx::query_scalar::<_, i64>(
+        "SELECT revision FROM pent_tool_definitions WHERE tool_id=$1 AND version=$2 ",
+    )
+    .bind(&tool_id)
+    .bind(&version)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .ok_or_else(|| AppError::not_found("not found"))?;
     let client_rev = body["revision"].as_i64().unwrap_or(0);
     if client_rev != 0 && client_rev != rev {
         return Err(AppError::bad_request(
@@ -109,7 +120,6 @@ async fn health_check(
     State(s): State<PentState>,
     Path((tool_id, version)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    // Check if the tool's backend is reachable
     let row = sqlx::query_as::<_, (String, String)>(
         "SELECT tool_id,version FROM pent_tool_definitions WHERE tool_id=$1 AND version=$2",
     )
@@ -119,23 +129,69 @@ async fn health_check(
     .await
     .map_err(|e| AppError::internal(e.to_string()))?
     .ok_or_else(|| AppError::not_found("not found"))?;
-    // Verify the tool binary exists (for built-in tools) or container image is available
-    let healthy = match tool_id.as_str() {
-        "nuclei" => std::process::Command::new("nuclei").arg("-version").output().map(|o| o.status.success()).unwrap_or(false),
-        "afrog" => std::process::Command::new("afrog").arg("-version").output().map(|o| o.status.success()).unwrap_or(false),
-        _ => true, // External tools — health check is best-effort
+    let prepared = crate::infrastructure::tool_registry::prepare_tool(
+        &tool_id,
+        &["health-check.invalid".to_string()],
+        &crate::infrastructure::process::NetworkPolicy::Full,
+    );
+    let (healthy, detail) = match prepared {
+        Ok(prepared) => {
+            let image = prepared.container_image;
+            let image_check = tokio::process::Command::new("/usr/bin/docker")
+                .args([
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{json .RepoDigests}}",
+                    &image,
+                ])
+                .output()
+                .await;
+            let network = std::env::var("PENTA_DOCKER_TARGET_NETWORK").ok();
+            let network_healthy = if let Some(network) = &network {
+                tokio::process::Command::new("/usr/bin/docker")
+                    .args(["network", "inspect", network])
+                    .output()
+                    .await
+                    .is_ok_and(|output| output.status.success())
+            } else {
+                false
+            };
+            let image_digest_pinned = image.contains("@sha256:");
+            let image_healthy = image_check
+                .as_ref()
+                .is_ok_and(|output| output.status.success());
+            (
+                image_healthy && network_healthy && image_digest_pinned,
+                json!({
+                    "backend": "docker",
+                    "image": image,
+                    "image_present": image_healthy,
+                    "image_digest_pinned": image_digest_pinned,
+                    "target_network": network,
+                    "target_network_present": network_healthy
+                }),
+            )
+        }
+        Err(error) => (false, json!({"error": error})),
     };
     let status = if healthy { "healthy" } else { "unhealthy" };
     sqlx::query(
-        "INSERT INTO pent_tool_health(tool_id,version,status,checked_at) VALUES($1,$2,$3,now())",
+        "INSERT INTO pent_tool_health(tool_id,version,worker_id,status,detail,checked_at)
+         VALUES($1,$2,'control-plane',$3,$4,now())
+         ON CONFLICT(tool_id,version,worker_id) DO UPDATE SET
+             status=excluded.status,detail=excluded.detail,checked_at=now()",
     )
     .bind(&row.0)
     .bind(&row.1)
     .bind(status)
+    .bind(&detail)
     .execute(&s.pool)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(ApiResponse::new(json!({"status":status}))))
+    Ok(Json(ApiResponse::new(
+        json!({"status":status,"detail":detail}),
+    )))
 }
 
 #[derive(serde::Serialize)]

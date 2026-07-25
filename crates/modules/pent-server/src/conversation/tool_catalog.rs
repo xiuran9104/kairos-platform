@@ -37,8 +37,33 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
     }) {
         definitions.push(file_upload_validator_definition());
     }
+    if !definitions.iter().any(|definition| {
+        definition.pointer("/function/name").and_then(Value::as_str) == Some("knowledge_search")
+    }) {
+        definitions.push(knowledge_search_definition());
+    }
 
     Ok(definitions)
+}
+
+fn knowledge_search_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "knowledge_search",
+            "description": "检索平台 Wiki 安全方法论。发现未验证线索、工具失败、缺少验证步骤或准备将线索标记为未验证时必须调用；检索后应使用当前可用工具继续验证。",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "具体漏洞类型、技术栈、观察或验证目标，例如 CSP bypass DVWA、weak session ID validation"
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn file_upload_validator_definition() -> Value {
@@ -64,7 +89,7 @@ fn file_upload_validator_definition() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::file_upload_validator_definition;
+    use super::{file_upload_validator_definition, knowledge_search_definition};
     use crate::conversation::tool_executor::has_conversation_handler;
 
     #[test]
@@ -85,6 +110,16 @@ mod tests {
     fn model_catalog_only_advertises_tools_with_real_handlers() {
         assert!(has_conversation_handler("http_request"));
         assert!(has_conversation_handler("js_analyze"));
+        assert!(has_conversation_handler("knowledge_search"));
         assert!(!has_conversation_handler("sqlmap"));
+    }
+
+    #[test]
+    fn knowledge_search_requires_query() {
+        let definition = knowledge_search_definition();
+        assert_eq!(
+            definition["function"]["parameters"]["required"],
+            serde_json::json!(["query"])
+        );
     }
 }

@@ -4,13 +4,34 @@
 use std::time::Instant;
 
 const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 50_000;
+const NETWORK_TOOLS: &[&str] = &[
+    "dir_fuzz",
+    "dns_lookup",
+    "file_upload_validate",
+    "http_probe",
+    "http_request",
+    "js_collect",
+    "web_crawl",
+    "web_fingerprint",
+    "web_url_collect",
+];
+
+fn direct_network_tools_enabled() -> bool {
+    cfg!(test)
+        || (std::env::var("PENTA_ENV").as_deref() == Ok("development")
+            && std::env::var("PENTA_ALLOW_DIRECT_NETWORK_TOOLS").as_deref() == Ok("true"))
+}
+
+fn docker_conversation_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "http_probe" | "http_request")
+}
 
 /// Whether this process has a real conversation-mode handler for a registry
 /// tool. The database remains the source of truth for which tools are active;
 /// this predicate prevents the model from being offered catalog entries whose
 /// worker executors are not implemented yet.
 pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
-    matches!(
+    let implemented = matches!(
         tool_name,
         "dir_fuzz"
             | "dns_lookup"
@@ -19,10 +40,15 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "http_request"
             | "js_analyze"
             | "js_collect"
+            | "knowledge_search"
             | "web_crawl"
             | "web_fingerprint"
             | "web_url_collect"
-    )
+    );
+    implemented
+        && (!NETWORK_TOOLS.contains(&tool_name)
+            || docker_conversation_tool(tool_name)
+            || direct_network_tools_enabled())
 }
 
 /// Result of executing a single tool call from the LLM.
@@ -40,7 +66,23 @@ pub async fn execute_tool(
     name: &str,
     arguments: &str,
     scope_snapshot: &serde_json::Value,
+    session_id: &str,
 ) -> ConversationToolResult {
+    if NETWORK_TOOLS.contains(&name)
+        && !docker_conversation_tool(name)
+        && !direct_network_tools_enabled()
+    {
+        return ConversationToolResult {
+            tool_call_id: String::new(),
+            tool_name: name.into(),
+            content: serde_json::json!({
+                "error": "对话进程内网络工具默认关闭；请通过隔离 Worker 的 Run 执行",
+                "blocked": true
+            })
+            .to_string(),
+            success: false,
+        };
+    }
     if let Err(error) = super::tool_guard::validate_tool_scope(name, arguments, scope_snapshot) {
         return ConversationToolResult {
             tool_call_id: String::new(),
@@ -51,6 +93,12 @@ pub async fn execute_tool(
     }
     match name {
         // ── HTTP tools ──────────────────────────────────────────
+        "http_request" if !direct_network_tools_enabled() => {
+            execute_isolated_http_request(arguments, scope_snapshot, session_id).await
+        }
+        "http_probe" if !direct_network_tools_enabled() => {
+            execute_isolated_http_probe(arguments, scope_snapshot, session_id).await
+        }
         "http_request" => execute_http_request(arguments).await,
         "http_probe" => execute_http_probe(arguments).await,
 
@@ -77,6 +125,251 @@ pub async fn execute_tool(
             .to_string(),
             success: false,
         },
+    }
+}
+
+async fn execute_isolated_http_request(
+    arguments: &str,
+    scope_snapshot: &serde_json::Value,
+    session_id: &str,
+) -> ConversationToolResult {
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(error) => return tool_error("http_request", format!("参数解析失败: {error}")),
+    };
+    let Some(url) = args.get("url").and_then(serde_json::Value::as_str) else {
+        return tool_error("http_request", "url 参数为空");
+    };
+    let method = args
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("GET")
+        .to_ascii_uppercase();
+    let body = args
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut headers = parse_header_object(args.get("headers"));
+    let state_dir = match http_session_state_dir(session_id).await {
+        Ok(path) => path,
+        Err(error) => return tool_error("http_request", error),
+    };
+    let csrf_path = state_dir.join("csrf-token");
+    if let Ok(token) = tokio::fs::read_to_string(&csrf_path).await {
+        let header_name = args
+            .get("csrf_header")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("X-CSRF-Token");
+        if !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(header_name))
+        {
+            headers.insert(header_name.into(), serde_json::Value::String(token));
+        }
+    }
+    let form = args
+        .get("form")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let command = vec![
+        url.to_string(),
+        method.clone(),
+        body.to_string(),
+        serde_json::Value::Object(headers).to_string(),
+        if form.is_null() {
+            String::new()
+        } else {
+            form.to_string()
+        },
+    ];
+    let limits = isolated_http_limits(scope_snapshot, url, &state_dir);
+    let output =
+        match crate::infrastructure::process::execute_tool("http_request", &command, &limits).await
+        {
+            Ok(output) => output,
+            Err(error) => return tool_error("http_request", error),
+        };
+    if let Some(token) = extract_csrf_token(&output.stdout) {
+        if tokio::fs::write(&csrf_path, token).await.is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    tokio::fs::set_permissions(&csrf_path, std::fs::Permissions::from_mode(0o600))
+                        .await;
+            }
+        }
+    }
+    let status = last_http_status(&output.stdout);
+    let raw_response =
+        truncate_http_response_body(output.stdout.clone(), MAX_HTTP_RESPONSE_BODY_BYTES);
+    let success = output.exit_code == 0 && status.is_some_and(|status| status < 500);
+    ConversationToolResult {
+        tool_call_id: String::new(),
+        tool_name: "http_request".into(),
+        content: serde_json::json!({
+            "url": url,
+            "method": method,
+            "status": status,
+            "redirects_followed": true,
+            "cookie_jar": "session",
+            "csrf_token_captured": csrf_path.exists(),
+            "raw_response": raw_response,
+            "stderr": output.stderr,
+            "elapsed_ms": output.duration_ms,
+            "executor": output.audit
+        })
+        .to_string(),
+        success,
+    }
+}
+
+async fn execute_isolated_http_probe(
+    arguments: &str,
+    scope_snapshot: &serde_json::Value,
+    session_id: &str,
+) -> ConversationToolResult {
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(error) => return tool_error("http_probe", format!("参数解析失败: {error}")),
+    };
+    let Some(target) = args.get("target").and_then(serde_json::Value::as_str) else {
+        return tool_error("http_probe", "target 参数为空");
+    };
+    let state_dir = match http_session_state_dir(session_id).await {
+        Ok(path) => path,
+        Err(error) => return tool_error("http_probe", error),
+    };
+    let mut results = Vec::new();
+    let mut reachable = false;
+    for url in http_probe_urls(target) {
+        let limits = isolated_http_limits(scope_snapshot, &url, &state_dir);
+        let command = vec!["probe".into(), url.clone()];
+        match crate::infrastructure::process::execute_tool("http_probe", &command, &limits).await {
+            Ok(output) => {
+                let status = last_http_status(&output.stdout);
+                let effective = output.exit_code == 0 && status.is_some();
+                reachable |= effective;
+                results.push(serde_json::json!({
+                    "url": url,
+                    "reachable": effective,
+                    "status": status,
+                    "raw_response": truncate_http_response_body(
+                        output.stdout,
+                        MAX_HTTP_RESPONSE_BODY_BYTES
+                    ),
+                    "stderr": output.stderr,
+                    "elapsed_ms": output.duration_ms,
+                    "executor": output.audit
+                }));
+            }
+            Err(error) => results.push(serde_json::json!({
+                "url": url,
+                "reachable": false,
+                "error": error
+            })),
+        }
+    }
+    ConversationToolResult {
+        tool_call_id: String::new(),
+        tool_name: "http_probe".into(),
+        content: serde_json::json!({"results": results}).to_string(),
+        success: reachable,
+    }
+}
+
+fn isolated_http_limits(
+    _scope_snapshot: &serde_json::Value,
+    target: &str,
+    state_dir: &std::path::Path,
+) -> crate::infrastructure::process::ContainerLimits {
+    crate::infrastructure::process::ContainerLimits {
+        timeout_seconds: 30,
+        network_access: crate::infrastructure::process::NetworkPolicy::TargetOnly(
+            target.to_string(),
+        ),
+        network_name: std::env::var("PENTA_DOCKER_TARGET_NETWORK").ok(),
+        allowed_paths: vec![state_dir.to_string_lossy().into_owned()],
+        backend: crate::infrastructure::process::ExecutionBackend::Docker,
+        ..Default::default()
+    }
+}
+
+async fn http_session_state_dir(session_id: &str) -> Result<std::path::PathBuf, String> {
+    let safe_session: String = session_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(64)
+        .collect();
+    if safe_session.is_empty() {
+        return Err("会话 ID 无效".into());
+    }
+    let root = std::env::var("PENTA_TOOL_STATE_ROOT")
+        .unwrap_or_else(|_| "/tmp/kairos-pent-tool-state".into());
+    let path = std::path::Path::new(&root).join(safe_session);
+    tokio::fs::create_dir_all(&path)
+        .await
+        .map_err(|error| format!("无法创建 HTTP 会话状态目录: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| format!("无法保护 HTTP 会话状态目录: {error}"))?;
+    }
+    Ok(path)
+}
+
+fn parse_header_object(
+    value: Option<&serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    match value {
+        Some(serde_json::Value::Object(headers)) => headers.clone(),
+        Some(serde_json::Value::String(headers)) => serde_json::from_str(headers)
+            .ok()
+            .and_then(|value: serde_json::Value| value.as_object().cloned())
+            .unwrap_or_default(),
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn last_http_status(raw: &str) -> Option<u16> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            let mut parts = line.split_ascii_whitespace();
+            parts
+                .next()
+                .filter(|protocol| protocol.starts_with("HTTP/"))?;
+            parts.next()?.parse::<u16>().ok()
+        })
+        .last()
+}
+
+fn extract_csrf_token(raw: &str) -> Option<String> {
+    let header = regex::Regex::new(r"(?im)^x-csrf-token:\s*([^\r\n]+)").ok()?;
+    if let Some(value) = header.captures(raw).and_then(|capture| capture.get(1)) {
+        return Some(value.as_str().trim().to_string());
+    }
+    let html = regex::Regex::new(
+        r#"(?is)(?:name=["'](?:_csrf|csrf_token)["'][^>]*value=["']([^"']+)|content=["']([^"']+)["'][^>]*name=["']csrf-token["'])"#,
+    )
+    .ok()?;
+    html.captures(raw).and_then(|capture| {
+        capture
+            .get(1)
+            .or_else(|| capture.get(2))
+            .map(|value| value.as_str().to_string())
+    })
+}
+
+fn tool_error(tool_name: &str, error: impl ToString) -> ConversationToolResult {
+    ConversationToolResult {
+        tool_call_id: String::new(),
+        tool_name: tool_name.into(),
+        content: serde_json::json!({"error": error.to_string(), "blocked": true}).to_string(),
+        success: false,
     }
 }
 
@@ -110,7 +403,7 @@ async fn execute_http_request(arguments: &str) -> ConversationToolResult {
         .timeout(std::time::Duration::from_secs(15))
         .danger_accept_invalid_certs(true)
         .user_agent("Kairos-Pent-Agent/1.0")
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build();
 
     let client = match client {
@@ -232,8 +525,7 @@ async fn execute_http_probe(arguments: &str) -> ConversationToolResult {
         }
     };
 
-    let target = args["target"].as_str().unwrap_or("");
-    let target = target.trim().trim_end_matches('/');
+    let target = args["target"].as_str().unwrap_or("").trim();
     if target.is_empty() {
         return ConversationToolResult {
             tool_call_id: String::new(),
@@ -248,7 +540,7 @@ async fn execute_http_probe(arguments: &str) -> ConversationToolResult {
         .timeout(std::time::Duration::from_secs(10))
         .danger_accept_invalid_certs(true)
         .user_agent("Kairos-Pent-Agent/1.0")
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build();
 
     let client = match client {
@@ -264,8 +556,7 @@ async fn execute_http_probe(arguments: &str) -> ConversationToolResult {
         }
     };
 
-    for scheme in &["https", "http"] {
-        let url = format!("{}://{}", scheme, target);
+    for url in http_probe_urls(target) {
         let started = Instant::now();
         match client.get(&url).send().await {
             Ok(resp) => {
@@ -290,7 +581,7 @@ async fn execute_http_probe(arguments: &str) -> ConversationToolResult {
 
                 results.push(serde_json::json!({
                     "url": url,
-                    "scheme": *scheme,
+                    "scheme": url.split_once("://").map(|(scheme, _)| scheme).unwrap_or(""),
                     "status": status,
                     "server": server,
                     "content_type": content_type,
@@ -302,18 +593,24 @@ async fn execute_http_probe(arguments: &str) -> ConversationToolResult {
             Err(_) => {
                 results.push(serde_json::json!({
                     "url": url,
-                    "scheme": *scheme,
+                    "scheme": url.split_once("://").map(|(scheme, _)| scheme).unwrap_or(""),
                     "reachable": false
                 }));
             }
         }
     }
 
+    let reachable = results.iter().any(|result| {
+        result
+            .get("status")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+    });
     ConversationToolResult {
         tool_call_id: String::new(),
         tool_name: "http_probe".into(),
         content: serde_json::json!({"results": results}).to_string(),
-        success: true,
+        success: reachable,
     }
 }
 
@@ -585,9 +882,20 @@ fn extract_title(html: &str) -> String {
     String::new()
 }
 
+fn http_probe_urls(target: &str) -> Vec<String> {
+    let target = target.trim().trim_end_matches('/');
+    if target.starts_with("http://") || target.starts_with("https://") {
+        vec![target.to_string()]
+    } else {
+        vec![format!("https://{target}"), format!("http://{target}")]
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::truncate_http_response_body;
+    use super::{
+        extract_csrf_token, http_probe_urls, last_http_status, truncate_http_response_body,
+    };
 
     #[test]
     fn truncates_http_response_body_at_utf8_boundary() {
@@ -597,6 +905,41 @@ mod tests {
 
         assert!(truncated.starts_with(&"a".repeat(49_999)));
         assert!(truncated.ends_with("...(truncated, total 50005 bytes)"));
+    }
+
+    #[test]
+    fn probe_preserves_an_explicit_scheme() {
+        assert_eq!(
+            http_probe_urls("https://example.test/"),
+            vec!["https://example.test"]
+        );
+    }
+
+    #[test]
+    fn probe_adds_schemes_only_for_bare_targets() {
+        assert_eq!(
+            http_probe_urls("example.test"),
+            vec!["https://example.test", "http://example.test"]
+        );
+    }
+
+    #[test]
+    fn parses_last_status_after_redirects() {
+        let raw = "HTTP/1.1 302 Found\r\nLocation: /login\r\n\r\n\
+                   HTTP/2 200\r\nContent-Type: text/html\r\n\r\nok";
+        assert_eq!(last_http_status(raw), Some(200));
+    }
+
+    #[test]
+    fn extracts_csrf_from_header_and_form() {
+        assert_eq!(
+            extract_csrf_token("HTTP/1.1 200 OK\r\nX-CSRF-Token: abc123\r\n"),
+            Some("abc123".into())
+        );
+        assert_eq!(
+            extract_csrf_token(r#"<input type="hidden" name="_csrf" value="form-token">"#),
+            Some("form-token".into())
+        );
     }
 }
 

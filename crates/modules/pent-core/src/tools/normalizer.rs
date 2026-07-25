@@ -20,7 +20,8 @@ pub fn normalize_tool_output(
     let stdout = sanitize(stdout);
     let stderr = sanitize(stderr);
     let status = match (exit_code, stdout.is_empty()) {
-        (0, _) => ToolExecutionStatus::Succeeded,
+        (0, false) => ToolExecutionStatus::Succeeded,
+        (0, true) => ToolExecutionStatus::Failed,
         (_, false) => ToolExecutionStatus::Partial,
         _ => ToolExecutionStatus::Failed,
     };
@@ -124,6 +125,13 @@ mod tests {
         let result = normalize_tool_output("nmap", "127.0.0.1", 2, "port 80 open", "timeout", 50);
         assert_eq!(result.status, ToolExecutionStatus::Partial);
         assert_eq!(result.metrics.exit_code, 2);
+    }
+
+    #[test]
+    fn treats_zero_exit_without_observation_as_failure() {
+        let result = normalize_tool_output("http_probe", "example.test", 0, "", "", 10);
+        assert_eq!(result.status, ToolExecutionStatus::Failed);
+        assert!(result.observations.is_empty());
     }
 
     #[test]

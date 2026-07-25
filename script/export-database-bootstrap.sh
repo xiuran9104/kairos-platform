@@ -24,6 +24,11 @@ pg_dump "$database_url" \
   --exclude-table-data='pent_run_instructions' \
   --exclude-table-data='scan_tasks' \
   --exclude-table-data='scan_port_details' \
+  --exclude-table-data='system_oauth2_access_token' \
+  --exclude-table-data='system_oauth2_refresh_token' \
+  --exclude-table-data='system_login_log' \
+  --exclude-table-data='system_operate_log' \
+  --exclude-table-data='system_notify_message' \
   --file "$temporary"
 
 test -s "$temporary"
@@ -34,6 +39,9 @@ BEGIN { FS = OFS = "\t"; in_copy = 0; sensitive_count = 0 }
 /^COPY / {
   in_copy = 1
   sensitive_count = 0
+  login_ip_column = 0
+  login_date_column = 0
+  sanitize_user_login = ($0 ~ /^COPY public[.]system_users /)
   header = $0
   sub(/^COPY [^(]+\(/, "", header)
   sub(/\) FROM stdin;$/, "", header)
@@ -43,6 +51,12 @@ BEGIN { FS = OFS = "\t"; in_copy = 0; sensitive_count = 0 }
     gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", name)
     if (name ~ /^(api_key|api_secret|password|secret|access_key|secret_key|token)$/) {
       sensitive[++sensitive_count] = i
+    }
+    if (sanitize_user_login && name == "login_ip") {
+      login_ip_column = i
+    }
+    if (sanitize_user_login && name == "login_date") {
+      login_date_column = i
     }
   }
   print
@@ -58,6 +72,12 @@ in_copy {
   for (i = 1; i <= sensitive_count; i++) {
     $sensitive[i] = ""
   }
+  if (login_ip_column > 0) {
+    $login_ip_column = ""
+  }
+  if (login_date_column > 0) {
+    $login_date_column = "\\N"
+  }
 }
 { print }
 ' "$temporary" > "$sanitized"
@@ -65,7 +85,7 @@ in_copy {
 mv "$sanitized" "$temporary"
 
 if rg -n -i \
-  '(sk-[a-z0-9_-]{16,}|authorization:[[:space:]]*bearer[[:space:]]+[a-z0-9._-]{12,}|password=[^[:space:]]{8,})' \
+  '((^|[^[:alnum:]])sk-[a-z0-9_-]{16,}|authorization:[[:space:]]*bearer[[:space:]]+[a-z0-9._-]{12,}|password=[^[:space:]]{8,})' \
   "$temporary"; then
   echo "database bootstrap export rejected: possible secret detected" >&2
   exit 1

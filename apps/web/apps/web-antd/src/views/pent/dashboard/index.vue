@@ -49,7 +49,7 @@ const { loading, error, sessions, runs, toolOverview, metrics, activity, running
         <a-card title="常用工具" size="small">
           <a-empty v-if="!toolOverview?.top_tools?.length" description="暂无数据" :image="false" />
           <div v-else v-for="(t,i) in toolOverview.top_tools" :key="t.name" style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid #fafafa">
-            <span :style="{width:22,height:22,borderRadius:'50%',background:i===0?'#fa8c16':i===1?'#8c8c8c':'#d9d9d9',color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'11px',fontWeight:600}">{{i+1}}</span>
+	            <span :style="{width:22,height:22,borderRadius:'50%',background:Number(i)===0?'#fa8c16':Number(i)===1?'#8c8c8c':'#d9d9d9',color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'11px',fontWeight:600}">{{Number(i)+1}}</span>
             <span style="flex:1;margin-left:10px;font-size:13px">{{t.name}}</span>
             <span style="font-weight:600;color:#1677ff">{{t.count}}</span>
           </div>

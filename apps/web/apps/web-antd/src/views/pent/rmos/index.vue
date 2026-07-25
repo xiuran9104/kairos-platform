@@ -8,7 +8,6 @@ import { requestClient } from '#/api/request';
 const memories = ref<any[]>([]); const loading = ref(false); const activeTab = ref('graph');
 const feedbackLoading = ref<string|null>(null); const graphData = ref<any>({nodes:[],edges:[]});
 const graphChart = ref<EchartsUIType>();
-const pathChart = ref<EchartsUIType>();
 const { renderEcharts } = useEcharts(graphChart);
 
 async function fetchAll() { loading.value=true; try{memories.value=(await getRmosMemories()) as any[]||[]}catch{/* */}finally{loading.value=false} }
@@ -57,7 +56,7 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
 
       <a-tab-pane key="paths" tab="攻击路径">
         <a-empty v-if="!graphData.nodes?.length" description="暂无攻击路径" />
-        <div v-else v-for="(n,i) in graphData.nodes.filter((n:any)=>n.category===3)" :key="n.id" style="margin-bottom:24px">
+	        <div v-else v-for="n in graphData.nodes.filter((n:any)=>n.category===3)" :key="n.id" style="margin-bottom:24px">
           <!-- Target header -->
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:6px 0">
             <div style="width:40px;height:40px;border-radius:50%;background:#52c41a20;display:flex;align-items:center;justify-content:center;font-size:20px">🎯</div>
@@ -68,7 +67,7 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
           <div style="display:flex;align-items:flex-start;gap:0;overflow-x:auto;padding:8px 0">
             <template v-for="(f,fi) in graphData.nodes.filter((fn:any)=>fn.category!==3&&graphData.edges.some((e:any)=>e.source===n.id&&e.target===fn.id))" :key="f.id">
               <!-- Arrow -->
-              <div v-if="fi>0" style="display:flex;align-items:center;padding:0 4px;flex-shrink:0">
+	              <div v-if="Number(fi)>0" style="display:flex;align-items:center;padding:0 4px;flex-shrink:0">
                 <div style="width:24px;height:2px;background:#d9d9d9;position:relative">
                   <div style="position:absolute;right:-4px;top:-4px;width:0;height:0;border-left:8px solid #d9d9d9;border-top:5px solid transparent;border-bottom:5px solid transparent"></div>
                 </div>

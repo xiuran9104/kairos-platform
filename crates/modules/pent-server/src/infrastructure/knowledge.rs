@@ -234,7 +234,11 @@ impl KnowledgeStore {
         Ok(rows.into_iter().map(|r| r.into_doc()).collect())
     }
 
-    pub async fn list(&self, filter: &KnowledgeFilter, limit: usize) -> Result<Vec<KnowledgeDocument>, String> {
+    pub async fn list(
+        &self,
+        filter: &KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeDocument>, String> {
         let rows = sqlx::query_as::<_, DocRow>(
             "SELECT id, doc_type, title, content, source, tags,
                     flow_id, task_id, subtask_id,
