@@ -29,7 +29,7 @@ const statusMap:Record<string,{color:string;label:string;icon:string}> = {
   approved:{color:'blue',label:'已批准',icon:'lucide:check'},
   rejected:{color:'red',label:'已拒绝',icon:'lucide:x'},
   pending_provision:{color:'cyan',label:'待配置',icon:'lucide:settings'},
-  provisioning:{color:'processing',label:'配置中',icon:'lucide:loader'},
+  provisioning:{color:'#1677ff',label:'配置中',icon:'lucide:loader'},
   pending_delivery:{color:'purple',label:'待交付',icon:'lucide:package'},
   delivered:{color:'green',label:'已交付',icon:'lucide:truck'},
   archived:{color:'default',label:'已归档',icon:'lucide:archive'},
@@ -50,8 +50,8 @@ const typeLabel:Record<string,string> = { cloud:'云资源', physical:'物理机
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:#f5f5f5;min-height:100%">
-      <a-page-header title="资源工单" sub-title="申请 · 审批 · 配置 · 交付 全流程管理" style="background:#fff;border-radius:8px;margin-bottom:16px;padding:16px 24px">
+    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
+      <a-page-header title="资源工单" sub-title="申请 · 审批 · 配置 · 交付 全流程管理" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
         <template #extra>
           <a-space>
             <a-button @click="fetchData"><Icon icon="lucide:refresh-cw" /> 刷新</a-button>
@@ -77,9 +77,9 @@ const typeLabel:Record<string,string> = { cloud:'云资源', physical:'物理机
             <template v-if="column.key==='actions'">
               <a-space>
                 <a-button type="link" size="small" @click="showDetail(record)">详情</a-button>
-                <a-button v-if="record.ticket_status==='pending_approval'" type="link" size="small" style="color:#52c41a" @click="handleApprove(record)">批准</a-button>
+                <a-button v-if="record.ticket_status==='pending_approval'" type="link" size="small" style="color:var(--ant-color-success)" @click="handleApprove(record)">批准</a-button>
                 <a-button v-if="record.ticket_status==='pending_approval'" type="link" size="small" danger @click="handleReject(record)">拒绝</a-button>
-                <a-button v-if="record.ticket_status==='pending_delivery'" type="link" size="small" style="color:#1677ff" @click="handleDeliver(record)">交付</a-button>
+                <a-button v-if="record.ticket_status==='pending_delivery'" type="link" size="small" style="color:var(--ant-color-primary)" @click="handleDeliver(record)">交付</a-button>
                 <a-popconfirm title="确认删除?" @confirm="deleteResourceTicket(record.id!).then(fetchData)"><a-button type="link" size="small" danger>删除</a-button></a-popconfirm>
               </a-space>
             </template>

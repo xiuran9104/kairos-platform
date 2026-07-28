@@ -49,7 +49,7 @@ onMounted(fetchAll);
     <a-row :gutter="[16, 16]" class="mb-4">
       <a-col :xs="12" :md="6">
         <a-card size="small">
-          <a-statistic title="静态规则" :value="rules.filter((r: any) => r.rule_type === 'static').length" value-style="color: #1677ff" />
+          <a-statistic title="静态规则" :value="rules.filter((r: any) => r.rule_type === 'static').length" value-style="color: var(--ant-color-primary)" />
         </a-card>
       </a-col>
       <a-col :xs="12" :md="6">
@@ -59,12 +59,12 @@ onMounted(fetchAll);
       </a-col>
       <a-col :xs="12" :md="6">
         <a-card size="small">
-          <a-statistic title="今日拦截" :value="interceptions.length" value-style="color: #ff4d4f" />
+          <a-statistic title="今日拦截" :value="interceptions.length" value-style="color: var(--ant-color-error)" />
         </a-card>
       </a-col>
       <a-col :xs="12" :md="6">
         <a-card size="small">
-          <a-statistic title="启用规则" :value="rules.filter((r: any) => r.enabled).length" value-style="color: #52c41a" />
+          <a-statistic title="启用规则" :value="rules.filter((r: any) => r.enabled).length" value-style="color: var(--ant-color-success)" />
         </a-card>
       </a-col>
     </a-row>

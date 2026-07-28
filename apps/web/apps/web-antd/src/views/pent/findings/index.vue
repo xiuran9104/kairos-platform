@@ -41,15 +41,15 @@ async function loadEvidence(f:any) {
 onMounted(fetch);
 </script>
 <template>
-  <div style="padding:24px;min-height:100vh">
+  <div style="padding:24px;min-height:100%">
     <a-page-header title="漏洞发现" sub-title="扫描结果 · 点击展开查看证据">
       <template #extra><a-button @click="fetch" :loading="loading">刷新</a-button></template>
     </a-page-header>
 
     <a-row :gutter="[16,16]" style="margin-bottom:16px">
       <a-col :span="6" v-for="c in [
-        {label:'总计',val:counts.total,color:'#1677ff'},{label:'严重',val:counts.critical,color:'#f5222d'},
-        {label:'高危',val:counts.high,color:'#fa8c16'},{label:'未处理',val:counts.open,color:'#ff4d4f'}
+        {label:'总计',val:counts.total,color:'var(--ant-color-primary)'},{label:'严重',val:counts.critical,color:'var(--ant-color-error)'},
+        {label:'高危',val:counts.high,color:'var(--ant-color-warning)'},{label:'未处理',val:counts.open,color:'var(--ant-color-error)'}
       ]" :key="c.label">
         <a-card size="small"><a-statistic :title="c.label" :value="c.val" :value-style="{color:c.color,fontSize:'28px'}"/></a-card>
       </a-col>
@@ -68,11 +68,11 @@ onMounted(fetch);
       <a-empty v-if="!filtered.length" description="暂无漏洞"/>
 
       <div v-else v-for="f in filtered" :key="f.id" style="margin-bottom:12px">
-        <a-card size="small" :style="{borderLeft: `3px solid ${sevColor[f.severity]==='red'?'#f5222d':sevColor[f.severity]==='volcano'?'#fa8c16':'#1677ff'}`}">
+        <a-card size="small" :style="{borderLeft: `3px solid ${sevColor[f.severity]==='red'?'var(--ant-color-error)':sevColor[f.severity]==='volcano'?'var(--ant-color-warning)':'var(--ant-color-primary)'}`}">
           <div style="display:flex;justify-content:space-between;align-items:flex-start">
             <div style="flex:1">
               <span style="font-weight:600;font-size:14px">{{f.title||'未命名漏洞'}}</span>
-              <span style="color:#8c8c8c;font-size:12px;margin-left:8px">Run: {{f._run_id?.slice(0,16)}}</span>
+              <span style="color:var(--ant-color-text-tertiary);font-size:12px;margin-left:8px">Run: {{f._run_id?.slice(0,16)}}</span>
             </div>
             <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
               <a-tag :color="sevColor[f.severity]||'default'" size="small">{{f.severity}}</a-tag>
@@ -83,23 +83,23 @@ onMounted(fetch);
               </a-button>
             </div>
           </div>
-          <div style="color:#8c8c8c;font-size:12px;margin-top:4px">
+          <div style="color:var(--ant-color-text-tertiary);font-size:12px;margin-top:4px">
             目标: {{f.target||f._target||'-'}}
           </div>
         </a-card>
 
         <!-- Inline evidence -- only visible when expanded -->
         <a-spin v-if="expandedId===f.id" :spinning="loadingEvidence===f.id" size="small">
-          <div v-if="evidenceCache[f.id]?.length" style="margin-left:20px;margin-top:4px;border-left:2px solid #1677ff;padding-left:16px">
-            <div v-for="(ev,idx) in evidenceCache[f.id]" :key="ev.id||idx" style="padding:8px 0;border-bottom:1px dashed #f0f0f0">
+          <div v-if="evidenceCache[f.id]?.length" style="margin-left:20px;margin-top:4px;border-left:2px solid var(--ant-color-primary);padding-left:16px">
+            <div v-for="(ev,idx) in evidenceCache[f.id]" :key="ev.id||idx" style="padding:8px 0;border-bottom:1px dashed var(--ant-color-border-secondary)">
               <div style="display:flex;gap:6px;margin-bottom:4px">
                 <a-tag v-if="ev.content_hash" size="small" color="blue" style="font-family:monospace">{{ev.content_hash?.slice(0,20)}}</a-tag>
                 <a-tag size="small">{{ev.content_type||'text/plain'}}</a-tag>
               </div>
-              <pre style="background:#f5f5f5;padding:8px;border-radius:4px;font-size:11px;max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0">{{ev.source||ev.content||'(空)'}}</pre>
+              <pre style="background:var(--ant-color-bg-layout);padding:8px;border-radius:4px;font-size:11px;max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0">{{ev.source||ev.content||'(空)'}}</pre>
             </div>
           </div>
-          <div v-else-if="!loadingEvidence||loadingEvidence!==f.id" style="margin-left:20px;padding:8px 16px;color:#8c8c8c;font-size:12px">暂无关联证据</div>
+          <div v-else-if="!loadingEvidence||loadingEvidence!==f.id" style="margin-left:20px;padding:8px 16px;color:var(--ant-color-text-tertiary);font-size:12px">暂无关联证据</div>
         </a-spin>
       </div>
     </a-spin>

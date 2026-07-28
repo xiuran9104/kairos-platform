@@ -85,7 +85,7 @@ function onUpload(event: Event) {
       @edges-change="emit('update:edges', props.edges)"
       @nodes-change="emit('update:nodes', props.nodes)"
     >
-      <Background pattern-color="#d9d9d9" :gap="20" />
+      <Background pattern-color="var(--ant-color-fill-secondary)" :gap="20" />
       <Controls />
       <MiniMap pannable zoomable />
 
@@ -144,15 +144,15 @@ function onUpload(event: Event) {
 <style scoped>
 .image-editor { height: 72vh; min-height: 560px; }
 .toolbar { height: 44px; }
-.hint { color: #8c8c8c; font-size: 12px; }
-.flow { height: calc(100% - 44px); border: 1px solid #e5e7eb; border-radius: 8px; background: #fafafa; }
+.hint { color: var(--ant-color-text-tertiary); font-size: 12px; }
+.flow { height: calc(100% - 44px); border: 1px solid var(--ant-color-border-secondary); border-radius: 8px; background: var(--ant-color-fill-quaternary); }
 .flow-node { width: 290px; box-shadow: 0 5px 18px rgb(0 0 0 / 8%); }
 .flow-node.generated { width: 320px; }
-.preview, .empty { width: 100%; height: 150px; margin-bottom: 10px; border-radius: 6px; object-fit: contain; background: #f5f5f5; }
+.preview, .empty { width: 100%; height: 150px; margin-bottom: 10px; border-radius: 6px; object-fit: contain; background: var(--ant-color-bg-layout); }
 .preview-image { display: block; width: 100%; margin-bottom: 10px; }
-.preview-image :deep(.ant-image-img) { width: 100%; height: 150px; border-radius: 6px; object-fit: contain; background: #f5f5f5; }
+.preview-image :deep(.ant-image-img) { width: 100%; height: 150px; border-radius: 6px; object-fit: contain; background: var(--ant-color-bg-layout); }
 .asset-select { width: 100%; margin-bottom: 8px; }
-.empty { display: flex; align-items: center; justify-content: center; padding: 16px; color: #8c8c8c; text-align: center; }
+.empty { display: flex; align-items: center; justify-content: center; padding: 16px; color: var(--ant-color-text-tertiary); text-align: center; }
 .field { width: 100%; margin-bottom: 8px; }
 .actions { margin-top: 10px; }
 .hidden { display: none; }

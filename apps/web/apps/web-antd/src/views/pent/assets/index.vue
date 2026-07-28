@@ -28,7 +28,7 @@ onMounted(fetch);
 </script>
 
 <template>
-  <div style="padding:24px;min-height:100vh">
+  <div style="padding:24px;min-height:100%">
     <a-page-header title="资产中心" sub-title="扫描发现的网络资产 · IP、端口、服务">
       <template #extra>
         <a-input-search v-model:value="keyword" placeholder="搜索IP或名称..." style="width:240px" allow-clear />
@@ -48,10 +48,10 @@ onMounted(fetch);
       <!-- Summary -->
       <a-row :gutter="[16,16]" v-if="filtered.length" style="margin-bottom:16px">
         <a-col :span="6" v-for="s in [
-          { label:'总资产', val: data.length, color: '#1677ff' },
-          { label:'内网', val: data.filter((a:any)=>a.zone==='Intranet').length, color: '#52c41a' },
-          { label:'DMZ', val: data.filter((a:any)=>a.zone==='DMZ').length, color: '#fa8c16' },
-          { label:'互联网', val: data.filter((a:any)=>a.zone==='Internet').length, color: '#ff4d4f' },
+          { label:'总资产', val: data.length, color: 'var(--ant-color-primary)' },
+          { label:'内网', val: data.filter((a:any)=>a.zone==='Intranet').length, color: 'var(--ant-color-success)' },
+          { label:'DMZ', val: data.filter((a:any)=>a.zone==='DMZ').length, color: 'var(--ant-color-warning)' },
+          { label:'互联网', val: data.filter((a:any)=>a.zone==='Internet').length, color: 'var(--ant-color-error)' },
         ]" :key="s.label">
           <a-card size="small">
             <a-statistic :title="s.label" :value="s.val" :value-style="{color:s.color,fontSize:'28px'}" />
@@ -78,7 +78,7 @@ onMounted(fetch);
         <!-- Expand: ports -->
         <template #expandedRowRender="{ record }">
           <div style="margin:0">
-            <div v-if="!record.ports?.length" style="color:#8c8c8c;font-size:13px">暂无端口数据 · 执行扫描任务后自动填充</div>
+            <div v-if="!record.ports?.length" style="color:var(--ant-color-text-tertiary);font-size:13px">暂无端口数据 · 执行扫描任务后自动填充</div>
             <a-tag v-for="p in record.ports" :key="p.port" :color="p.is_open?'green':'default'" style="margin:2px">
               {{ p.port }}{{ p.service ? '/'+p.service : '' }}
             </a-tag>

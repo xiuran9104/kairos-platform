@@ -21,12 +21,12 @@ async function buildGraph() {
     tooltip: { formatter: (p:any) => p.dataType==='node'?`<b>${p.name}</b><br/>${p.data.category===3?'目标':p.data.category===0?'严重':p.data.category===1?'高危':'中低危'}`:`${p.data.source} → ${p.data.target}` },
     series: [{
       type: 'graph', layout: 'force', roam: true, draggable: true,
-      label: { show: true, fontSize: 11, color: '#333', formatter: (p:any) => p.name.length>16?p.name.slice(0,14)+'..':p.name },
+      label: { show: true, fontSize: 11, color: 'var(--ant-color-text)', formatter: (p:any) => p.name.length>16?p.name.slice(0,14)+'..':p.name },
       force: { repulsion: 600, gravity: 0.1, edgeLength: [80, 180], layoutAnimation: true },
       categories: [
-        { name: '严重', itemStyle: { color: '#e84749' } },
-        { name: '高危', itemStyle: { color: '#f0a040' } },
-        { name: '中低危', itemStyle: { color: '#5b8def' } },
+        { name: '严重', itemStyle: { color: 'var(--ant-color-error)' } },
+        { name: '高危', itemStyle: { color: 'var(--ant-color-warning)' } },
+        { name: '中低危', itemStyle: { color: 'var(--ant-color-primary)' } },
         { name: '目标', itemStyle: { color: '#3cb371' } },
       ],
       data: graphData.value.nodes,
@@ -43,7 +43,7 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
 </script>
 
 <template>
-  <div style="padding:24px;min-height:100vh">
+  <div style="padding:24px;min-height:100%">
     <a-page-header title="RMOS 攻击记忆" sub-title="攻击图谱 · 攻击路径 · 记忆召回">
       <template #extra><a-button @click="fetchAll" :loading="loading">刷新</a-button></template>
     </a-page-header>
@@ -60,7 +60,7 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
           <!-- Target header -->
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:6px 0">
             <div style="width:40px;height:40px;border-radius:50%;background:#52c41a20;display:flex;align-items:center;justify-content:center;font-size:20px">🎯</div>
-            <div><span style="font-weight:600;font-size:15px;color:#333">{{ n.name }}</span><span style="color:#8c8c8c;font-size:12px;margin-left:8px">攻击链</span></div>
+            <div><span style="font-weight:600;font-size:15px;color:var(--ant-color-text)">{{ n.name }}</span><span style="color:var(--ant-color-text-tertiary);font-size:12px;margin-left:8px">攻击链</span></div>
           </div>
 
           <!-- Horizontal chain: each finding as a linked node -->
@@ -68,8 +68,8 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
             <template v-for="(f,fi) in graphData.nodes.filter((fn:any)=>fn.category!==3&&graphData.edges.some((e:any)=>e.source===n.id&&e.target===fn.id))" :key="f.id">
               <!-- Arrow -->
 	              <div v-if="Number(fi)>0" style="display:flex;align-items:center;padding:0 4px;flex-shrink:0">
-                <div style="width:24px;height:2px;background:#d9d9d9;position:relative">
-                  <div style="position:absolute;right:-4px;top:-4px;width:0;height:0;border-left:8px solid #d9d9d9;border-top:5px solid transparent;border-bottom:5px solid transparent"></div>
+                <div style="width:24px;height:2px;background:var(--ant-color-fill-secondary);position:relative">
+                  <div style="position:absolute;right:-4px;top:-4px;width:0;height:0;border-left:8px solid var(--ant-color-fill-secondary);border-top:5px solid transparent;border-bottom:5px solid transparent"></div>
                 </div>
               </div>
 
@@ -77,8 +77,8 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
               <div :style="{
                 flexShrink:0,width:'180px',
                 padding:'16px',borderRadius:'12px',
-                background:f.category===0?'linear-gradient(135deg,#fff2f0,#ffccc7)':f.category===1?'linear-gradient(135deg,#fff7e6,#ffd591)':'linear-gradient(135deg,#e6f4ff,#91caff)',
-                border:`2px solid ${f.category===0?'#ff4d4f':f.category===1?'#fa8c16':'#1677ff'}`,
+                background:f.category===0?'linear-gradient(135deg,var(--ant-color-error-bg),var(--ant-color-error-border))':f.category===1?'linear-gradient(135deg,var(--ant-color-warning-bg),var(--ant-color-warning-border))':'linear-gradient(135deg,var(--ant-color-primary-bg),var(--ant-color-primary-border))',
+                border:`2px solid ${f.category===0?'var(--ant-color-error)':f.category===1?'var(--ant-color-warning)':'var(--ant-color-primary)'}`,
                 boxShadow:'0 2px 8px rgba(0,0,0,0.08)',
                 position:'relative',
               }">
@@ -86,12 +86,12 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
                 <div :style="{
                   position:'absolute',top:'-12px',left:'8px',
                   padding:'2px 10px',borderRadius:'10px',
-                  fontSize:'10px',fontWeight:600,color:'#fff',
-                  background:f.category===0?'#ff4d4f':f.category===1?'#fa8c16':'#1677ff',
+                  fontSize:'10px',fontWeight:600,color:'var(--ant-color-bg-container)',
+                  background:f.category===0?'var(--ant-color-error)':f.category===1?'var(--ant-color-warning)':'var(--ant-color-primary)',
                 }">
                   {{ f.category===0 ? '严重' : f.category===1 ? '高危' : '中低危' }}
                 </div>
-                <div style="font-size:13px;font-weight:600;color:#333;margin-bottom:4px;margin-top:4px;word-break:break-all">{{ f.name }}</div>
+                <div style="font-size:13px;font-weight:600;color:var(--ant-color-text);margin-bottom:4px;margin-top:4px;word-break:break-all">{{ f.name }}</div>
                 <div style="font-size:11px;color:#666;line-height:1.4">
                   <!-- Determine stage based on finding name -->
                   <span v-if="f.name.includes('SSH')">🔓 初始访问</span>
@@ -102,9 +102,9 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
                 </div>
                 <!-- Impact indicator -->
                 <div style="margin-top:8px;display:flex;gap:4px">
-                  <div :style="{height:4,borderRadius:2,flex:1,background:f.category===0?'#ff4d4f':'#d9d9d9'}"></div>
-                  <div :style="{height:4,borderRadius:2,flex:1,background:f.category<=1?'#fa8c16':'#d9d9d9'}"></div>
-                  <div :style="{height:4,borderRadius:2,flex:1,background:'#d9d9d9'}"></div>
+                  <div :style="{height:4,borderRadius:2,flex:1,background:f.category===0?'var(--ant-color-error)':'var(--ant-color-fill-secondary)'}"></div>
+                  <div :style="{height:4,borderRadius:2,flex:1,background:f.category<=1?'var(--ant-color-warning)':'var(--ant-color-fill-secondary)'}"></div>
+                  <div :style="{height:4,borderRadius:2,flex:1,background:'var(--ant-color-fill-secondary)'}"></div>
                 </div>
               </div>
             </template>
@@ -115,38 +115,38 @@ onMounted(async () => { await fetchAll(); await buildGraph(); });
       <a-tab-pane key="memories" tab="记忆库">
         <a-row :gutter="[16,16]" style="margin-bottom:16px">
           <a-col :xs="12" :md="6" v-for="c in [
-            {label:'记忆条目',val:memories.length,color:'#1677ff',icon:'🧠'},
+            {label:'记忆条目',val:memories.length,color:'var(--ant-color-primary)',icon:'🧠'},
             {label:'策略文档',val:memories.filter((m:any)=>m.doc_type==='guide').length,color:'#722ed1',icon:'📋'},
             {label:'代码片段',val:memories.filter((m:any)=>m.doc_type==='code').length,color:'#52c41a',icon:'💻'},
-            {label:'运行时记录',val:memories.filter((m:any)=>m.doc_type==='answer').length,color:'#fa8c16',icon:'⚡'},
+            {label:'运行时记录',val:memories.filter((m:any)=>m.doc_type==='answer').length,color:'var(--ant-color-warning)',icon:'⚡'},
           ]" :key="c.label">
             <div :style="{padding:'20px',borderRadius:'10px',border:`1px solid ${c.color}20`,background:`${c.color}08`,textAlign:'center'}">
               <div style="font-size:28px;margin-bottom:4px">{{ c.icon }}</div>
               <div :style="{fontSize:'36px',fontWeight:700,color:c.color}">{{ c.val }}</div>
-              <div style="fontSize:'13px',color:'#8c8c8c',marginTop:'4px'">{{ c.label }}</div>
+              <div style="fontSize:'13px',color:'var(--ant-color-text-tertiary)',marginTop:'4px'">{{ c.label }}</div>
             </div>
           </a-col>
         </a-row>
-        <div v-if="!memories.length" style="text-align:center;padding:60px 0;color:#8c8c8c">
+        <div v-if="!memories.length" style="text-align:center;padding:60px 0;color:var(--ant-color-text-tertiary)">
           <div style="font-size:48px;margin-bottom:12px">🧠</div>
           <div>暂无记忆 · Worker 执行后自动积累</div>
         </div>
         <div v-else style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px">
           <div v-for="m in memories" :key="m.id"
-            :style="{padding:'16px',borderRadius:'10px',border:'1px solid #f0f0f0',background:'#fff',cursor:'pointer',transition:'box-shadow 0.2s'}"
+            :style="{padding:'16px',borderRadius:'10px',border:'1px solid var(--ant-color-border-secondary)',background:'var(--ant-color-bg-container)',cursor:'pointer',transition:'box-shadow 0.2s'}"
             @mouseenter="($el:any) => $el.style.boxShadow='0 4px 12px rgba(0,0,0,0.08)'"
             @mouseleave="($el:any) => $el.style.boxShadow='none'">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
               <div style="display:flex;align-items:center;gap:8px">
                 <a-tag :color="m.doc_type==='guide'?'purple':m.doc_type==='code'?'green':'orange'" size="small">{{ m.doc_type==='guide'?'策略':m.doc_type==='code'?'代码':'运行时' }}</a-tag>
-                <span style="font-weight:600;font-size:14px;color:#333">{{ m.title?.slice(0,40) || m.id?.slice(0,16) }}</span>
+                <span style="font-weight:600;font-size:14px;color:var(--ant-color-text)">{{ m.title?.slice(0,40) || m.id?.slice(0,16) }}</span>
               </div>
               <div style="display:flex;gap:4px">
                 <a-button size="small" type="text" @click="submitFeedback(m.id,'useful')" :loading="feedbackLoading===m.id">👍</a-button>
                 <a-button size="small" type="text" @click="submitFeedback(m.id,'useless')" :loading="feedbackLoading===m.id">👎</a-button>
               </div>
             </div>
-            <div style="color:#8c8c8c;font-size:12px;margin-bottom:8px;line-height:1.5;max-height:60px;overflow:hidden">
+            <div style="color:var(--ant-color-text-tertiary);font-size:12px;margin-bottom:8px;line-height:1.5;max-height:60px;overflow:hidden">
               {{ m.content?.slice(0,150) || m.description || '(空)' }}
             </div>
             <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px">

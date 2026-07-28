@@ -218,6 +218,7 @@ export function addScript(data: {
   content: string;
   name: string;
   projectId: number;
+  shouldGenerateImage?: number;
 }) {
   return requestClient.post<{ id: number }>('/toonflow/script/addScript', data);
 }
@@ -227,6 +228,7 @@ export function updateScript(data: {
   content: string;
   id: number;
   name: string;
+  shouldGenerateImage?: number;
 }) {
   return requestClient.post('/toonflow/script/updateScript', data);
 }

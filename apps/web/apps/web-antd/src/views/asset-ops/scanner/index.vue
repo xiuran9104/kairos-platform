@@ -56,8 +56,8 @@ const typeLabel:Record<string,string> = { basic_tcp:'TCP 连接', rustscan:'Rust
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:#f5f5f5;min-height:100%">
-      <a-page-header title="扫描器管理" sub-title="配置扫描引擎 · 执行端口扫描 · 查看结果" style="background:#fff;border-radius:8px;margin-bottom:16px;padding:16px 24px">
+    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
+      <a-page-header title="扫描器管理" sub-title="配置扫描引擎 · 执行端口扫描 · 查看结果" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
         <template #extra>
           <a-space>
             <a-button @click="scanVisible=true" type="primary" ghost><Icon icon="lucide:scan-search" /> 执行扫描</a-button>
@@ -87,7 +87,7 @@ const typeLabel:Record<string,string> = { basic_tcp:'TCP 连接', rustscan:'Rust
             <template v-if="column.key==='is_alive'"><a-tag :color="record.is_alive?'green':'red'">{{ record.is_alive?'存活':'离线' }}</a-tag></template>
             <template v-if="column.key==='ports'">
               <a-tag v-for="p in (record.open_ports||[])" :key="p.port" :color="p.is_open?'blue':'default'" style="margin:2px">
-                {{ p.port }}<span v-if="p.service" style="color:#8c8c8c">:{{ p.service }}</span>
+                {{ p.port }}<span v-if="p.service" style="color:var(--ant-color-text-tertiary)">:{{ p.service }}</span>
               </a-tag>
             </template>
           </template>

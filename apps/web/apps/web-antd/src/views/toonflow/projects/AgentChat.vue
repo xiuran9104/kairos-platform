@@ -354,7 +354,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
         <div v-for="block in msg.content" :key="block.id" class="content-block">
           <!-- Text content -->
           <div v-if="block.type === 'text' || block.type === 'markdown'" class="content-text">
-            <div class="markdown-body" v-html="block.data" />
+            <div class="markdown-body" v-dompurify-html="block.data" />
             <span v-if="block.status === 'streaming'" class="streaming-cursor">▊</span>
           </div>
 
@@ -441,10 +441,10 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
   display: flex;
   flex-direction: column;
   height: 680px;
-  border: 1px solid #f0f0f0;
+  border: 1px solid var(--ant-color-border-secondary);
   border-radius: 8px;
   overflow: hidden;
-  background: #fafafa;
+  background: var(--ant-color-fill-quaternary);
 }
 
 .connection-status {
@@ -453,17 +453,17 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
   display: flex;
   align-items: center;
   gap: 6px;
-  background: #fff;
-  border-bottom: 1px solid #f0f0f0;
+  background: var(--ant-color-bg-container);
+  border-bottom: 1px solid var(--ant-color-border-secondary);
 }
 .connection-status.connected .status-dot { background: #52c41a; }
 .connection-status.connecting .status-dot { background: #faad14; }
 .status-dot {
   width: 8px; height: 8px;
   border-radius: 50%;
-  background: #d9d9d9;
+  background: var(--ant-color-fill-secondary);
 }
-.status-text { color: #8c8c8c; }
+.status-text { color: var(--ant-color-text-tertiary); }
 .agent-controls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .agent-controls label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 
@@ -478,7 +478,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
 
 .chat-empty {
   text-align: center;
-  color: #bfbfbf;
+  color: var(--ant-color-text-quaternary);
   padding: 60px 0;
   font-size: 14px;
 }
@@ -494,15 +494,15 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
 
 .chat-message-user {
   align-self: flex-end;
-  background: #1677ff;
-  color: #fff;
+  background: var(--ant-color-primary);
+  color: var(--ant-color-bg-container);
 }
 .chat-message-user .message-header { color: rgba(255,255,255,0.7); }
 .chat-message-user .message-time { color: rgba(255,255,255,0.5); }
 
 .chat-message-agent {
   align-self: flex-start;
-  background: #fff;
+  background: var(--ant-color-bg-container);
   border: 1px solid #e8e8e8;
 }
 
@@ -513,7 +513,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
   font-size: 12px;
 }
 .message-role { font-weight: 600; }
-.message-time { color: #bfbfbf; }
+.message-time { color: var(--ant-color-text-quaternary); }
 
 .content-block { margin-top: 4px; }
 
@@ -522,7 +522,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
 }
 .streaming-cursor {
   animation: blink 1s infinite;
-  color: #1677ff;
+  color: var(--ant-color-primary);
 }
 @keyframes blink { 50% { opacity: 0; } }
 
@@ -532,7 +532,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
   padding: 8px;
   margin: 4px 0;
 }
-.thinking-title { font-size: 12px; color: #8c8c8c; cursor: pointer; }
+.thinking-title { font-size: 12px; color: var(--ant-color-text-tertiary); cursor: pointer; }
 .thinking-body {
   margin-top: 6px;
   font-size: 13px;
@@ -543,7 +543,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
 }
 
 .content-toolcall {
-  background: #fffbe6;
+  background: var(--ant-color-warning-bg);
   border: 1px solid #ffe58f;
   border-radius: 6px;
   padding: 8px;
@@ -565,7 +565,7 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
   color: #595959;
 }
 .toolcall-section pre {
-  background: #fff;
+  background: var(--ant-color-bg-container);
   padding: 6px;
   border-radius: 4px;
   font-size: 11px;
@@ -574,13 +574,13 @@ defineExpose({ connect, disconnect, send, stop, updateThinkConfig, connected });
   margin: 2px 0;
 }
 
-.message-loading { color: #1677ff; font-size: 12px; }
+.message-loading { color: var(--ant-color-primary); font-size: 12px; }
 .message-error { color: #ff4d4f; font-size: 12px; }
 
 .chat-input-area {
   padding: 10px 12px;
-  background: #fff;
-  border-top: 1px solid #f0f0f0;
+  background: var(--ant-color-bg-container);
+  border-top: 1px solid var(--ant-color-border-secondary);
 }
 .input-wrapper {
   position: relative;

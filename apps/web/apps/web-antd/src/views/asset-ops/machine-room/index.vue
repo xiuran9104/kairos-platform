@@ -1,7 +1,5 @@
 <script lang="ts" setup>
-import { ref, onMounted, computed } from 'vue';
 import { Page } from '@vben/common-ui';
-import { message } from 'ant-design-vue';
 import {
   createMachineRoom,
   deleteMachineRoom,
@@ -9,19 +7,22 @@ import {
   updateMachineRoom,
 } from '#/api/scan/machine-room';
 import type { ScanMachineRoomApi } from '#/api/scan/machine-room';
+import { useCrudList } from '../composables/useCrudList';
 
 type MachineRoom = ScanMachineRoomApi.MachineRoom;
 
-const data = ref<MachineRoom[]>([]);
-const loading = ref(false);
-const modalVisible = ref(false);
-const searchText = ref('');
-const editingId = ref<number>();
-const form = ref<MachineRoom>({ room_name:'',room_code:'',facility_type:'',address:'',provider_id:0,room_type:'核心机房',contact_person:'',contact_phone:'',status:'active' });
-
-const filtered = computed(() => {
-  const kw = searchText.value.toLowerCase();
-  return kw ? data.value.filter(r => r.room_name.toLowerCase().includes(kw) || r.room_code.toLowerCase().includes(kw) || r.address?.toLowerCase().includes(kw)) : data.value;
+const {
+  data, loading, modalVisible, editingId, searchText, form,
+  filtered, fetchData, openCreate, openEdit, handleSubmit, handleDelete,
+} = useCrudList<MachineRoom>({
+  api: {
+    list: getMachineRoomList,
+    create: (d) => createMachineRoom(d as any),
+    update: (id, d) => updateMachineRoom(id, d as any),
+    del: (id) => deleteMachineRoom(id),
+  },
+  defaultForm: () => ({ room_name:'',room_code:'',facility_type:'',address:'',provider_id:0,room_type:'核心机房',contact_person:'',contact_phone:'',status:'active' }),
+  searchKeys: ['room_name', 'room_code', 'address'],
 });
 
 const columns = [
@@ -36,25 +37,13 @@ const columns = [
   { title:'操作', key:'actions', width:130, fixed:'right' },
 ];
 
-async function fetchData() { loading.value=true; try { data.value=(await getMachineRoomList()) as any; } catch { message.error('加载失败'); } finally { loading.value=false; } }
-onMounted(fetchData);
-
-function openCreate() { editingId.value=undefined; form.value={ room_name:'',room_code:'',facility_type:'',address:'',provider_id:0,room_type:'核心机房',contact_person:'',contact_phone:'',status:'active' }; modalVisible.value=true; }
-function openEdit(r:MachineRoom) { editingId.value=r.id; form.value={...r}; modalVisible.value=true; }
-async function handleDelete(id:number) { await deleteMachineRoom(id); message.success('已删除'); fetchData(); }
-async function handleSubmit() {
-  const payload = form.value as any;
-  if (editingId.value) { await updateMachineRoom(editingId.value, payload); message.success('更新成功'); }
-  else { await createMachineRoom(payload); message.success('创建成功'); }
-  modalVisible.value=false; fetchData();
-}
 const statusMap:Record<string,{color:string;label:string}> = { active:{color:'green',label:'运营中'}, inactive:{color:'red',label:'停用'}, maintenance:{color:'orange',label:'维护中'} };
 </script>
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:#f5f5f5;min-height:100%">
-      <a-page-header title="机房管理" sub-title="管理数据中心机房与设施" style="background:#fff;border-radius:8px;margin-bottom:16px;padding:16px 24px">
+    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
+      <a-page-header title="机房管理" sub-title="管理数据中心机房与设施" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
         <template #extra>
           <a-space>
             <a-input-search v-model:value="searchText" placeholder="搜索机房..." style="width:240px" allow-clear />
@@ -73,7 +62,7 @@ const statusMap:Record<string,{color:string;label:string}> = { active:{color:'gr
       <a-card style="border-radius:8px" size="small">
         <a-table :columns="columns" :data-source="filtered" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:15,showSizeChanger:true,showTotal:(t:number)=>`共 ${t} 个机房`}">
           <template #bodyCell="{ column, record }">
-            <template v-if="column.key==='room_name'"><Icon icon="lucide:warehouse" style="color:#1677ff;margin-right:6px" />{{ record.room_name }}</template>
+            <template v-if="column.key==='room_name'"><Icon icon="lucide:warehouse" style="color:var(--ant-color-primary);margin-right:6px" />{{ record.room_name }}</template>
             <template v-if="column.key==='status'"><a-tag :color="statusMap[record.status]?.color||'default'">{{ statusMap[record.status]?.label||record.status }}</a-tag></template>
             <template v-if="column.key==='cabinet_count'">{{ record.cabinet_count||'-' }}</template>
             <template v-if="column.key==='actions'">

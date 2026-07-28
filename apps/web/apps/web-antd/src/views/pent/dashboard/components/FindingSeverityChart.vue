@@ -28,7 +28,7 @@ function maxVal() {
             :style="{ width: `${(severity[s.key] / maxVal()) * 100}%`, backgroundColor: s.color }"
           />
         </div>
-        <span class="text-sm font-medium" style="width: 28px; color: s.color">
+        <span class="text-sm font-medium" :style="{ width: '28px', color: s.color }">
           {{ severity[s.key] }}
         </span>
       </div>

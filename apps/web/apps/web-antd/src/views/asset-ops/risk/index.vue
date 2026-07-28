@@ -1,12 +1,15 @@
 <script lang="ts" setup>
-import { computed, ref, onMounted } from 'vue';
+import { computed, ref } from 'vue';
 import { Page } from '@vben/common-ui';
 import { message } from 'ant-design-vue';
 import { getRiskList, updateRisk } from '#/api/scan/risk';
+import { useCrudList } from '../composables/useCrudList';
 
 interface Risk { id:string; asset_ip:string; port:number; severity:string; description:string; solution?:string; status:string; assigned_to?:string; }
-const data = ref<Risk[]>([]);
-const loading = ref(false);
+const { data, loading, fetchData } = useCrudList<Risk>({
+  api: { list: getRiskList },
+});
+
 const detailVisible = ref(false);
 const detailRisk = ref<Risk|null>(null);
 const severityFilter = ref('');
@@ -29,16 +32,14 @@ const filtered = computed(() => severityFilter.value
   ? data.value.filter(r => r.severity === severityFilter.value)
   : data.value);
 
-async function fetchData() { loading.value=true; try { data.value=(await getRiskList()) as any; } catch { message.error('加载失败'); } finally { loading.value=false; } }
-onMounted(fetchData);
 function showDetail(r:Risk) { detailRisk.value=r; detailVisible.value=true; }
 async function handleStatus(r:Risk,status:string) { await updateRisk(r.id,{status}); message.success('状态已更新'); fetchData(); }
 </script>
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:#f5f5f5;min-height:100%">
-      <a-page-header title="风险管理" sub-title="漏洞风险监控与处置" style="background:#fff;border-radius:8px;margin-bottom:16px;padding:16px 24px">
+    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
+      <a-page-header title="风险管理" sub-title="漏洞风险监控与处置" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
         <template #extra>
           <a-space>
             <a-select v-model:value="severityFilter" placeholder="严重程度筛选" allow-clear style="width:140px" @change="fetchData">

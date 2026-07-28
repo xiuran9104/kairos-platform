@@ -325,6 +325,7 @@ const scriptForm = reactive({
   name: '',
   content: '',
   assets: [] as number[],
+  shouldGenerateImage: 1,
 });
 
 const storyboardForm = reactive({
@@ -530,6 +531,7 @@ function openScript(script?: any) {
     assets:
       script?.relatedAssets?.map((item: { id: number; name: string }) => item.id) ??
       [],
+    shouldGenerateImage: script?.shouldGenerateImage ?? 1,
   });
   scriptModalOpen.value = true;
 }
@@ -545,6 +547,7 @@ async function saveScript() {
       name: scriptForm.name,
       content: scriptForm.content,
       assets: scriptForm.assets,
+      shouldGenerateImage: scriptForm.shouldGenerateImage,
     });
   } else {
     const result = await addScript({
@@ -552,6 +555,7 @@ async function saveScript() {
       name: scriptForm.name,
       content: scriptForm.content,
       assets: scriptForm.assets,
+      shouldGenerateImage: scriptForm.shouldGenerateImage,
     });
     selectedScriptId.value = result.id;
   }
@@ -1418,7 +1422,7 @@ watch(projectId, () => loadAll());
                 <Tabs v-model:active-key="workspaceActiveTab" size="small">
                   <Tabs.TabPane v-for="tab in workspaceTabs" :key="tab.key" :tab="tab.label">
                     <div v-if="!tab.content" class="workspace-placeholder">剧本 Agent 将在此展示{{ tab.label }}...</div>
-                    <div v-else class="workspace-output" v-html="renderMarkdown(tab.content)"></div>
+                    <div v-else class="workspace-output" v-dompurify-html="renderMarkdown(tab.content)"></div>
                   </Tabs.TabPane>
                 </Tabs>
               </Card>
@@ -1570,82 +1574,6 @@ watch(projectId, () => loadAll());
           </Modal>
         </Tabs.TabPane>
 
-        <Tabs.TabPane v-if="false" key="agent" tab="Agent 工作台">
-          <Card size="small" title="Agent 工作台">
-            <template #title>
-              <Space>
-                <Select
-                  v-model:value="agentType"
-                  :options="[
-                    { label: '剧本 Agent', value: 'scriptAgent' },
-                    { label: '生产 Agent', value: 'productionAgent' },
-                  ]"
-                  style="width: 180px"
-                  @change="loadAgentMemory"
-                />
-                <Select
-                  v-if="agentType === 'productionAgent'"
-                  v-model:value="selectedScriptId"
-                  :options="scriptOptions"
-                  placeholder="选择生产剧本"
-                  style="width: 220px"
-                  @change="loadAgentMemory"
-                />
-              </Space>
-            </template>
-            <template #extra>
-              <Space>
-                <Popconfirm title="确认清除所有对话和工作区内容？" @confirm="resetAgentWorkspace">
-                  <Button>重新开始</Button>
-                </Popconfirm>
-                <Button type="primary" @click="openScriptGeneration">AI 生成剧本</Button>
-              </Space>
-            </template>
-
-            <Row :gutter="16">
-              <Col :span="agentType === 'scriptAgent' ? 8 : 24">
-                <AgentChat
-                  ref="agentChatRef"
-                  :agent-type="agentType"
-                  :project-id="projectId"
-                  :script-id="agentType === 'productionAgent' ? selectedScriptId : undefined"
-                  :messages="activeAgentMessages"
-                  @tool-result="onAgentToolResult"
-                />
-              </Col>
-              <Col v-if="agentType === 'scriptAgent'" :span="16">
-                <Card size="small" class="workspace-card">
-                  <template #extra>
-                    <Button type="primary" size="small" @click="saveAgentWorkspace">保存工作区</Button>
-                  </template>
-                  <!-- Pipeline progress -->
-                  <div class="pipeline-bar">
-                    <div
-                      v-for="(stage, i) in pipelineStages"
-                      :key="stage.key"
-                      class="pipeline-step"
-                      :class="[stage.status, { last: i === pipelineStages.length - 1 }]"
-                    >
-                      <span class="pipeline-dot">{{ stage.status === 'completed' ? '✓' : stage.status === 'active' ? '●' : stage.status === 'review' ? '🔍' : '○' }}</span>
-                      <span class="pipeline-label">{{ stage.label }}</span>
-                      <span v-if="i < pipelineStages.length - 1" class="pipeline-line" />
-                    </div>
-                  </div>
-                  <Tabs v-model:activeKey="workspaceActiveTab" size="small">
-                    <Tabs.TabPane v-for="tab in workspaceTabs" :key="tab.key" :tab="tab.label">
-                      <div class="workspace-pane">
-                        <div v-if="!tab.content" class="workspace-placeholder">
-                          Agent 将在此展示{{ tab.label }}...
-                        </div>
-                        <div v-else class="workspace-output" v-html="renderMarkdown(tab.content)" />
-                      </div>
-                    </Tabs.TabPane>
-                  </Tabs>
-                </Card>
-              </Col>
-            </Row>
-          </Card>
-        </Tabs.TabPane>
       </Tabs>
     </Card>
 
@@ -1691,7 +1619,7 @@ watch(projectId, () => loadAll());
         </Form.Item>
         <Form.Item label="生成图片">
           <Select
-            v-model:value="storyboardForm.shouldGenerateImage"
+            v-model:value="scriptForm.shouldGenerateImage"
             :options="[
               { label: '需要生成', value: 1 },
               { label: '不生成', value: 0 },
@@ -1928,7 +1856,7 @@ watch(projectId, () => loadAll());
   align-items: center;
   padding: 8px 4px 12px;
   gap: 0;
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid var(--ant-color-border-secondary);
   margin-bottom: 4px;
 }
 .pipeline-step {
@@ -1938,8 +1866,8 @@ watch(projectId, () => loadAll());
   font-size: 12px;
   white-space: nowrap;
 }
-.pipeline-step.pending { color: #bfbfbf; }
-.pipeline-step.active { color: #1677ff; font-weight: 600; }
+.pipeline-step.pending { color: var(--ant-color-text-quaternary); }
+.pipeline-step.active { color: var(--ant-color-primary); font-weight: 600; }
 .pipeline-step.completed { color: #52c41a; }
 .pipeline-step.review { color: #faad14; }
 .pipeline-dot { font-size: 14px; width: 18px; text-align: center; flex-shrink: 0; }
@@ -1952,7 +1880,7 @@ watch(projectId, () => loadAll());
   margin: 0 4px;
 }
 .pipeline-step.completed .pipeline-line { background: #52c41a; }
-.pipeline-step.active .pipeline-line { background: #1677ff; }
+.pipeline-step.active .pipeline-line { background: var(--ant-color-primary); }
 .workspace-card :deep(.ant-card-body) {
   padding: 8px 12px;
   flex: 1;
@@ -1979,7 +1907,7 @@ watch(projectId, () => loadAll());
   min-height: 0;
 }
 .workspace-placeholder {
-  color: #bfbfbf;
+  color: var(--ant-color-text-quaternary);
   font-size: 13px;
   padding: 16px 0;
   text-align: center;
@@ -1990,9 +1918,9 @@ watch(projectId, () => loadAll());
   white-space: pre-wrap;
   word-break: break-word;
 }
-.workspace-output :deep(h2) { font-size: 16px; margin: 10px 0 6px; border-bottom: 1px solid #f0f0f0; padding-bottom: 4px; }
+.workspace-output :deep(h2) { font-size: 16px; margin: 10px 0 6px; border-bottom: 1px solid var(--ant-color-border-secondary); padding-bottom: 4px; }
 .workspace-output :deep(h3) { font-size: 15px; margin: 8px 0 4px; }
-.workspace-output :deep(h4) { font-size: 14px; margin: 6px 0 3px; color: #1677ff; }
+.workspace-output :deep(h4) { font-size: 14px; margin: 6px 0 3px; color: var(--ant-color-primary); }
 .workspace-output :deep(strong) { font-weight: 600; }
 .workspace-output :deep(li) { margin-left: 16px; }
 .workspace-output :deep(p) { margin: 4px 0; }

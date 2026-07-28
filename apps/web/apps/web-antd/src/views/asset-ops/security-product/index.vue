@@ -11,7 +11,18 @@ async function fetchData() { loading.value = true; try { data.value = (await get
 onMounted(fetchData);
 function openCreate() { editingId.value = undefined; form.value = { name: '', category: '', vendor: '', model: '', version: '', license_type: '', deployment_mode: '', status: 'active', contact_person: '', contact_phone: '' }; modalVisible.value = true; }
 function openEdit(r: Product) { editingId.value = r.id; form.value = { ...r }; modalVisible.value = true; }
-async function handleSubmit() { if (editingId.value) { await updateSecurityProduct(editingId.value, form.value as any); message.success('更新成功'); } else { await createSecurityProduct(form.value as any); message.success('创建成功'); } modalVisible.value = false; fetchData(); }
+async function handleSubmit() {
+  const payload = { ...form.value };
+  // Convert Dayjs object from date-picker to string for API
+  if (payload.license_expiry && typeof payload.license_expiry !== 'string') {
+    payload.license_expiry = (payload.license_expiry as any).format?.('YYYY-MM-DD') ?? String(payload.license_expiry);
+  }
+  try {
+    if (editingId.value) { await updateSecurityProduct(editingId.value, payload as any); message.success('更新成功'); }
+    else { await createSecurityProduct(payload as any); message.success('创建成功'); }
+    modalVisible.value = false; fetchData();
+  } catch { message.error('保存失败'); }
+}
 </script>
 <template>
   <Page auto-content-height>

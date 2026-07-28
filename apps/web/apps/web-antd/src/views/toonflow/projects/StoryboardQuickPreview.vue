@@ -147,9 +147,9 @@ onBeforeUnmount(stop);
         </div>
         <div class="player-controls">
           <div class="control-buttons">
-            <Button shape="circle" :disabled="activeIndex === 0" @click="selectShot(activeIndex - 1)">｜◀</Button>
-            <Button shape="circle" type="primary" @click="togglePlay">{{ playing ? 'Ⅱ' : '▶' }}</Button>
-            <Button shape="circle" :disabled="activeIndex === orderedStoryboards.length - 1" @click="selectShot(activeIndex + 1)">▶｜</Button>
+            <Button shape="circle" :disabled="activeIndex === 0" aria-label="上一个分镜" @click="selectShot(activeIndex - 1)">｜◀</Button>
+            <Button shape="circle" type="primary" :aria-label="playing ? '暂停' : '播放'" @click="togglePlay">{{ playing ? 'Ⅱ' : '▶' }}</Button>
+            <Button shape="circle" :disabled="activeIndex === orderedStoryboards.length - 1" aria-label="下一个分镜" @click="selectShot(activeIndex + 1)">▶｜</Button>
           </div>
           <div class="progress-row">
             <span>{{ formatTime(elapsedBefore + elapsed) }}</span>

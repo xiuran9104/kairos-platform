@@ -283,7 +283,7 @@ onBeforeUnmount(() => {
       :keyboard="true"
       :mask-closable="false"
       :style="{ top: '0', paddingBottom: '0' }"
-      :width="'100vw'"
+      :width="'100%'"
       wrap-class-name="toonflow-workbench-modal"
     >
       <VideoWorkbenchPanel
@@ -316,7 +316,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .production-flow-shell {
   position: relative;
-  height: calc(100vh - 250px);
+  height: 100%;
   min-height: 720px;
   overflow: hidden;
   border: 1px solid var(--ant-color-border-secondary);
@@ -698,7 +698,7 @@ pre {
 :deep(.vue-flow__handle) {
   width: 10px;
   height: 10px;
-  border: 2px solid #fff;
+  border: 2px solid var(--ant-color-bg-container);
   background: var(--ant-color-primary);
 }
 </style>

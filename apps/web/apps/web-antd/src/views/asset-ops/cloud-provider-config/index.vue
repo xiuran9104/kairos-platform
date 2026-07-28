@@ -31,23 +31,23 @@ async function handleSubmit() {
   modalVisible.value=false; fetchData();
 }
 async function handleTest(r:Config) {
-  message.loading({content:'测试连接中...',duration:0});
-  try { const res:any = await testCloudConnection(r.id!); message.success(res?.message||'连接正常'); } catch { message.error('连接失败'); }
+  const hide = message.loading({content:'测试连接中...',duration:0});
+  try { const res:any = await testCloudConnection(r.id!); hide(); message.success(res?.message||'连接正常'); } catch { hide(); message.error('连接失败'); }
 }
 async function handleSync(r:Config) {
-  syncing.value=r.id!; message.loading({content:'同步VPS中...',duration:0});
-  try { await syncCloudInstances(r.id!); message.success('VPS同步完成'); } finally { syncing.value=null; }
+  syncing.value=r.id!; const hide = message.loading({content:'同步VPS中...',duration:0});
+  try { await syncCloudInstances(r.id!); hide(); message.success('VPS同步完成'); } catch { hide(); message.error('VPS同步失败'); } finally { syncing.value=null; }
 }
 async function handleSyncFw(r:Config) {
-  syncing.value=r.id!;
-  try { await syncCloudFirewalls(r.id!); message.success('防火墙同步完成'); } finally { syncing.value=null; }
+  syncing.value=r.id!; const hide = message.loading({content:'同步防火墙中...',duration:0});
+  try { await syncCloudFirewalls(r.id!); hide(); message.success('防火墙同步完成'); } catch { hide(); message.error('防火墙同步失败'); } finally { syncing.value=null; }
 }
 </script>
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:#f5f5f5;min-height:100%">
-      <a-page-header title="云厂商对接" sub-title="管理私有云平台接入与资源同步" style="background:#fff;border-radius:8px;margin-bottom:16px;padding:16px 24px">
+    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
+      <a-page-header title="云厂商对接" sub-title="管理私有云平台接入与资源同步" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
         <template #extra>
           <a-space>
             <a-button @click="fetchData" :loading="loading"><Icon icon="lucide:refresh-cw" /> 刷新</a-button>
@@ -58,15 +58,15 @@ async function handleSyncFw(r:Config) {
 
       <a-row :gutter="[16,16]">
         <a-col :xs="24" :md="12" :lg="8" v-for="item in data" :key="item.id">
-          <a-card :hoverable="true" style="border-radius:10px;border-top:3px solid" :style="{'border-top-color':providerMap[item.provider]?.color||'#d9d9d9'}">
+          <a-card :hoverable="true" style="border-radius:10px;border-top:3px solid" :style="{'border-top-color':providerMap[item.provider]?.color||'var(--ant-color-border-secondary)'}">
             <template #title>
               <div style="display:flex;align-items:center;gap:8px">
-                <div :style="{width:36,height:36,borderRadius:8,background:providerMap[item.provider]?.bg||'#f5f5f5',display:'flex',alignItems:'center',justifyContent:'center'}">
-                  <Icon :icon="providerMap[item.provider]?.icon||'lucide:cloud'" :style="{fontSize:'20px',color:providerMap[item.provider]?.color||'#999'}" />
+                <div :style="{width:36,height:36,borderRadius:8,background:providerMap[item.provider]?.bg||'var(--ant-color-fill-secondary)',display:'flex',alignItems:'center',justifyContent:'center'}">
+                  <Icon :icon="providerMap[item.provider]?.icon||'lucide:cloud'" :style="{fontSize:'20px',color:providerMap[item.provider]?.color||'var(--ant-color-text-tertiary)'}" />
                 </div>
                 <div>
                   <span style="font-weight:600">{{ providerMap[item.provider]?.name||item.provider }}</span>
-                  <div style="font-size:11px;color:#8c8c8c">{{ item.region_name }} / {{ item.account_name }}</div>
+                  <div style="font-size:11px;color:var(--ant-color-text-tertiary)">{{ item.region_name }} / {{ item.account_name }}</div>
                 </div>
               </div>
             </template>

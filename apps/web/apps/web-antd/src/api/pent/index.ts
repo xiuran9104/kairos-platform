@@ -1,4 +1,7 @@
 import { requestClient } from '#/api/request';
+import { fetchEventSource } from '@vben/request';
+import { useAccessStore } from '@vben/stores';
+import { useAppConfig } from '@vben/hooks';
 
 export * from './assets';
 export * from './guard';
@@ -56,11 +59,63 @@ export function getPentRuns() { return requestClient.get('/pent/runs'); }
 export function createPentRun(data: any) { return requestClient.post('/pent/runs', data); }
 export function cancelPentRun(id: string) { return requestClient.post(`/pent/runs/${id}/cancel`); }
 export function getPentRunEvents(runId: string) { return requestClient.get(`/pent/runs/${runId}/events`); }
+
+/** Stream run events via SSE with proper Authorization header (no token in URL). */
+export function streamPentRunEvents(
+  runId: string,
+  ctrl: AbortController,
+  onMessage: (event: any) => void,
+  onError: (err: any) => void,
+  onClose: () => void,
+) {
+  const { apiURL } = useAppConfig(import.meta.env, import.meta.env.PROD);
+  const accessStore = useAccessStore();
+  const token = accessStore.accessToken;
+  return fetchEventSource(`${apiURL}/pent/runs/${runId}/events/stream`, {
+    method: 'get',
+    headers: { Authorization: `Bearer ${token}` },
+    openWhenHidden: true,
+    onmessage: onMessage,
+    onerror: onError,
+    onclose: onClose,
+    signal: ctrl.signal,
+  });
+}
+
 export function getPentRunEvidence(runId: string) { return requestClient.get(`/pent/runs/${runId}/evidence`); }
 export function getPentRunFindings(runId: string) { return requestClient.get(`/pent/runs/${runId}/findings`); }
 export function getPentApprovals() { return requestClient.get('/pent/approvals'); }
 export function decidePentApproval(id: string, data: any) { return requestClient.post(`/pent/approvals/${id}/decision`, data); }
 export function getPentTools() { return requestClient.get('/pent/tools'); }
+
+// Skill management
+export interface PentSkill {
+  id: string;
+  name: string;
+  title: string;
+  description: string;
+  category: string;
+  risk_level: string;
+  status: string;
+  version: string;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  content?: string;
+  manifest?: Record<string, any>;
+}
+export function getPentSkills(params?: { status?: string; category?: string; query?: string }) {
+  return requestClient.get<PentSkill[]>('/pent/skills', { params });
+}
+export function getPentSkill(id: string) {
+  return requestClient.get<PentSkill>(`/pent/skills/${id}`);
+}
+export function createPentSkill(data: { name: string; title: string; content: string; description?: string; category?: string; risk_level?: string }) {
+  return requestClient.post<PentSkill>('/pent/skills', data);
+}
+export function updatePentSkillStatus(id: string, status: string) {
+  return requestClient.put<PentSkill>(`/pent/skills/${id}/status`, { status });
+}
 export function getPentSessions() {
   return requestClient.get<PentAgentSession[]>('/pent/sessions');
 }

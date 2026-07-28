@@ -16,7 +16,7 @@ const filtered = computed(() => {
   return kw ? data.value.filter(a=>a.name.toLowerCase().includes(kw)||a.ip.includes(kw)||(a.owner||'').toLowerCase().includes(kw)) : data.value;
 });
 
-const zoneInfo:Record<string,{color:string;bg:string;label:string}> = { Internet:{color:'#f5222d',bg:'#fff1f0',label:'外网'}, DMZ:{color:'#fa8c16',bg:'#fff7e6',label:'DMZ'}, Intranet:{color:'#52c41a',bg:'#f6ffed',label:'内网'} };
+const zoneInfo:Record<string,{color:string;bg:string;label:string}> = { Internet:{color:'var(--ant-color-error)',bg:'#fff1f0',label:'外网'}, DMZ:{color:'var(--ant-color-warning)',bg:'#fff7e6',label:'DMZ'}, Intranet:{color:'var(--ant-color-success)',bg:'#f6ffed',label:'内网'} };
 
 async function fetchData() { loading.value=true; try { data.value=(await getAssetList()) as any; } catch { message.error('加载失败'); } finally { loading.value=false; } }
 onMounted(fetchData);
@@ -29,17 +29,17 @@ async function handleSubmit() {
 
 const viewMode = ref<'grid'|'table'>('grid');
 const statCards = [
-  { title:'资产总数', value:()=>data.value.length, color:'#1677ff', bg:'#e6f4ff', icon:'lucide:hard-drive' },
-  { title:'外网资产', value:()=>data.value.filter(a=>a.zone==='Internet').length, color:'#f5222d', bg:'#fff1f0', icon:'lucide:globe' },
-  { title:'内网资产', value:()=>data.value.filter(a=>a.zone==='Intranet').length, color:'#52c41a', bg:'#f6ffed', icon:'lucide:lock' },
-  { title:'DMZ资产', value:()=>data.value.filter(a=>a.zone==='DMZ').length, color:'#fa8c16', bg:'#fff7e6', icon:'lucide:shield-alert' },
+  { title:'资产总数', value:()=>data.value.length, color:'var(--ant-color-primary)', bg:'#e6f4ff', icon:'lucide:hard-drive' },
+  { title:'外网资产', value:()=>data.value.filter(a=>a.zone==='Internet').length, color:'var(--ant-color-error)', bg:'#fff1f0', icon:'lucide:globe' },
+  { title:'内网资产', value:()=>data.value.filter(a=>a.zone==='Intranet').length, color:'var(--ant-color-success)', bg:'#f6ffed', icon:'lucide:lock' },
+  { title:'DMZ资产', value:()=>data.value.filter(a=>a.zone==='DMZ').length, color:'var(--ant-color-warning)', bg:'#fff7e6', icon:'lucide:shield-alert' },
 ];
 </script>
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:#f5f5f5;min-height:100%">
-      <a-page-header title="资产管理" sub-title="网络资产发现 · 端口绑定 · 权责分配" style="background:#fff;border-radius:8px;margin-bottom:16px;padding:16px 24px">
+    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
+      <a-page-header title="资产管理" sub-title="网络资产发现 · 端口绑定 · 权责分配" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
         <template #extra>
           <a-space>
             <a-input-search v-model:value="searchText" placeholder="搜索资产名称/IP/负责人..." style="width:260px" allow-clear />
@@ -58,8 +58,8 @@ const statCards = [
                 <Icon :icon="s.icon" :style="{fontSize:'20px',color:s.color}" />
               </div>
               <div>
-                <div style="font-size:12px;color:#8c8c8c">{{ s.title }}</div>
-                <div style="font-size:22px;font-weight:700;color:#262626">{{ typeof s.value==='function' ? s.value() : s.value }}</div>
+                <div style="font-size:12px;color:var(--ant-color-text-tertiary)">{{ s.title }}</div>
+                <div style="font-size:22px;font-weight:700;color:var(--ant-color-text)">{{ typeof s.value==='function' ? s.value() : s.value }}</div>
               </div>
             </div>
           </a-card>
@@ -89,7 +89,7 @@ const statCards = [
               <a-tag v-if="(item.ports||[]).length>8" size="small" style="margin:2px">+{{ item.ports.length-8 }}</a-tag>
             </div>
             <a-row :gutter="8">
-              <a-col :span="16"><a-progress :percent="item.weight" :size="20" :show-info="false" :stroke-color="item.weight>70?'#f5222d':item.weight>40?'#fa8c16':'#52c41a'" /></a-col>
+              <a-col :span="16"><a-progress :percent="item.weight" :size="20" :show-info="false" :stroke-color="item.weight>70?'var(--ant-color-error)':item.weight>40?'var(--ant-color-warning)':'var(--ant-color-success)'" /></a-col>
               <a-col :span="8"><a-space size="0"><a-button type="link" size="small" @click="router.push(`/pent/assets/${item.id}`)">档案</a-button><a-button type="link" size="small" @click="openEdit(item)">编辑</a-button></a-space></a-col>
             </a-row>
           </a-card>
@@ -105,7 +105,7 @@ const statCards = [
             <template v-if="column.key==='technology'">{{ record.language || record.os || '-' }}</template>
             <template v-if="column.key==='ports'">{{ (record.ports||[]).length }}</template>
             <template v-if="column.key==='findings'">{{ record.finding_count || 0 }}</template>
-            <template v-if="column.key==='weight'"><a-progress :percent="record.weight" :size="20" :show-info="false" :stroke-color="record.weight>70?'#f5222d':record.weight>40?'#fa8c16':'#52c41a'" style="width:60px;display:inline-block" /><span style="font-size:11px;margin-left:4px">{{ record.weight }}</span></template>
+            <template v-if="column.key==='weight'"><a-progress :percent="record.weight" :size="20" :show-info="false" :stroke-color="record.weight>70?'var(--ant-color-error)':record.weight>40?'var(--ant-color-warning)':'var(--ant-color-success)'" style="width:60px;display:inline-block" /><span style="font-size:11px;margin-left:4px">{{ record.weight }}</span></template>
             <template v-if="column.key==='actions'"><a-space><a-button type="link" size="small" @click="router.push(`/pent/assets/${record.id}`)">档案</a-button><a-button type="link" size="small" @click="openEdit(record)">编辑</a-button></a-space></template>
           </template>
         </a-table>

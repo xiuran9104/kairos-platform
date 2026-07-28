@@ -1,7 +1,8 @@
 <script lang="ts" setup>
-import { ref, onMounted, onUnmounted } from 'vue';
+import { ref, onMounted, onUnmounted, watch } from 'vue';
 import { message } from 'ant-design-vue';
 import { getPentRuns, createPentRun, cancelPentRun, getPentRunEvents, getPentTasks, createPentTask } from '#/api/pent';
+import PageHeader from '../components/PageHeader.vue';
 
 const runs = ref<any[]>([]); const tasks = ref<any[]>([]); const loading = ref(false);
 const createTaskVisible = ref(false); const createRunVisible = ref(false);
@@ -12,6 +13,7 @@ const events = ref<any[]>([]); let eventTimer: any = null;
 async function fetchRuns() { loading.value=true; try { runs.value=(await getPentRuns()) as any[]; } catch { message.error('加载失败'); } finally { loading.value=false; } }
 onMounted(async () => { await fetchRuns(); tasks.value=(await getPentTasks()) as any[]; });
 onUnmounted(() => { if (eventTimer) clearInterval(eventTimer); });
+watch(detailVisible, (v) => { if (!v && eventTimer) { clearInterval(eventTimer); eventTimer = null; } });
 
 async function handleCreateTask() {
   if (!taskForm.value.authorization_confirmed) { message.warning('请先确认目标测试授权'); return; }
@@ -34,11 +36,12 @@ const columns = [{ title:'Run ID',dataIndex:'id',width:120,ellipsis:true },{ tit
 </script>
 
 <template>
-  <div style="padding:24px;background:#f5f5f5;min-height:100%">
-    <div style="background:#fff;border-radius:8px;margin-bottom:16px;padding:16px 24px;display:flex;justify-content:space-between;align-items:center">
-      <div><h2 style="margin:0">运行管理</h2><span style="color:#8c8c8c;font-size:13px">查看和管理 Agent 执行运行</span></div>
-      <a-space><a-button @click="createTaskVisible=true">新建任务</a-button><a-button type="primary" @click="createRunVisible=true">创建 Run</a-button><a-button @click="fetchRuns">刷新</a-button></a-space>
-    </div>
+  <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
+    <PageHeader title="运行管理" subtitle="查看和管理 Agent 执行运行">
+      <template #extra>
+        <a-space><a-button @click="createTaskVisible=true">新建任务</a-button><a-button type="primary" @click="createRunVisible=true">创建 Run</a-button><a-button @click="fetchRuns">刷新</a-button></a-space>
+      </template>
+    </PageHeader>
     <a-card size="small" style="border-radius:8px">
       <a-table :columns="columns" :data-source="runs" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:15}">
         <template #bodyCell="{ column, record }">
@@ -65,7 +68,7 @@ const columns = [{ title:'Run ID',dataIndex:'id',width:120,ellipsis:true },{ tit
         <a-timeline>
           <a-timeline-item v-for="evt in events" :key="evt.event_id" :color="evt.event_type.includes('failed')?'red':evt.event_type.includes('completed')?'green':'blue'">
             <a-tag size="small" style="margin-right:6px">{{ evt.event_type }}</a-tag>
-            <span style="font-size:11px;color:#666">{{ JSON.stringify(evt.payload)?.slice(0,80) }}</span>
+            <span style="font-size:11px;color:var(--ant-color-text-tertiary)">{{ JSON.stringify(evt.payload)?.slice(0,80) }}</span>
           </a-timeline-item>
         </a-timeline>
       </template>

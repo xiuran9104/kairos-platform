@@ -6,7 +6,7 @@ async function fetch() { loading.value=true; try{const r:any=await requestClient
 onMounted(fetch);
 </script>
 <template>
-  <div style="padding:24px;min-height:100vh">
+  <div style="padding:24px;min-height:100%">
     <a-page-header title="LLM 流量" sub-title="模型调用记录 · 令牌用量 · 延迟分析"><template #extra><a-button @click="fetch" :loading="loading">刷新</a-button></template></a-page-header>
     <a-table :columns="[
       {title:'模型',dataIndex:'model',key:'model',width:160},
