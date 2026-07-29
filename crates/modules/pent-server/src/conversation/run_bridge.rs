@@ -66,17 +66,45 @@ pub(crate) async fn execute_session_run(
             .await
             .map_err(|error| error.to_string())?;
             tx.commit().await.map_err(|error| error.to_string())?;
-            append_event(
+            match crate::report::generate_run_report(
                 pool,
                 run_id,
-                "run.report.completed",
-                json!({
-                    "turn_id": result.turn_id,
-                    "message_id": result.message.message_id,
-                    "report": result.message.content
-                }),
+                Some(&result.message.content),
             )
-            .await?;
+            .await
+            {
+                Ok(artifact) => {
+                    append_event(
+                        pool,
+                        run_id,
+                        "run.report.completed",
+                        json!({
+                            "turn_id": result.turn_id,
+                            "message_id": result.message.message_id,
+                            "artifact_id": artifact.artifact_id,
+                            "object_key": artifact.object_key,
+                            "size_bytes": artifact.size_bytes,
+                            "sha256": artifact.sha256,
+                            "report": result.message.content
+                        }),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::error!(run_id = %run_id, error = %error, "run report generation failed");
+                    append_event(
+                        pool,
+                        run_id,
+                        "run.report.failed",
+                        json!({
+                            "turn_id": result.turn_id,
+                            "message_id": result.message.message_id,
+                            "error": error
+                        }),
+                    )
+                    .await?;
+                }
+            }
             Ok(true)
         }
         Err(error) => {

@@ -177,11 +177,13 @@ pub async fn generate_flow_image(
         &prompt,
         &req.quality,
         references,
+        None,
     )
     .await
     .map_err(AppError::bad_request)?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let _=sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,related_objects,model,description,state,start_time)VALUES($1,$2,'工作流图片生成',$3,$4,'工作流图片生成','success',$1)").bind(now).bind(req.project_id).bind(json!({"prompt":req.prompt}).to_string()).bind(req.model).execute(&state.pool).await;
+    let tm = crate::toonflow_tasks::TaskManager::new(state.pool.clone());
+    let task_id = tm.create("工作流图片生成", Some(req.project_id), &req.model, "工作流图片生成", &json!({"prompt":req.prompt}).to_string()).await.map_err(|e| AppError::internal(e.to_string()))?;
+    let _ = tm.set_succeeded(task_id, None, None).await;
     Ok(Json(ApiResponse::new(json!({"url":url}))))
 }
 #[derive(Deserialize)]
@@ -309,6 +311,7 @@ pub async fn schedule_storyboard_generation(
                         &prompt,
                         &storyboard_image_size(&quality, &ratio),
                         references,
+                        None,
                     )
                     .await
                     {

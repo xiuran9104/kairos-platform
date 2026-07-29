@@ -61,8 +61,9 @@ async fn process_chapter(pool: &PgPool, project_id: i64, id: i64) {
     let Some((title, content)) = chapter else {
         return;
     };
-    let task_id = chrono::Utc::now().timestamp_millis() * 1_000_000 + id % 1_000_000;
-    let _=sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,related_objects,model,description,state,start_time) VALUES($1,$2,'novelEvent',$3,'universalAi',$4,'running',$5) ON CONFLICT(id) DO NOTHING").bind(task_id).bind(project_id).bind(id.to_string()).bind(format!("提取事件：{title}")).bind(chrono::Utc::now().timestamp_millis()).execute(pool).await;
+    let tm = crate::toonflow_tasks::TaskManager::new(pool.clone());
+    let Ok(task_id) = tm.create("novelEvent", Some(project_id), "universalAi", &format!("提取事件：{title}"), &id.to_string()).await else { return; };
+    let _ = tm.set_running(task_id).await;
     // Try loading custom prompt from prompts table, fall back to built-in
     let system = sqlx::query_scalar::<_,String>(
         "SELECT data FROM toonflow.prompts WHERE type='eventExtraction' AND use_data=true ORDER BY id DESC LIMIT 1",
@@ -109,10 +110,8 @@ async fn process_chapter(pool: &PgPool, project_id: i64, id: i64) {
             if let Err(reason) = save_events(pool, id, &raw).await {
                 fail(pool, id, task_id, &reason).await
             } else {
-                let _ = sqlx::query("UPDATE toonflow.tasks SET state='success' WHERE id=$1")
-                    .bind(task_id)
-                    .execute(pool)
-                    .await;
+                let _ = crate::toonflow_tasks::TaskManager::new(pool.clone())
+                    .set_succeeded(task_id, None, None).await;
             }
         }
         Err(reason) => fail(pool, id, task_id, &reason).await,
@@ -179,11 +178,8 @@ async fn fail(pool: &PgPool, id: i64, task_id: i64, reason: &str) {
         .bind(reason)
         .execute(pool)
         .await;
-    let _ = sqlx::query("UPDATE toonflow.tasks SET state='failed',reason=$2 WHERE id=$1")
-        .bind(task_id)
-        .bind(reason)
-        .execute(pool)
-        .await;
+    let _ = crate::toonflow_tasks::TaskManager::new(pool.clone())
+        .set_failed(task_id, reason).await;
 }
 
 #[derive(Deserialize)]

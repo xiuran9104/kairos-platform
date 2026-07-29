@@ -1,5 +1,7 @@
 use axum::{Json, Router, middleware::from_fn_with_state, routing::get};
-use kairos_platform_framework_common::{ApiResponse, ServiceConfig, health_route, init_tracing, serve};
+use kairos_platform_framework_common::{
+    ApiResponse, ServiceConfig, health_route, init_tracing, serve,
+};
 use kairos_platform_framework_database::{DatabaseConfig, connect, ensure_initialized};
 use kairos_platform_framework_redis::{RateLimitConfig, RateLimitState, RedisClient, RedisConfig};
 use kairos_platform_framework_security::{SecurityConfig, TokenService};

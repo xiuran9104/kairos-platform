@@ -92,7 +92,7 @@ const routes: RouteRecordRaw[] = [
         path: '/pent/guard',
         component: () => import('#/views/pent/guard/index.vue'),
         name: 'PentGuard',
-        meta: { title: '拦截中心', icon: 'lucide:shield-ban' },
+        meta: { title: '拦截中心', icon: 'lucide:shield-ban', hideInMenu: true },
       },
     ],
   },

@@ -468,6 +468,7 @@ async fn test(
                         prompt,
                         size: "1024x1024".into(),
                         references: Vec::new(),
+                        seed: None,
                     },
                 )
                 .await?,

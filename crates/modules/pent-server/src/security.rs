@@ -151,7 +151,7 @@ fn required_permission(method: &str, path: &str) -> &'static str {
     if path.starts_with("/pent/sessions") && path.ends_with("/runs") {
         return permission_codes::RUN_EXECUTE;
     }
-    if path.starts_with("/pent/sessions") || path.starts_with("/pent/turns") || path == "/pent/chat"
+    if path.starts_with("/pent/sessions") || path.starts_with("/pent/turns")
     {
         return permission_codes::AGENT_CHAT;
     }

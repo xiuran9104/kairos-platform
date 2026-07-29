@@ -32,7 +32,7 @@ pub fn route_tools(
         rejected_count,
         policy_version,
         registry_revision,
-        strategy: "hard_filter+deterministic_score".into(),
+        strategy: "hard_filter+hybrid_retrieval+deterministic_score".into(),
         decided_at: Utc::now(),
     }
 }

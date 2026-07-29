@@ -380,3 +380,99 @@ pub async fn save_skill_content(
     affected(result.rows_affected(), "skill")?;
     Ok(Json(ApiResponse::new(())))
 }
+// ── Tool management API handlers (AI-02) ──────────────────────────────
+
+use crate::tool_catalog::ToonPgCatalog;
+
+#[derive(serde::Deserialize)]
+pub(crate) struct CreateToolRequest {
+    tool_id: String,
+    version: String,
+    name: String,
+    description: Option<String>,
+    namespace: Option<String>,
+    capabilities: Option<serde_json::Value>,
+    source: Option<String>,
+    input_schema: Option<serde_json::Value>,
+    output_schema: Option<serde_json::Value>,
+    risk_level: Option<String>,
+    executor: Option<serde_json::Value>,
+}
+
+pub(crate) async fn list_tools(
+    user: CurrentUser,
+    State(state): State<ToonState>,
+) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, AppError> {
+    require(&user, "toon:project:read")?;
+    let catalog = ToonPgCatalog::new(state.pool.clone());
+    let tools = catalog.active_tools().await.map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(tools.into_iter().map(|t| serde_json::to_value(t).unwrap_or_default()).collect())))
+}
+
+pub(crate) async fn create_tool(
+    user: CurrentUser,
+    State(state): State<ToonState>,
+    Json(body): Json<CreateToolRequest>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    require(&user, "toon:setting:manage")?;
+    let catalog = ToonPgCatalog::new(state.pool.clone());
+    catalog.upsert(&body.tool_id, &body.version, &body.name, &body.description.unwrap_or_default(), &body.namespace.unwrap_or_else(|| "toonflow".into()), &body.capabilities.unwrap_or_else(|| serde_json::json!([])), &body.source.unwrap_or_else(|| "builtin".into()), &body.input_schema.unwrap_or_else(|| serde_json::json!({})), &body.output_schema.unwrap_or_else(|| serde_json::json!({})), &body.risk_level.unwrap_or_else(|| "low".into()), &body.executor.unwrap_or_else(|| serde_json::json!({}))).await.map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(())))
+}
+
+pub(crate) async fn get_tool(
+    user: CurrentUser, State(state): State<ToonState>,
+    Path((tool_id, version)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    require(&user, "toon:project:read")?;
+    let catalog = ToonPgCatalog::new(state.pool.clone());
+    let tool = catalog.get(&tool_id, &version).await.map_err(|e| AppError::internal(e.to_string()))?.ok_or_else(|| AppError::not_found("工具不存在"))?;
+    Ok(Json(ApiResponse::new(serde_json::to_value(tool).unwrap_or_default())))
+}
+
+pub(crate) async fn update_tool(
+    user: CurrentUser, State(state): State<ToonState>,
+    Path((tool_id, version)): Path<(String, String)>,
+    Json(body): Json<CreateToolRequest>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    require(&user, "toon:setting:manage")?;
+    let catalog = ToonPgCatalog::new(state.pool.clone());
+    catalog.upsert(&tool_id, &version, &body.name, &body.description.unwrap_or_default(), &body.namespace.unwrap_or_else(|| "toonflow".into()), &body.capabilities.unwrap_or_else(|| serde_json::json!([])), &body.source.unwrap_or_else(|| "builtin".into()), &body.input_schema.unwrap_or_else(|| serde_json::json!({})), &body.output_schema.unwrap_or_else(|| serde_json::json!({})), &body.risk_level.unwrap_or_else(|| "low".into()), &body.executor.unwrap_or_else(|| serde_json::json!({}))).await.map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(())))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct StatusRequest { status: String }
+
+pub(crate) async fn update_tool_status(
+    user: CurrentUser, State(state): State<ToonState>,
+    Path((tool_id, version)): Path<(String, String)>,
+    Json(body): Json<StatusRequest>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    require(&user, "toon:setting:manage")?;
+    ToonPgCatalog::new(state.pool.clone()).set_status(&tool_id, &version, &body.status).await.map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(())))
+}
+
+// ── Task cancel / retry ───────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(crate) struct TaskIdRequest { task_id: i64 }
+
+pub(crate) async fn cancel_task(
+    user: CurrentUser, State(state): State<ToonState>,
+    Json(body): Json<TaskIdRequest>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    require(&user, "toon:task:cancel")?;
+    crate::toonflow_tasks::TaskManager::new(state.pool.clone()).request_cancel(body.task_id).await.map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(())))
+}
+
+pub(crate) async fn retry_task(
+    user: CurrentUser, State(state): State<ToonState>,
+    Json(body): Json<TaskIdRequest>,
+) -> Result<Json<ApiResponse<i64>>, AppError> {
+    require(&user, "toon:setting:manage")?;
+    let new_id = crate::toonflow_tasks::TaskManager::new(state.pool.clone()).retry(body.task_id).await.map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(new_id)))
+}

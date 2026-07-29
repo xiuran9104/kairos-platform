@@ -21,7 +21,7 @@ impl AiModelGateway {
         }
     }
 
-    async fn resolve_model(&self, session_id: &str) -> anyhow::Result<(i64, Option<f64>, u32)> {
+    pub(crate) async fn resolve_model(&self, session_id: &str) -> anyhow::Result<(i64, Option<f64>, u32)> {
         let (tenant_id, project_id): (i64, Option<String>) =
             sqlx::query_as("SELECT tenant_id, project_id FROM pent_agent_sessions WHERE id = $1")
                 .bind(session_id)
@@ -71,12 +71,44 @@ fn conversation_output_token_limit(configured: u32) -> u32 {
     configured
 }
 
+/// Build the routing intent from the run objective, rolling summary and the
+/// most recent user message so tool routing reflects the current phase.
+fn routing_intent(context: &ConversationContext) -> String {
+    let last_user = context
+        .recent_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    format!(
+        "{}\n{}\n{}",
+        context.objective_snapshot, context.run_summary, last_user
+    )
+}
+
+/// Max risk accepted for routed tools. Conversation-executable tools are
+/// already allow-listed to low/medium risk; the policy snapshot can tighten
+/// this further via `max_risk`.
+fn routing_max_risk(context: &ConversationContext) -> &'static str {
+    match context
+        .policy_snapshot
+        .get("max_risk")
+        .and_then(Value::as_str)
+    {
+        Some("info") | Some("low") => "low",
+        Some("medium") => "medium",
+        Some("critical") => "critical",
+        _ => "high",
+    }
+}
+
 #[async_trait]
 impl ConversationModelGateway for AiModelGateway {
     async fn generate(
         &self,
         context: &ConversationContext,
-        _intent: &ConversationIntent,
+        intent: &ConversationIntent,
     ) -> anyhow::Result<ModelTurnOutput> {
         let (model_id, temperature, max_tokens) = self.resolve_model(&context.session_id).await?;
         let context_token_budget = std::env::var("PENTA_CONTEXT_TOKEN_BUDGET")
@@ -90,9 +122,17 @@ impl ConversationModelGateway for AiModelGateway {
         } else {
             format!("\n\n## 运行摘要与长期记忆\n{}", model_context.run_summary)
         };
+        let intent_context = format!(
+            "\n\n## 当前轮意图\n- 类型：{:?}\n- 置信度：{:.2}\n\
+             意图只影响本轮交互方式，不得覆盖 Scope、策略、审批和预算。",
+            intent.kind, intent.confidence
+        );
         let mut messages = vec![ChatMessage {
             role: "system".into(),
-            content: format!("{}{}", model_context.system_instruction, memory_context),
+            content: format!(
+                "{}{}{}",
+                model_context.system_instruction, memory_context, intent_context
+            ),
         }];
         messages.extend(
             model_context
@@ -105,7 +145,23 @@ impl ConversationModelGateway for AiModelGateway {
         );
         let started = std::time::Instant::now();
 
-        let tools = super::tool_catalog::load_conversation_tool_definitions(&self.pool).await?;
+        let tools = match super::tool_catalog::load_routed_tool_definitions(
+            &self.pool,
+            &routing_intent(context),
+            routing_max_risk(context),
+            super::tool_catalog::tool_schema_top_k(),
+        )
+        .await
+        {
+            Ok(definitions) => definitions,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "tool routing failed; falling back to full conversation catalog"
+                );
+                super::tool_catalog::load_conversation_tool_definitions(&self.pool).await?
+            }
+        };
         let mut api_messages: Vec<Value> =
             messages.iter().map(|m| format_message_for_api(m)).collect();
 
@@ -166,7 +222,7 @@ fn format_message_for_api(m: &kairos_platform_ai_api::ChatMessage) -> Value {
         if let Some(tool_calls) = parsed.get("tool_calls") {
             return serde_json::json!({
                 "role": "assistant",
-                "content": null,
+                "content": parsed.get("content").cloned().unwrap_or(Value::Null),
                 "tool_calls": tool_calls
             });
         }
@@ -359,7 +415,11 @@ fn parse_chat_tools_response(response: &Value) -> (String, Vec<ModelToolCall>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_tool_message_groups, trim_api_messages_preserving_tool_groups};
+    use super::{
+        format_message_for_api, sanitize_tool_message_groups,
+        trim_api_messages_preserving_tool_groups,
+    };
+    use kairos_platform_ai_api::ChatMessage;
     use serde_json::{Value, json};
 
     fn call(id: &str) -> Value {
@@ -373,6 +433,25 @@ mod tests {
 
     fn result(id: &str) -> Value {
         json!({"role": "tool", "tool_call_id": id, "content": "{}"})
+    }
+
+    #[test]
+    fn preserves_assistant_content_that_accompanies_tool_calls() {
+        let message = ChatMessage {
+            role: "assistant".into(),
+            content: json!({
+                "content": "根据新证据改为检查登录接口",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "http_request", "arguments": "{}"}
+                }]
+            })
+            .to_string(),
+        };
+        let formatted = format_message_for_api(&message);
+        assert_eq!(formatted["content"], "根据新证据改为检查登录接口");
+        assert_eq!(formatted["tool_calls"][0]["id"], "call-1");
     }
 
     #[test]

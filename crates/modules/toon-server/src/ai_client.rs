@@ -95,7 +95,7 @@ pub async fn image(
     prompt: &str,
     size: &str,
 ) -> Result<String, String> {
-    image_with_references(pool, configured, prompt, size, Vec::new()).await
+    image_with_references(pool, configured, prompt, size, Vec::new(), None).await
 }
 
 /// Generates an image with ordered visual references when the configured provider supports edits.
@@ -105,6 +105,7 @@ pub async fn image_with_references(
     prompt: &str,
     size: &str,
     references: Vec<String>,
+    seed: Option<i64>,
 ) -> Result<String, String> {
     kairos_platform_ai_server::AiModelFactory::new(pool.clone())
         .image(
@@ -113,6 +114,7 @@ pub async fn image_with_references(
                 prompt: prompt.into(),
                 size: size.into(),
                 references,
+                seed,
             },
         )
         .await

@@ -918,6 +918,7 @@ pub struct StoryboardRow {
     pub flow_id: Option<i64>,
     pub index: Option<i32>,
     pub create_time: i64,
+    pub confirm_state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -935,7 +936,8 @@ pub async fn get_storyboards(
     require(&user, "toon:scene:read")?;
     let rows = sqlx::query_as::<_, StoryboardRow>(
         r#"SELECT id, script_id, prompt, file_path, duration, state, track_id, reason, track,
-                  video_desc, should_generate_image, project_id, flow_id, index, create_time
+                  video_desc, should_generate_image, project_id, flow_id, index, create_time,
+                  confirm_state
            FROM toonflow.storyboards WHERE script_id=$1 AND project_id=$2 ORDER BY index ASC NULLS LAST, id ASC"#,
     )
     .bind(request.script_id)
@@ -1061,8 +1063,8 @@ async fn insert_storyboard(
     sqlx::query(
         r#"INSERT INTO toonflow.storyboards
            (id, script_id, prompt, file_path, duration, state, track_id, track, video_desc,
-            should_generate_image, project_id, index, create_time)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"#,
+            should_generate_image, project_id, index, create_time, confirm_state)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')"#,
     )
     .bind(id)
     .bind(script_id)
@@ -1610,4 +1612,126 @@ pub async fn get_project_by_path(
     .map_err(|_| AppError::internal("failed to get project"))?
     .ok_or_else(|| AppError::not_found("project not found"))?;
     Ok(Json(ApiResponse::new(row)))
+}
+
+// ── AI-05: Storyboard dual state machine ───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmStoryboardRequest {
+    pub ids: Vec<i64>,
+    pub project_id: i64,
+}
+
+/// Confirm storyboards (pending → ready). Unready storyboards are rejected.
+pub async fn confirm_storyboards(
+    user: CurrentUser,
+    State(state): State<ToonState>,
+    Json(request): Json<ConfirmStoryboardRequest>,
+) -> Result<Json<ApiResponse<usize>>, AppError> {
+    require(&user, "toon:storyboard:update")?;
+    if request.ids.is_empty() {
+        return Err(AppError::bad_request("ids 不能为空"));
+    }
+    // Validate all exist and are pending
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM toonflow.storyboards
+         WHERE id = ANY($1) AND project_id = $2 AND confirm_state = 'pending'",
+    )
+    .bind(&request.ids)
+    .bind(request.project_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to query storyboards"))?;
+    if count != request.ids.len() as i64 {
+        return Err(AppError::bad_request("部分分镜不存在或已确认"));
+    }
+    let updated = sqlx::query(
+        "UPDATE toonflow.storyboards SET confirm_state = 'ready'
+         WHERE id = ANY($1) AND project_id = $2",
+    )
+    .bind(&request.ids)
+    .bind(request.project_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to confirm storyboards"))?;
+    Ok(Json(ApiResponse::new(updated.rows_affected() as usize)))
+}
+
+/// Unconfirm storyboards (ready → pending).
+pub async fn unconfirm_storyboards(
+    user: CurrentUser,
+    State(state): State<ToonState>,
+    Json(request): Json<ConfirmStoryboardRequest>,
+) -> Result<Json<ApiResponse<usize>>, AppError> {
+    require(&user, "toon:storyboard:update")?;
+    if request.ids.is_empty() {
+        return Err(AppError::bad_request("ids 不能为空"));
+    }
+    let updated = sqlx::query(
+        "UPDATE toonflow.storyboards SET confirm_state = 'pending'
+         WHERE id = ANY($1) AND project_id = $2",
+    )
+    .bind(&request.ids)
+    .bind(request.project_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to unconfirm storyboards"))?;
+    Ok(Json(ApiResponse::new(updated.rows_affected() as usize)))
+}
+
+/// Storyboard readiness: has_image + has_duration + has_prompt + has_track.
+/// Only ready storyboards should enter image/video generation.
+#[derive(Debug, Serialize)]
+pub struct StoryboardReadiness {
+    pub id: i64,
+    pub ready: bool,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadinessRequest {
+    pub ids: Vec<i64>,
+    pub project_id: i64,
+}
+
+pub async fn get_storyboard_readiness(
+    user: CurrentUser,
+    State(state): State<ToonState>,
+    Json(request): Json<ReadinessRequest>,
+) -> Result<Json<ApiResponse<Vec<StoryboardReadiness>>>, AppError> {
+    require(&user, "toon:storyboard:read")?;
+    let rows: Vec<(i64, Option<String>, Option<String>, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, file_path, duration, prompt, track_id::text
+         FROM toonflow.storyboards
+         WHERE id = ANY($1) AND project_id = $2",
+    )
+    .bind(&request.ids)
+    .bind(request.project_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("failed to query storyboards"))?;
+    let result: Vec<StoryboardReadiness> = rows
+        .into_iter()
+        .map(|(id, file_path, duration, prompt, track)| {
+            let mut missing = Vec::new();
+            if file_path.is_none() && duration.is_none() {
+                missing.push("image".to_string());
+            }
+            if duration.is_none() || duration.as_deref() == Some("") {
+                missing.push("duration".to_string());
+            }
+            if prompt.is_empty() {
+                missing.push("prompt".to_string());
+            }
+            if track.is_none() {
+                missing.push("track".to_string());
+            }
+            StoryboardReadiness {
+                id,
+                ready: missing.is_empty(),
+                missing,
+            }
+        })
+        .collect();
+    Ok(Json(ApiResponse::new(result)))
 }

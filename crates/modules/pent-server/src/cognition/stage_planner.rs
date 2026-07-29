@@ -43,6 +43,9 @@ impl StagePlanner {
                         2,
                     ));
                 }
+                // Reporting stages produce no tool actions — the cognition
+                // driver generates the deterministic report itself.
+                o if o.contains("报告") => {}
                 _ => {
                     tasks.push(Self::action(
                         format!("{}-t1", stage_id),
@@ -66,7 +69,12 @@ impl StagePlanner {
     }
 
     fn action(id: String, capability: &str, target: &str, priority: i32) -> PlanNode {
-        let parent = id.split('-').next().unwrap_or("stage").to_string();
+        // Child ids look like "stage-1-t1"; the parent stage id is the id
+        // minus the last dash segment ("stage-1"), never a bare prefix.
+        let parent = id
+            .rfind('-')
+            .map(|index| id[..index].to_string())
+            .unwrap_or_else(|| "stage".to_string());
         PlanNode {
             node_id: id,
             node_type: PlanNodeType::Action,

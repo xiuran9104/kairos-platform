@@ -259,6 +259,8 @@ pub struct ImageRequest {
     pub size: String,
     #[serde(default)]
     pub references: Vec<String>,
+    #[serde(default)]
+    pub seed: Option<i64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaResponse {

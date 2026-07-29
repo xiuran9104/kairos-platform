@@ -31,7 +31,8 @@ pub(crate) fn build_runtime(
 }
 
 pub mod adapters;
-mod authorization;
+pub(crate) mod authorization;
+pub(crate) mod claim_gate;
 pub mod context_source;
 pub mod error_codes;
 pub mod http;
@@ -47,4 +48,5 @@ pub mod tool_catalog;
 pub mod tool_executor;
 mod tool_extensions;
 mod tool_guard;
+pub mod traffic;
 pub(crate) mod turn_tasks;

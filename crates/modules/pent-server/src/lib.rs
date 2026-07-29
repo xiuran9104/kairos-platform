@@ -3,15 +3,17 @@ pub mod cognition;
 pub mod config;
 pub mod conversation;
 pub mod infrastructure;
+pub(crate) mod report;
 mod runtime_policy;
 mod security;
 mod session;
+mod skills;
 pub mod tooling;
 pub mod transport;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     middleware::from_fn,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -54,7 +56,7 @@ pub fn routes(state: PentState) -> Router {
         .route("/pent/runs/{id}/tool-calls", get(get_tool_calls))
         .route("/pent/approvals", get(list_approvals))
         .route("/pent/approvals/{id}/decision", post(decide_approval))
-        .route("/pent/chat", post(chat))
+        // /pent/chat removed — was a demo stub with keyword-fixed replies
         .merge(tooling::http::routes())
         .route("/pent/metrics", get(metrics))
         .route("/pent/tools/overview", get(tools_overview))
@@ -74,11 +76,14 @@ pub fn routes(state: PentState) -> Router {
         .route("/pent/runs/{id}/evidence", get(get_run_evidence))
         .route("/pent/runs/{id}/findings", get(get_run_findings))
         .route("/pent/runs/{id}/artifacts", get(get_run_artifacts))
+        .route("/pent/runs/{id}/traffic", get(get_run_traffic))
         .route("/pent/evidence/{id}", get(get_evidence))
         .route("/pent/findings/{id}", get(get_finding).post(review_finding))
+        .route("/pent/traffic/{id}", get(get_traffic))
         .route("/pent/artifacts/{id}/download", get(download_artifact))
         .merge(session::routes())
         .merge(conversation::http::routes())
+        .merge(skills::routes())
         .route_layer(from_fn(security::authorize_request));
 
     Router::new()
@@ -996,6 +1001,24 @@ async fn authorize_tool_call(
     let policy = runtime_policy::load(pool, tenant_id)
         .await
         .map_err(|error| format!("{error:?}"))?;
+    // VulnClaw-style default: scope confirmation + tool-layer constraints are
+    // the authorization boundary; per-tool human approval is opt-in via
+    // PENTA_APPROVAL_MODE=policy. Every auto-grant is audited.
+    if std::env::var("PENTA_APPROVAL_MODE").as_deref() != Ok("policy") {
+        append_run_event(
+            pool,
+            run_id,
+            "approval.auto_granted",
+            json!({
+                "tool_name": tool_name,
+                "target": target,
+                "risk_level": risk_level,
+                "reason": "approval_mode=auto（默认免审批；设置 PENTA_APPROVAL_MODE=policy 恢复人工审批）"
+            }),
+        )
+        .await?;
+        return Ok(ToolAuthorization::Allowed);
+    }
     let needs_approval = approval_policy == "always"
         || policy
             .require_approval_for
@@ -1148,6 +1171,18 @@ async fn execute_claimed_run(
     };
     if session_run? {
         return Ok(());
+    }
+
+    // ── H-PER-M cognition engine (opt-in) ──
+    if std::env::var("PENTA_COGNITION_ENGINE").as_deref() == Ok("true") {
+        append_run_event(
+            pool,
+            &run_id,
+            "run.engine.selected",
+            json!({"engine": "cognition", "worker_id": worker_id}),
+        )
+        .await?;
+        return crate::cognition::engine::execute_cognition_run(pool, &run_id, worker_id).await;
     }
 
     // ── PentAGI Security Tools 执行 ──
@@ -1685,6 +1720,32 @@ async fn execute_claimed_run(
         }),
     )
     .await?;
+    match report::generate_run_report(pool, &run_id, None).await {
+        Ok(artifact) => {
+            append_run_event(
+                pool,
+                &run_id,
+                "run.report.completed",
+                json!({
+                    "artifact_id": artifact.artifact_id,
+                    "object_key": artifact.object_key,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                }),
+            )
+            .await?;
+        }
+        Err(error) => {
+            tracing::error!(run_id = %run_id, error = %error, "run report generation failed");
+            append_run_event(
+                pool,
+                &run_id,
+                "run.report.failed",
+                json!({"error": error}),
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -1710,7 +1771,7 @@ async fn wait_for_run_cancellation(pool: &PgPool, run_id: &str) {
     }
 }
 
-async fn run_cancel_requested(pool: &PgPool, run_id: &str) -> Result<bool, String> {
+pub(crate) async fn run_cancel_requested(pool: &PgPool, run_id: &str) -> Result<bool, String> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
              SELECT 1 FROM pent_runs
@@ -1816,7 +1877,7 @@ async fn handle_run_failure(
     Ok(())
 }
 
-async fn append_run_event(
+pub(crate) async fn append_run_event(
     pool: &PgPool,
     run_id: &str,
     event_type: &str,
@@ -2118,6 +2179,120 @@ async fn get_evidence(
     }
     Ok(Json(ApiResponse::new(sanitized)))
 }
+
+async fn get_run_traffic(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let offset = params
+        .get("offset")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0);
+    let status = params
+        .get("status")
+        .and_then(|value| value.parse::<i32>().ok());
+    let method = params
+        .get("method")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let url_contains = params
+        .get("url_contains")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let rows = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(t) FROM (
+             SELECT t.id, t.run_id, t.tool_call_id, t.tool_name, t.method, t.url,
+                    t.response_status, t.duration_ms, t.replay_of, t.created_at,
+                    octet_length(coalesce(t.response_body,'')) AS response_size_bytes
+             FROM pent_http_traffic t JOIN pent_runs r ON r.id=t.run_id
+             WHERE t.run_id=$1 AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)
+               AND ($5::text IS NULL OR t.url ILIKE '%'||$5||'%')
+               AND ($6::text IS NULL OR t.method=upper($6))
+               AND ($7::int IS NULL OR t.response_status=$7)
+             ORDER BY t.created_at DESC LIMIT $8 OFFSET $9
+         ) t",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(url_contains)
+    .bind(method)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(rows)))
+}
+
+async fn get_traffic(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let v = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(t) FROM pent_http_traffic t JOIN pent_runs r ON r.id=t.run_id
+         WHERE t.id=$1 AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .ok_or_else(|| AppError::not_found("not found"))?;
+    let mut sanitized = v.clone();
+    if let Some(obj) = sanitized.as_object_mut() {
+        for field in ["request_body", "response_body"] {
+            if let Some(text) = obj.get(field).and_then(Value::as_str) {
+                obj.insert(
+                    field.into(),
+                    Value::String(sanitize_sensitive_data(text)),
+                );
+            }
+        }
+        for field in ["request_headers", "response_headers"] {
+            if let Some(headers) = obj.get(field).and_then(Value::as_object) {
+                let redacted: serde_json::Map<String, Value> = headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let sensitive = matches!(
+                            name.to_ascii_lowercase().as_str(),
+                            "authorization"
+                                | "proxy-authorization"
+                                | "cookie"
+                                | "set-cookie"
+                                | "x-csrf-token"
+                                | "x-api-key"
+                        );
+                        if sensitive {
+                            (name.clone(), Value::String("***REDACTED***".into()))
+                        } else {
+                            (name.clone(), value.clone())
+                        }
+                    })
+                    .collect();
+                obj.insert(field.into(), Value::Object(redacted));
+            }
+        }
+    }
+    Ok(Json(ApiResponse::new(sanitized)))
+}
 async fn get_finding(
     State(s): State<PentState>,
     Path(id): Path<String>,
@@ -2193,17 +2368,30 @@ async fn download_artifact(
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
     let (key, content_type, _size) = row.ok_or_else(|| AppError::not_found("not found"))?;
+    let store = infrastructure::object_store::ObjectStore::from_env();
+    let (stored_type, bytes) = store
+        .get_object(&key)
+        .await
+        .map_err(|error| AppError::internal(format!("产物存储读取失败：{error}")))?;
+    let filename = key.rsplit('/').next().unwrap_or("artifact.bin");
+    let content_type = if content_type.is_empty() {
+        stored_type
+    } else {
+        content_type
+    };
     Ok(axum::response::Response::builder()
         .header("content-type", content_type)
-        .header("x-artifact-key", key)
-        .body(axum::body::Body::from(
-            "artifact download stub — MinIO integration pending",
-        ))
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .header("content-length", bytes.len())
+        .body(axum::body::Body::from(bytes))
         .unwrap())
 }
 
 /// Filter sensitive data (tokens, passwords, keys) from evidence text.
-fn sanitize_sensitive_data(text: &str) -> String {
+pub(crate) fn sanitize_sensitive_data(text: &str) -> String {
     let patterns: &[(&str, &str)] = &[
         ("Authorization", "Authorization: ***REDACTED***"),
         ("Cookie", "Cookie: ***REDACTED***"),
@@ -2227,33 +2415,6 @@ fn sanitize_sensitive_data(text: &str) -> String {
     }
     result
 }
-
-// ── AI Chat ─────────────────────────────────────────────────────────────
-
-async fn chat(Json(body): Json<Value>) -> Json<ApiResponse<Value>> {
-    let msg = body["message"].as_str().unwrap_or("hello");
-    let reply = if msg.contains("scan") || msg.contains("扫描") {
-        let target = msg
-            .split_whitespace()
-            .find(|w| w.contains('.'))
-            .unwrap_or("10.0.0.0/24");
-        format!(
-            "收到扫描指令。正在对目标 {} 发起安全扫描，包括TCP端口扫描、服务指纹识别和漏洞分析。任务已创建，请在运行页面查看进度。",
-            target
-        )
-    } else if msg.contains("漏洞") || msg.contains("风险") {
-        "当前系统已发现多个中危漏洞，包括SSH端口对外开放、nginx版本过旧等。建议及时修补，详情请在漏洞页面查看。".to_string()
-    } else if msg.contains("你好") || msg.contains("hi") || msg.contains("hello") {
-        "你好！我是 Pent AI 安全助手。我可以:\n1. 执行安全扫描 (输入 扫描 IP)\n2. 分析漏洞风险\n3. 查看安全证据\n4. 生成安全报告\n请告诉我你需要什么帮助？".to_string()
-    } else {
-        format!(
-            "收到你的消息: {}。我可以帮你执行安全扫描、分析漏洞、查看证据。试试输入 扫描 192.168.1.0/24",
-            msg
-        )
-    };
-    Json(ApiResponse::new(json!({"reply": reply})))
-}
-
 #[derive(serde::Serialize)]
 pub(crate) struct ApiResponse<T: serde::Serialize> {
     code: i32,
@@ -2267,5 +2428,100 @@ impl<T: serde::Serialize> ApiResponse<T> {
             data,
             message: "ok".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod approval_mode_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL)"]
+    async fn auto_approval_mode_allows_high_risk_tool_without_human_decision() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let config = kairos_platform_framework_database::DatabaseConfig::new(
+            url,
+            1,
+            2,
+            std::time::Duration::from_secs(10),
+        )
+        .expect("valid test database config");
+        let pool = kairos_platform_framework_database::connect(&config)
+            .await
+            .expect("connect test database");
+        let run_id = "approval-it-run";
+
+        sqlx::query("DELETE FROM pent_run_events WHERE run_id=$1")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup events");
+        sqlx::query("DELETE FROM pent_runs WHERE id=$1")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup run");
+        sqlx::query("DELETE FROM pent_tool_definitions WHERE tool_id='it-approval-tool'")
+            .execute(&pool)
+            .await
+            .expect("cleanup tool");
+        sqlx::query(
+            "INSERT INTO pent_runs(id, task_id, tenant_id, user_id, status, objective_snapshot)
+             VALUES ($1,'approval-it-task',0,'it-tester','running','审批模式测试')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("seed run");
+        // A tool whose manifest demands approval on every call.
+        sqlx::query(
+            "INSERT INTO pent_tool_definitions(
+                 tool_id, version, namespace, name, description, source,
+                 risk_level, approval_policy, lifecycle_status
+             ) VALUES ('it-approval-tool','1.0.0','test','审批测试工具','测试','builtin',
+                       'high','always','active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed tool");
+
+        // Default mode (no PENTA_APPROVAL_MODE=policy): auto-grant.
+        let result = authorize_tool_call(&pool, run_id, "it-approval-tool", "192.0.2.10").await;
+        assert!(
+            matches!(result, Ok(ToolAuthorization::Allowed)),
+            "默认模式必须自动批准，实际：{result:?}"
+        );
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pent_run_events
+             WHERE run_id=$1 AND event_type='approval.auto_granted')",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("query audit event");
+        assert!(audited, "自动批准必须留下审计事件");
+        let run_status: String = sqlx::query_scalar(
+            "SELECT status FROM pent_runs WHERE id=$1",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("query run status");
+        assert_eq!(run_status, "running", "免审批不得改变 Run 状态");
+
+        sqlx::query("DELETE FROM pent_run_events WHERE run_id=$1")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup events after test");
+        sqlx::query("DELETE FROM pent_runs WHERE id=$1")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup run after test");
+        sqlx::query("DELETE FROM pent_tool_definitions WHERE tool_id='it-approval-tool'")
+            .execute(&pool)
+            .await
+            .expect("cleanup tool after test");
     }
 }

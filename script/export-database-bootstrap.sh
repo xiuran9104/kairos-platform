@@ -20,6 +20,7 @@ pg_dump "$database_url" \
   --exclude-table-data='pent_approvals' \
   --exclude-table-data='pent_evidence' \
   --exclude-table-data='pent_findings' \
+  --exclude-table-data='pent_http_traffic' \
   --exclude-table-data='pent_run_events' \
   --exclude-table-data='pent_run_instructions' \
   --exclude-table-data='scan_tasks' \

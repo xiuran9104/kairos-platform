@@ -1,22 +1,31 @@
 //! LLM-06: Conversation HTTP endpoints.
 use crate::PentState;
+use crate::conversation::ports::ConversationAuthorizationService;
 use crate::conversation::stream::turn_sse;
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
+    http::{Response, header},
     routing::{get, post},
 };
-use futures_util::future::{AbortHandle, Abortable};
+use futures_util::{future::{AbortHandle, Abortable}, stream};
+use kairos_platform_ai_api::ChatMessage;
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
 use kairos_platform_pent_api::{AgentTurnRequest, ConversationMessageType};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 pub fn routes() -> Router<PentState> {
     Router::new()
         .route(
             "/pent/sessions/{id}/turns",
             get(list_turns).post(create_turn),
+        )
+        .route(
+            "/pent/sessions/{id}/turns/stream",
+            post(create_turn_stream),
         )
         .route("/pent/sessions/{id}/events", get(session_events))
         .route("/pent/turns/{id}/cancel", post(cancel_turn))
@@ -117,6 +126,316 @@ async fn create_turn(
         "status": "thinking",
         "processing": true
     }))))
+}
+
+/// Stream a simple chat turn token-by-token over SSE.
+///
+/// Unlike `create_turn`, this endpoint does **not** run the autonomous Pent tool
+/// loop. It is meant for plain conversational messages and mirrors the UX of
+/// `/ai/chat/message/send-stream` while still persisting messages under the
+/// agent session/turn model.
+async fn create_turn_stream(
+    State(s): State<PentState>,
+    Path(session_id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Response<Body>, AppError> {
+    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
+    let content = body["content"].as_str().unwrap_or("").trim().to_string();
+    if content.is_empty() {
+        return Err(AppError::bad_request("消息内容不能为空"));
+    }
+    let client_req_id = body
+        .get("client_request_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Idempotency: replay the existing turn id to the client and close.
+    if let Some(existing) = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM pent_conversation_turns WHERE session_id=$1 AND client_request_id=$2",
+    )
+    .bind(&session_id)
+    .bind(&client_req_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    {
+        let body = Body::from(format!(
+            "data: {}\n\nevent: done\ndata: [DONE]\n\n",
+            json!({"type":"already_exists","turn_id":existing})
+        ));
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(body)
+            .map_err(|_| AppError::internal("创建流失败"));
+    }
+
+    // Streaming chat is only for plain conversation without an active run.
+    let active_run_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT active_run_id FROM pent_agent_sessions WHERE id=$1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .flatten();
+    if active_run_id.is_some() {
+        return Err(AppError::bad_request(
+            "当前会话有运行中的任务，请使用非流式端点",
+        ));
+    }
+
+    // Try auto-authorization: detect explicit user declaration of authorised scope.
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let user_message_id = uuid::Uuid::new_v4().to_string();
+    let assistant_message_id = uuid::Uuid::new_v4().to_string();
+
+    // Apply authorization auto-detection before persisting messages so the session
+    // transitions to "ready" when the user explicitly declares scope in chat.
+    let auth_service =
+        crate::conversation::authorization::PgConversationAuthorizationService::new(s.pool.clone());
+    let _ = auth_service
+        .reconcile_explicit_authorization(&session_id, &content)
+        .await;
+
+    // Persist turn, user message, and a placeholder streaming assistant message.
+    sqlx::query(
+        "INSERT INTO pent_conversation_turns(
+             id, session_id, run_id, client_request_id, status, message_type,
+             intent, intent_confidence, started_at
+         ) VALUES($1,$2,NULL,$3,'streaming',$4,'chat',0.8,now())",
+    )
+    .bind(&turn_id)
+    .bind(&session_id)
+    .bind(&client_req_id)
+    .bind("chat")
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    sqlx::query(
+        "INSERT INTO pent_conversation_messages(
+             id, session_id, turn_id, role, message_type, content, payload,
+             created_by, sequence, status, format
+         ) VALUES($1,$2,$3,'user',$4,$5,$6,'system',0,'completed','text')",
+    )
+    .bind(&user_message_id)
+    .bind(&session_id)
+    .bind(&turn_id)
+    .bind("chat")
+    .bind(&content)
+    .bind(json!({"attachments": []}))
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    sqlx::query(
+        "INSERT INTO pent_conversation_messages(
+             id, session_id, turn_id, role, message_type, content, payload,
+             created_by, sequence, status, format
+         ) VALUES($1,$2,$3,'assistant','chat','',$4,'system',1,'streaming','text')",
+    )
+    .bind(&assistant_message_id)
+    .bind(&session_id)
+    .bind(&turn_id)
+    .bind(json!({}))
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let gateway = crate::conversation::model_gateway::AiModelGateway::new(s.pool.clone());
+    let (model_id, temperature, max_tokens) = gateway
+        .resolve_model(&session_id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    // Build a context-aware system prompt from session state.
+    let session_row: Option<(String, Option<Value>)> = sqlx::query_as(
+        "SELECT status, confirmed_scope_snapshot FROM pent_agent_sessions WHERE id=$1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    let has_active_run = sqlx::query_scalar::<_, bool>(
+        "SELECT active_run_id IS NOT NULL FROM pent_agent_sessions WHERE id=$1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .unwrap_or(false);
+
+    let system_prompt = {
+        let mut base = String::from(
+            "你是 Pent 平台的自动化渗透测试智能体。你有以下能力：\n\
+             - 执行信息收集（存活探测、指纹识别、端口扫描、目录枚举）\n\
+             - 漏洞检测与验证（SQL注入、XSS、文件上传、SSRF等）\n\
+             - 自动化攻击链构建\n\n",
+        );
+        if let Some((ref status, ref maybe_scope)) = session_row {
+            base.push_str(&format!("当前会话状态: {status}\n"));
+            if let Some(scope) = maybe_scope {
+                if let Some(targets) = scope.get("targets").and_then(|t| t.as_array()) {
+                    let target_list: Vec<&str> = targets.iter().filter_map(|t| t.as_str()).collect();
+                    if !target_list.is_empty() {
+                        base.push_str(&format!("已授权目标: {}\n", target_list.join(", ")));
+                    }
+                }
+            }
+            base.push_str(&format!("活跃 Run: {}\n\n", if has_active_run { "是" } else { "否" }));
+        }
+        base.push_str(
+            "核心原则：\n\
+             1. 用户说\"开始\"/\"继续\"/\"执行\"/\"直接\"时，立即进入行动模式，给具体操作步骤和命令\n\
+             2. 不要反复确认授权（授权已在会话中确认过了）\n\
+             3. 有活跃 Run 时直接调用工具，没有 Run 时给出立即可执行的命令\n\
+             4. 简洁直接，先做再说，不要冗长的免责声明\n\
+             5. 发现漏洞后直接报告漏洞类型 + 证据，不要只给手工操作指南\n\n\
+             请用中文回答。",
+        );
+        base
+    };
+
+    let history: Vec<(String, String)> = sqlx::query_as(
+        "SELECT role, content FROM pent_conversation_messages
+         WHERE session_id=$1 AND role IN ('user','assistant') AND status='completed'
+         ORDER BY created_at DESC, sequence DESC LIMIT 20",
+    )
+    .bind(&session_id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let mut messages = vec![ChatMessage {
+        role: "system".into(),
+        content: system_prompt,
+    }];
+    for (role, content) in history.into_iter().rev() {
+        messages.push(ChatMessage { role, content });
+    }
+    messages.push(ChatMessage {
+        role: "user".into(),
+        content: content.clone(),
+    });
+
+    let request = kairos_platform_ai_api::ChatRequest {
+        model: String::new(),
+        messages,
+        temperature,
+        max_tokens: Some(max_tokens),
+    };
+
+    let (tx, rx) = mpsc::channel::<Result<String, std::convert::Infallible>>(32);
+    let pool = s.pool.clone();
+    let turn_id_for_task = turn_id.clone();
+    let assistant_message_id_for_task = assistant_message_id.clone();
+
+    tokio::spawn(async move {
+        let factory = kairos_platform_ai_server::AiModelFactory::new(pool.clone());
+        let tx_inner = tx.clone();
+        let full_content = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let full_content_for_callback = full_content.clone();
+        let pool_for_callback = pool.clone();
+        let turn_id_for_callback = turn_id_for_task.clone();
+        let assistant_message_id_for_callback = assistant_message_id_for_task.clone();
+
+        let result = factory
+            .chat_stream(model_id, request, move |delta: String| {
+                let tx = tx_inner.clone();
+                let full_content = full_content_for_callback.clone();
+                let pool = pool_for_callback.clone();
+                let turn_id = turn_id_for_callback.clone();
+                let assistant_message_id = assistant_message_id_for_callback.clone();
+                async move {
+                    let mut content = full_content.lock().await;
+                    content.push_str(&delta);
+                    let content_clone = content.clone();
+                    drop(content);
+
+                    let _ = sqlx::query(
+                        "UPDATE pent_conversation_messages SET content=$2 WHERE id=$1",
+                    )
+                    .bind(&assistant_message_id)
+                    .bind(&content_clone)
+                    .execute(&pool)
+                    .await;
+
+                    let payload = json!({
+                        "type": "delta",
+                        "turn_id": turn_id,
+                        "message_id": assistant_message_id,
+                        "content": delta,
+                    });
+                    tx.send(Ok(format!("data: {}\n\n", payload)))
+                        .await
+                        .map_err(|_| "客户端已断开".to_string())
+                }
+            })
+            .await;
+
+        match result {
+            Ok(response) => {
+                let final_content = response.content;
+                let reasoning = response.reasoning;
+                let _ = sqlx::query(
+                    "UPDATE pent_conversation_messages SET content=$2, reasoning_summary=$3, status='completed' WHERE id=$1",
+                )
+                .bind(&assistant_message_id_for_task)
+                .bind(&final_content)
+                .bind(&reasoning)
+                .execute(&pool)
+                .await;
+                let _ = sqlx::query(
+                    "UPDATE pent_conversation_turns SET status='completed', completed_at=now() WHERE id=$1",
+                )
+                .bind(&turn_id_for_task)
+                .execute(&pool)
+                .await;
+
+                let payload = json!({
+                    "type": "complete",
+                    "turn_id": turn_id_for_task,
+                    "message_id": assistant_message_id_for_task,
+                    "content": final_content,
+                    "reasoning_content": reasoning,
+                });
+                let _ = tx.send(Ok(format!("data: {}\n\n", payload))).await;
+                let _ = tx.send(Ok("event: done\ndata: [DONE]\n\n".to_string())).await;
+            }
+            Err(error) => {
+                let error_msg = format!("{error:?}");
+                let _ = sqlx::query(
+                    "UPDATE pent_conversation_messages SET content=$2, status='failed' WHERE id=$1",
+                )
+                .bind(&assistant_message_id_for_task)
+                .bind(&format!("生成失败: {error_msg}"))
+                .execute(&pool)
+                .await;
+                let _ = sqlx::query(
+                    "UPDATE pent_conversation_turns SET status='failed', error_code='STREAM_ERROR', error_message=$2, completed_at=now() WHERE id=$1",
+                )
+                .bind(&turn_id_for_task)
+                .bind(&error_msg)
+                .execute(&pool)
+                .await;
+
+                let payload = json!({"code":500,"msg":error_msg});
+                let _ = tx.send(Ok(format!("event: error\ndata: {}\n\n", payload))).await;
+            }
+        }
+    });
+
+    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .map_err(|_| AppError::internal("创建流失败"))
 }
 
 async fn session_events(

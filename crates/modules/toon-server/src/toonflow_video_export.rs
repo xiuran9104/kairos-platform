@@ -130,22 +130,18 @@ pub async fn export(
             "服务器未安装 FFmpeg，安装后即可使用成片导出",
         ));
     }
-    let task_id = chrono::Utc::now().timestamp_millis();
-    sqlx::query("INSERT INTO toonflow.tasks(id,project_id,task_class,related_objects,model,description,state,start_time) VALUES($1,$2,'videoExport',$3,'ffmpeg','合并选中视频为最终成片','running',$1)")
-        .bind(task_id).bind(request.project_id).bind(json!({"scriptId":request.script_id}).to_string()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to create export task"))?;
+    let tm = crate::toonflow_tasks::TaskManager::new(state.pool.clone());
+    let task_id = tm.create("videoExport", Some(request.project_id), "ffmpeg", "合并选中视频为最终成片", &json!({"scriptId":request.script_id}).to_string()).await.map_err(|e| AppError::internal(e.to_string()))?;
+    tm.set_running(task_id).await.map_err(|e| AppError::internal(e.to_string()))?;
     let pool = state.pool.clone();
     tokio::spawn(async move {
+        let tm = crate::toonflow_tasks::TaskManager::new(pool.clone());
         match run_export(pool.clone(), request.project_id, request.script_id, task_id).await {
             Ok(url) => {
-                let _=sqlx::query("UPDATE toonflow.tasks SET state='success',related_objects=$2,reason=NULL WHERE id=$1").bind(task_id).bind(json!({"scriptId":request.script_id,"url":url}).to_string()).execute(&pool).await;
+                let _ = tm.set_succeeded(task_id, Some(&json!({"scriptId":request.script_id,"url":url}).to_string()), None).await;
             }
             Err(reason) => {
-                let _ =
-                    sqlx::query("UPDATE toonflow.tasks SET state='failed',reason=$2 WHERE id=$1")
-                        .bind(task_id)
-                        .bind(reason)
-                        .execute(&pool)
-                        .await;
+                let _ = tm.set_failed(task_id, &reason).await;
             }
         }
     });

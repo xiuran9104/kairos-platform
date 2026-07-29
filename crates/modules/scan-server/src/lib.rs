@@ -582,7 +582,10 @@ async fn zone_delete(
 
 // ── Asset CRUD ────────────────────────────────────────────────────────────
 
-async fn asset_list(State(s): State<ScanState>, Query(params): Query<HashMap<String, String>>) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+async fn asset_list(
+    State(s): State<ScanState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT to_jsonb(t) FROM scan_assets t WHERE deleted=0 ORDER BY id DESC",
     )
@@ -592,7 +595,8 @@ async fn asset_list(State(s): State<ScanState>, Query(params): Query<HashMap<Str
     // Apply keyword filter
     if let Some(keyword) = params.get("keyword").filter(|k| !k.is_empty()) {
         let kw = keyword.to_lowercase();
-        let filtered: Vec<Value> = rows.into_iter()
+        let filtered: Vec<Value> = rows
+            .into_iter()
             .filter(|v| {
                 let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let ip = v.get("ip").and_then(|i| i.as_str()).unwrap_or("");
@@ -817,8 +821,7 @@ async fn task_execute(
         serde_json::from_value(v).map_err(|e| AppError::internal(e.to_string()))?;
 
     // Validate
-    task::validate_task_target(&task.target)
-        .map_err(|e| AppError::internal(e))?;
+    task::validate_task_target(&task.target).map_err(|e| AppError::internal(e))?;
 
     // Start
     task::start_task(&mut task);
@@ -911,9 +914,13 @@ async fn task_execute(
 
         // Retrieve the newly inserted asset id for updates
         let asset_id: Option<i32> = if asset.id.is_none() {
-            sqlx::query_scalar::<_, i32>("SELECT id FROM scan_assets WHERE ip=$1 AND deleted=0 ORDER BY id DESC LIMIT 1")
-                .bind(&asset.ip).fetch_optional(&s.pool).await
-                .map_err(|e| AppError::internal(e.to_string()))?
+            sqlx::query_scalar::<_, i32>(
+                "SELECT id FROM scan_assets WHERE ip=$1 AND deleted=0 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(&asset.ip)
+            .fetch_optional(&s.pool)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?
         } else {
             asset.id
         };
@@ -943,8 +950,10 @@ async fn task_execute(
             let ports_json = serde_json::to_value(&asset.ports)
                 .map_err(|e| AppError::internal(e.to_string()))?;
             sqlx::query("UPDATE scan_assets SET ports=$2,last_scanned=now() WHERE id=$1")
-                .bind(aid).bind(&ports_json)
-                .execute(&s.pool).await
+                .bind(aid)
+                .bind(&ports_json)
+                .execute(&s.pool)
+                .await
                 .map_err(|e| AppError::internal(e.to_string()))?;
         }
 

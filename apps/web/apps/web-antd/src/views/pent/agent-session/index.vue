@@ -121,24 +121,15 @@ async function sendMessage() {
   if (!text || loading.value) return;
   let currentSessionId = sessionId.value;
 
-  // Auto-create session
+  // No session in URL: redirect to the most recent one instead of auto-creating.
   if (!currentSessionId) {
-    try {
-      loading.value = true;
-      const s: any = await createPentSession({
-        objective: text.slice(0, 50), targets: [], constraints: {}, budget: {},
-      });
-      const newId = s?.id ?? s?.data?.id;
-      if (newId) {
-        currentSessionId = newId;
-        await loadSessions();
-        await router.replace(`/pent/sessions/${newId}`);
-      }
-    } catch {
-      message.error('创建会话失败');
-      loading.value = false;
-      return;
+    if (sessions.value.length > 0) {
+      await router.replace(`/pent/sessions/${sessions.value[0].id}`);
+      message.info('已切换到最近的会话，请重新发送');
+    } else {
+      message.warning('请先创建一个会话');
     }
+    return;
   }
   if (!currentSessionId) { loading.value = false; return; }
 
@@ -328,10 +319,12 @@ async function sendStreamingMessage(currentSessionId: string, text: string) {
         }
       },
       (err: any) => {
+        // Throwing stops the library from retrying; reject the promise and bail.
         if (assistantMsg && assistantMsg.status === 'streaming') {
           assistantMsg.status = 'failed';
         }
         reject(err);
+        throw err;
       },
       () => {
         if (assistantMsg && assistantMsg.status === 'streaming') {

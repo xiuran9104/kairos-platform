@@ -31,6 +31,29 @@ async fn applies_all_migrations_to_empty_postgres() {
     .expect("inspect storyboard asset ordering column");
     assert!(storyboard_asset_order_exists);
 
+    // AI-02: workflow migration columns
+    for (table, column) in [
+        ("toonflow.projects", "global_seed"),
+        ("toonflow.storyboards", "confirm_state"),
+        ("toonflow.tasks", "payload"),
+        ("toonflow.tasks", "cancel_requested"),
+        ("toonflow.tasks", "progress"),
+        ("toonflow.assets", "scope"),
+        ("toonflow.images", "seed"),
+        ("toonflow.videos", "seed"),
+    ] {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema||'.'||table_name=$1 AND column_name=$2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_optional(&pool)
+        .await
+        .expect("inspect workflow column");
+        let exists = row.is_some_and(|(found,)| found);
+        assert!(exists, "workflow column {table}.{column} must exist");
+    }
+
     for table in [
         "ai.model_configs",
         "ai.chat_roles",
@@ -52,6 +75,8 @@ async fn applies_all_migrations_to_empty_postgres() {
         "infra_codegen_column",
         "pent_runtime_policies",
         "pent_runs",
+        "pent_http_traffic",
+        "pent_skills",
         "pent_tool_calls",
         "pent_workers",
         "yudao_demo01_contact",

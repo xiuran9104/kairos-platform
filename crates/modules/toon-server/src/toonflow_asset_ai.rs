@@ -307,9 +307,12 @@ async fn new_image(
     model: &str,
     resolution: &str,
     offset: i64,
+    seed: i64,
 ) -> Result<i64, AppError> {
     let id = chrono::Utc::now().timestamp_millis() + offset;
-    sqlx::query("INSERT INTO toonflow.images(id,type,assets_id,model,resolution,state) VALUES($1,$2,$3,$4,$5,'生成中')").bind(id).bind(&item.type_).bind(item.id).bind(model).bind(resolution).execute(pool).await.map_err(|_|AppError::internal("failed to create image"))?;
+    sqlx::query("INSERT INTO toonflow.images(id,type,assets_id,model,resolution,state,seed) VALUES($1,$2,$3,$4,$5,'生成中',$6)")
+        .bind(id).bind(&item.type_).bind(item.id).bind(model).bind(resolution).bind(seed)
+        .execute(pool).await.map_err(|_|AppError::internal("failed to create image"))?;
     Ok(id)
 }
 async fn make_image(
@@ -319,6 +322,7 @@ async fn make_image(
     resolution: &str,
     item: ImageItem,
     image_id: i64,
+    seed: i64,
 ) -> Result<String, String> {
     let style: Option<(String,)> =
         sqlx::query_as("SELECT art_style FROM toonflow.projects WHERE id=$1")
@@ -348,7 +352,7 @@ async fn make_image(
     } else {
         Some(toonflow_prompt_store::load(pool, prompt_key, "").await)
     };
-    let prompt = toonflow_asset_prompt::image_prompt_with_instruction(
+    let mut prompt = toonflow_asset_prompt::image_prompt_with_instruction(
         &style,
         &item.type_,
         &visual_description,
@@ -356,8 +360,11 @@ async fn make_image(
         item.base64.is_some(),
         managed_instruction.as_deref(),
     );
+    // AI-04: inject art style prefix for consistency
+    let style_prefix = toonflow_prompt_store::load_style_prefix(pool, project_id).await;
+    prompt = toonflow_prompt_store::inject_style_prefix(&prompt, &style_prefix);
     let references = item.base64.clone().into_iter().collect();
-    match ai_client::image_with_references(pool, model, &prompt, resolution, references).await {
+    match ai_client::image_with_references(pool, model, &prompt, resolution, references, Some(seed)).await {
         Ok(path) => {
             let path = persist_remote_image(&path, item.id).await?;
             let updated = sqlx::query("UPDATE toonflow.images SET file_path=$2,state='已完成' WHERE id=$1 AND state='生成中'")
@@ -436,17 +443,18 @@ pub(crate) async fn schedule_asset_generation(
             prompt,
             base64,
         };
-        let image_id = new_image(pool, &item, &model, &resolution, offset as i64).await?;
-        queue.push((image_id, item));
+        let seed = toonflow_prompt_store::resolve_seed(pool, Some(project_id), None).await.wrapping_add(offset as i64);
+        let image_id = new_image(pool, &item, &model, &resolution, offset as i64, seed).await?;
+        queue.push((image_id, item, seed));
     }
     let response = queue
         .iter()
-        .map(|(image_id, item)| json!({"id":item.id,"imageId":image_id,"state":"生成中"}))
+        .map(|(image_id, item, _)| json!({"id":item.id,"imageId":image_id,"state":"生成中"}))
         .collect::<Vec<_>>();
     let pool = pool.clone();
     tokio::spawn(async move {
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrent_count.clamp(1, 10)));
-        for (image_id, item) in queue {
+        for (image_id, item, seed) in queue {
             let permit = sem.clone().acquire_owned().await;
             let pool = pool.clone();
             let model = model.clone();
@@ -454,7 +462,7 @@ pub(crate) async fn schedule_asset_generation(
             tokio::spawn(async move {
                 if permit.is_ok() {
                     let _ =
-                        make_image(&pool, project_id, &model, &resolution, item, image_id).await;
+                        make_image(&pool, project_id, &model, &resolution, item, image_id, seed).await;
                 }
             });
         }
@@ -533,7 +541,8 @@ pub async fn generate_image(
         prompt: req.prompt,
         base64: req.base64,
     };
-    let image_id = new_image(&state.pool, &item, &model, &req.resolution, 0).await?;
+    let seed = toonflow_prompt_store::resolve_seed(&state.pool, Some(req.project_id), None).await;
+    let image_id = new_image(&state.pool, &item, &model, &req.resolution, 0, seed).await?;
     match make_image(
         &state.pool,
         req.project_id,
@@ -541,6 +550,7 @@ pub async fn generate_image(
         &req.resolution,
         item.clone(),
         image_id,
+        seed,
     )
     .await
     {
@@ -559,10 +569,13 @@ pub async fn batch_generate_images(
     let total = req.items.len();
     let model = req.model.as_configured();
     let mut queue = Vec::new();
+    let project_seed = toonflow_prompt_store::resolve_seed(&state.pool, Some(req.project_id), None).await;
     for (index, item) in req.items.into_iter().enumerate() {
+        let seed = project_seed.wrapping_add(index as i64);
         queue.push((
-            new_image(&state.pool, &item, &model, &req.resolution, index as i64).await?,
+            new_image(&state.pool, &item, &model, &req.resolution, index as i64, seed).await?,
             item,
+            seed,
         ));
     }
     let pool = state.pool.clone();
@@ -570,14 +583,14 @@ pub async fn batch_generate_images(
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
             req.concurrent_count.unwrap_or(1).clamp(1, 10),
         ));
-        for (image_id, item) in queue {
+        for (image_id, item, seed) in queue {
             let permit = sem.clone().acquire_owned().await;
             let pool = pool.clone();
             let model = model.clone();
             let resolution = req.resolution.clone();
             tokio::spawn(async move {
                 if permit.is_ok() {
-                    let _ = make_image(&pool, req.project_id, &model, &resolution, item, image_id)
+                    let _ = make_image(&pool, req.project_id, &model, &resolution, item, image_id, seed)
                         .await;
                 }
             });

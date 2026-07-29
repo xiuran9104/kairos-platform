@@ -23,6 +23,37 @@ const MAX_TURN_RUNTIME_SECS: u64 = 2 * 60 * 60;
 const MAX_MODEL_TOOL_OBSERVATION_CHARS: usize = 8_000;
 const MAX_RUN_SUMMARY_CHARS: usize = 12_000;
 
+/// Autonomous agent lifecycle actions. The model MUST emit one of these
+/// (as a text prefix or JSON block) when it does not issue tool calls.
+/// Ordinary chat without a security objective does not need these markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentDirective {
+    /// Task complete; factual conclusions cite real Evidence IDs.
+    Final(String),
+    /// Blocked on missing information that only the user can provide.
+    AskUser(String),
+    /// No viable path within current authorization, tools, and budget.
+    NoPath(String),
+    /// Current strategy failed; switch approach and execute immediately.
+    Replan(String),
+    /// Text-only response with no explicit directive — treated as a
+    /// candidate FINAL and subject to the evidence completion gate.
+    CandidateFinal(String),
+}
+
+/// Autonomous loop injection message sent to the model at the start of every
+/// tool loop. This reminds the model it is operating in autonomous mode and
+/// must directly call tools or emit lifecycle actions.
+const AUTONOMOUS_LOOP_PROMPT: &str = "\
+## 自主工具循环已启动\n\n\
+你现在处于自主执行模式。根据目标、当前证据和可用工具直接选择下一步操作：\n\
+- 需要信息 → 直接发起 Tool Calling\n\
+- 任务完成 → 输出 `FINAL: <结论>`（事实性结论必须引用 Evidence ID）\n\
+- 缺少关键信息 → 输出 `ASK_USER: <问题>`\n\
+- 无可行路径 → 输出 `NO_PATH: <原因>`\n\
+- 策略失败需调整 → 输出 `REPLAN: <新策略>` 并在下一轮直接执行\n\n\
+不要输出等待确认的计划、不要枚举工具列表、不要在工具调用前请求许可。";
+
 #[derive(Debug, Clone, Copy)]
 struct TurnBudget {
     max_tool_rounds: usize,
@@ -335,7 +366,6 @@ impl ConversationRuntime {
         let mut run_summary = context.run_summary.clone();
         let mut request_fingerprints = std::collections::HashSet::new();
 
-        // ── Phase 0: Planning (like PentAGI CLI's should_prepare_tool_plan) ──
         let user_input = context
             .recent_messages
             .last()
@@ -343,15 +373,34 @@ impl ConversationRuntime {
             .unwrap_or_default();
         let scan_goal = format!("{user_input}\n{}", context.objective_snapshot);
         let mut scan_progress = super::scan_progress::ScanProgress::new(&scan_goal);
-        if needs_planning(&user_input) {
-            let plan = self
-                .generate_plan(turn_id, session_id, &user_input, &context, intent)
-                .await?;
-            // Write the plan as an assistant message so SSE shows it
-            self.repository
-                .write_intermediate_message(turn_id, session_id, "assistant", &plan, "text")
-                .await?;
+        if let Some(run_id) = context.run_id.as_deref() {
+            let history = self.repository.load_run_tool_history(run_id).await?;
+            evidence_ids = history.evidence_ids;
+            for historical in history.tool_calls {
+                request_fingerprints.insert(tool_request_fingerprint(
+                    &historical.tool_name,
+                    &historical.arguments.to_string(),
+                ));
+                let effective_observation =
+                    historical.success && !is_reference_tool(&historical.tool_name);
+                scan_progress.restore_tool_result(
+                    &historical.tool_name,
+                    historical.success,
+                    effective_observation,
+                    historical.semantic_fingerprint.as_deref(),
+                );
+            }
         }
+
+        // Inject the autonomous loop prompt at the start of tool execution.
+        // This reminds the model it is in autonomous mode and must directly
+        // call tools or emit lifecycle actions — no waiting for approval.
+        context.recent_messages.push(AgentMessage {
+            message_id: "runtime_autonomous_loop_start".into(),
+            role: "user".into(),
+            content: AUTONOMOUS_LOOP_PROMPT.to_string(),
+            format: "text".into(),
+        });
 
         for round in 0..budget.max_tool_rounds {
             rounds_used = round + 1;
@@ -364,7 +413,7 @@ impl ConversationRuntime {
                 break;
             }
 
-            let output = match self.model_gateway.generate(&context, intent).await {
+            let mut output = match self.model_gateway.generate(&context, intent).await {
                 Ok(output) => output,
                 Err(error) => {
                     self.repository
@@ -394,13 +443,22 @@ impl ConversationRuntime {
                     })
                     .collect();
 
-                // Persist the plan/tool_calls message for SSE
+                // Persist the model's optional reasoning/plan together with
+                // tool_calls so it remains part of the native tool transcript.
+                let assistant_tool_message = serde_json::json!({
+                    "content": if output.content.trim().is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(output.content.clone())
+                    },
+                    "tool_calls": tool_calls_json
+                });
                 self.repository
                     .write_intermediate_message(
                         turn_id,
                         session_id,
                         "assistant",
-                        &serde_json::json!({"tool_calls": tool_calls_json}).to_string(),
+                        &assistant_tool_message.to_string(),
                         "tool_calls",
                     )
                     .await?;
@@ -408,17 +466,17 @@ impl ConversationRuntime {
                 context.recent_messages.push(AgentMessage {
                     message_id: format!("assistant_tool:round_{}", round),
                     role: "assistant".into(),
-                    content: serde_json::json!({"tool_calls": tool_calls_json}).to_string(),
+                    content: assistant_tool_message.to_string(),
                     format: "tool_calls".into(),
                 });
 
+                let mut loop_diagnostic = None;
                 for tc in &output.tool_calls {
                     if request_count >= budget.max_requests {
                         stopped_by_budget = Some("requests");
                         break;
                     }
                     request_count += 1;
-                    scan_progress.record_tool(&tc.name);
                     let tool_started = std::time::Instant::now();
                     let fingerprint = tool_request_fingerprint(&tc.name, &tc.arguments);
                     let result = if !request_fingerprints.insert(fingerprint) {
@@ -434,6 +492,72 @@ impl ConversationRuntime {
                         }
                     } else if tc.name == "knowledge_search" {
                         self.execute_knowledge_search(&tc.id, &tc.arguments).await
+                    } else if is_skill_tool(&tc.name) {
+                        let content = self
+                            .repository
+                            .execute_skill_tool(&tc.name, &tc.arguments)
+                            .await
+                            .map(|value| value.to_string());
+                        super::tool_executor::ConversationToolResult {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            success: content.is_ok(),
+                            content: content.unwrap_or_else(|error| {
+                                serde_json::json!({
+                                    "error": error.to_string(),
+                                    "retryable": false
+                                })
+                                .to_string()
+                            }),
+                        }
+                    } else if is_traffic_tool(&tc.name) {
+                        let content = match context.run_id.as_deref() {
+                            Some(run_id) => {
+                                self.execute_traffic_tool(
+                                    run_id,
+                                    session_id,
+                                    &tc.name,
+                                    &tc.id,
+                                    &tc.arguments,
+                                    &context.scope_snapshot,
+                                )
+                                .await
+                            }
+                            None => Err(anyhow::anyhow!("流量工具只能在已有执行 Run 中使用")),
+                        };
+                        super::tool_executor::ConversationToolResult {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            success: content.is_ok(),
+                            content: content.unwrap_or_else(|error| {
+                                serde_json::json!({
+                                    "error": error.to_string(),
+                                    "retryable": false
+                                })
+                                .to_string()
+                            }),
+                        }
+                    } else if is_evidence_tool(&tc.name) {
+                        let content = match context.run_id.as_deref() {
+                            Some(run_id) => self
+                                .repository
+                                .execute_evidence_tool(run_id, &tc.name, &tc.arguments)
+                                .await
+                                .map(|value| value.to_string()),
+                            None => Err(anyhow::anyhow!("Evidence 工具只能在已有执行 Run 中使用")),
+                        };
+                        super::tool_executor::ConversationToolResult {
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            success: content.is_ok(),
+                            content: content.unwrap_or_else(|error| {
+                                serde_json::json!({
+                                    "error": error.to_string(),
+                                    "retryable": false
+                                })
+                                .to_string()
+                            }),
+                        }
                     } else {
                         super::tool_executor::execute_tool(
                             &tc.name,
@@ -444,11 +568,29 @@ impl ConversationRuntime {
                         .await
                     };
                     let duplicate_skipped = result.content.contains(r#""duplicate_skipped":true"#);
-                    scan_progress.record_tool_result(&tc.name, result.success, duplicate_skipped);
-                    if result.success && has_effective_observation(&tc.name, &result.content) {
+                    let effective_observation = result.success
+                        && !duplicate_skipped
+                        && has_effective_observation(&tc.name, &result.content);
+                    if effective_observation {
                         successful_observations += 1;
                     }
-                    let evidence_id = if let Some(run_id) = context.run_id.as_deref() {
+                    if let Some(diagnostic) = scan_progress.record_tool_result(
+                        &tc.name,
+                        result.success,
+                        duplicate_skipped,
+                        effective_observation,
+                        &result.content,
+                    ) {
+                        loop_diagnostic = Some(diagnostic);
+                    }
+                    if tc.name == "traffic_replay" && result.success {
+                        scan_progress.record_traffic_replay();
+                    }
+                    let evidence_id = if is_evidence_tool(&tc.name) || is_traffic_tool(&tc.name) {
+                        // Reading Evidence/Traffic must not create Evidence-of-Evidence
+                        // records or pollute target-observation completion gates.
+                        None
+                    } else if let Some(run_id) = context.run_id.as_deref() {
                         let evidence_id = self
                             .repository
                             .record_tool_result(
@@ -466,10 +608,25 @@ impl ConversationRuntime {
                             )
                             .await?;
                         evidence_ids.push(evidence_id.clone());
+                        scan_progress.record_evidence_tool(&evidence_id, &tc.name);
                         Some(evidence_id)
                     } else {
                         None
                     };
+                    if let Some(run_id) = context.run_id.as_deref()
+                        && matches!(tc.name.as_str(), "http_request" | "http_probe")
+                    {
+                        self.repository
+                            .record_http_traffic(
+                                run_id,
+                                &tc.id,
+                                &tc.name,
+                                &tc.arguments,
+                                &result.content,
+                                None,
+                            )
+                            .await?;
+                    }
                     append_run_summary(
                         &mut run_summary,
                         round + 1,
@@ -514,30 +671,106 @@ impl ConversationRuntime {
                     .checkpoint_context(turn_id, &context, &run_summary, &evidence_ids)
                     .await?;
 
-                if !output.content.trim().is_empty() {
-                    final_output = Some(output);
+                if scan_progress.stall_exhausted() {
+                    anyhow::bail!(
+                        "RUN_BLOCKED: autonomous loop stalled after repeated calls without new evidence"
+                    );
+                }
+                if let Some(diagnostic) = loop_diagnostic {
+                    context.recent_messages.push(AgentMessage {
+                        message_id: format!("runtime_diagnostic:round_{round}"),
+                        role: "user".into(),
+                        content: diagnostic,
+                        format: "text".into(),
+                    });
                 }
                 continue;
             }
 
-            // A response without tool calls is only a candidate final response.
-            // Scan objectives must first pass deterministic coverage gates.
-            if let Some(prompt) = scan_progress.continuation_prompt(&output.content) {
-                if !output.content.trim().is_empty() {
+            // A tool-free response must declare, or be treated as, a lifecycle
+            // action. The runtime validates the action against actual progress
+            // and Evidence rather than forcing a fixed pentest phase template.
+            match parse_agent_directive(&output.content) {
+                AgentDirective::Replan(reason) => {
                     context.recent_messages.push(AgentMessage {
-                        message_id: format!("assistant_gate:round_{round}"),
+                        message_id: format!("assistant_replan:round_{round}"),
                         role: "assistant".into(),
-                        content: output.content,
+                        content: format!("REPLAN: {reason}"),
                         format: "text".into(),
                     });
+                    context.recent_messages.push(AgentMessage {
+                        message_id: format!("runtime_replan:round_{round}"),
+                        role: "user".into(),
+                        content: "请根据新计划直接选择并调用下一项最有信息增益的可用工具；\
+                                  不要只输出另一份计划。"
+                            .into(),
+                        format: "text".into(),
+                    });
+                    continue;
                 }
-                context.recent_messages.push(AgentMessage {
-                    message_id: format!("system_gate:round_{round}"),
-                    role: "user".into(),
-                    content: prompt,
-                    format: "text".into(),
-                });
-                continue;
+                AgentDirective::NoPath(reason) => {
+                    if let Some(rejection) = scan_progress.no_path_rejection() {
+                        push_gate_rejection(
+                            &mut context,
+                            round,
+                            &output.content,
+                            &format!("NO_PATH 被拒绝：{rejection}"),
+                        );
+                        continue;
+                    }
+                    output.content = format!(
+                        "当前授权范围和可用能力下无法继续：{}",
+                        nonempty_or(&reason, "模型未提供具体原因")
+                    );
+                }
+                AgentDirective::AskUser(question) => {
+                    output.content = nonempty_or(
+                        &question,
+                        "需要用户补充继续执行所必需的目标、授权范围、测试凭据或业务背景。",
+                    )
+                    .to_string();
+                }
+                AgentDirective::Final(candidate) | AgentDirective::CandidateFinal(candidate) => {
+                    if let Some(rejection) =
+                        scan_progress.final_rejection(&candidate, &evidence_ids)
+                    {
+                        push_gate_rejection(
+                            &mut context,
+                            round,
+                            &output.content,
+                            &format!("FINAL 被拒绝：{rejection}"),
+                        );
+                        continue;
+                    }
+                    if let Some(rejection) = self
+                        .claim_projection_rejection(
+                            context.run_id.as_deref(),
+                            &candidate,
+                            &evidence_ids,
+                        )
+                        .await?
+                    {
+                        push_gate_rejection(
+                            &mut context,
+                            round,
+                            &output.content,
+                            &format!("FINAL 被拒绝：{rejection}"),
+                        );
+                        continue;
+                    }
+                    if let Some(rejection) =
+                        scan_progress.maturity_rejection(&candidate, &evidence_ids)
+                    {
+                        push_gate_rejection(
+                            &mut context,
+                            round,
+                            &output.content,
+                            &format!("FINAL 被拒绝：{rejection}"),
+                        );
+                        continue;
+                    }
+                    output.content = candidate;
+                }
             }
             final_output = Some(output);
             finished_normally = true;
@@ -633,6 +866,93 @@ impl ConversationRuntime {
             },
         }
     }
+
+    /// Verify that quotable assertions in a verified FINAL are verbatim-
+    /// projectable into the run's cited evidence. Returns the model-facing
+    /// rejection reason when fabrication is detected.
+    async fn claim_projection_rejection(
+        &self,
+        run_id: Option<&str>,
+        candidate: &str,
+        evidence_ids: &[String],
+    ) -> anyhow::Result<Option<String>> {
+        let Some(run_id) = run_id else {
+            return Ok(None);
+        };
+        if !super::scan_progress::has_verified_claim(candidate) {
+            return Ok(None);
+        }
+        let cited: Vec<String> = evidence_ids
+            .iter()
+            .filter(|id| candidate.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if cited.is_empty() {
+            // The citation gate in `final_rejection` already rejects this case.
+            return Ok(None);
+        }
+        let texts = self.repository.evidence_texts(run_id, &cited).await?;
+        Ok(super::claim_gate::assess_claims(candidate, &texts).rejection())
+    }
+
+    /// Execute one of the traffic tools. Read-only tools delegate to the
+    /// repository; `traffic_replay` re-issues the stored request through the
+    /// isolated HTTP executor (scope guard applies) and records the new
+    /// exchange linked to the original traffic row.
+    async fn execute_traffic_tool(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        tool_call_id: &str,
+        arguments: &str,
+        scope_snapshot: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        if tool_name != "traffic_replay" {
+            return self
+                .repository
+                .execute_traffic_tool(run_id, tool_name, arguments)
+                .await
+                .map(|value| value.to_string());
+        }
+        let arguments_value = serde_json::from_str::<serde_json::Value>(arguments)?;
+        let traffic_id = arguments_value
+            .get("traffic_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("traffic_replay 缺少 traffic_id"))?;
+        let replay_args = self
+            .repository
+            .load_traffic_request(run_id, traffic_id)
+            .await?;
+        let result = super::tool_executor::execute_tool(
+            "http_request",
+            &replay_args.to_string(),
+            scope_snapshot,
+            session_id,
+        )
+        .await;
+        let traffic_ids = self
+            .repository
+            .record_http_traffic(
+                run_id,
+                tool_call_id,
+                "http_request",
+                &replay_args.to_string(),
+                &result.content,
+                Some(traffic_id),
+            )
+            .await?;
+        let mut content = serde_json::from_str::<serde_json::Value>(&result.content)
+            .unwrap_or_else(|_| serde_json::json!({"raw": result.content}));
+        if let Some(object) = content.as_object_mut() {
+            object.insert("replay_of".into(), serde_json::json!(traffic_id));
+            object.insert(
+                "replay_traffic_ids".into(),
+                serde_json::json!(traffic_ids),
+            );
+        }
+        Ok(content.to_string())
+    }
 }
 
 fn append_run_summary(
@@ -725,11 +1045,114 @@ fn compact_model_observation(content: &str) -> String {
     )
 }
 
+/// Parse the model's text-only response into an autonomous agent directive.
+///
+/// Supports two formats:
+/// 1. **Text prefix** — `FINAL: <content>`, `ASK_USER: <question>`, etc.
+///    Chinese equivalents like `最终结果：` and `需要用户：` are also accepted.
+/// 2. **JSON action block** — A JSON object with an `action` field:
+///    `{"action":"final","content":"...","evidence_refs":["ev-1"]}`
+///    This format is preferred when the model can produce structured output.
+fn parse_agent_directive(content: &str) -> AgentDirective {
+    let content = content.trim();
+
+    // ── JSON structured action protocol ──────────────────────────
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(action) = parsed.get("action").and_then(serde_json::Value::as_str) {
+            let body = parsed
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let fallback = if body.is_empty() {
+                content.to_string()
+            } else {
+                body
+            };
+            match action {
+                "final" | "FINAL" => return AgentDirective::Final(fallback),
+                "ask_user" | "ASK_USER" => return AgentDirective::AskUser(fallback),
+                "no_path" | "NO_PATH" => return AgentDirective::NoPath(fallback),
+                "replan" | "REPLAN" => return AgentDirective::Replan(fallback),
+                _ => {}
+            }
+        }
+    }
+
+    // ── Text prefix protocol ─────────────────────────────────────
+    for marker in ["FINAL:", "Final:", "final:", "最终结果：", "完成："] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::Final(value.trim().to_string());
+        }
+    }
+    for marker in [
+        "ASK_USER:",
+        "Ask user:",
+        "ask_user:",
+        "需要用户：",
+        "请用户确认：",
+    ] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::AskUser(value.trim().to_string());
+        }
+    }
+    for marker in [
+        "NO_PATH:",
+        "No viable path:",
+        "no_path:",
+        "无法继续：",
+        "没有可继续验证的路径：",
+    ] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::NoPath(value.trim().to_string());
+        }
+    }
+    for marker in ["REPLAN:", "Replan:", "replan:", "重新规划："] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::Replan(value.trim().to_string());
+        }
+    }
+    AgentDirective::CandidateFinal(content.to_string())
+}
+
+fn push_gate_rejection(
+    context: &mut ConversationContext,
+    round: usize,
+    candidate: &str,
+    rejection: &str,
+) {
+    context.recent_messages.push(AgentMessage {
+        message_id: format!("assistant_gate_candidate:round_{round}"),
+        role: "assistant".into(),
+        content: candidate.to_string(),
+        format: "text".into(),
+    });
+    context.recent_messages.push(AgentMessage {
+        message_id: format!("runtime_gate:round_{round}"),
+        role: "user".into(),
+        content: format!(
+            "自主循环完成闸门：{rejection}\n\
+             请自行选择下一步：调用工具补充证据、REPLAN、ASK_USER，或在路径确实耗尽时\
+             给出有依据的 NO_PATH。"
+        ),
+        format: "text".into(),
+    });
+}
+
+fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value.trim()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MODEL_TOOL_OBSERVATION_CHARS, compact_model_observation, has_effective_observation,
-        tool_request_fingerprint,
+        AgentDirective, MAX_MODEL_TOOL_OBSERVATION_CHARS, compact_model_observation,
+        has_effective_observation, parse_agent_directive, tool_request_fingerprint,
     };
 
     #[test]
@@ -753,6 +1176,14 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_guides_do_not_count_as_target_evidence() {
+        assert!(!has_effective_observation(
+            "knowledge_search",
+            r#"{"guide_count":1,"guides":[{"title":"SQL injection"}]}"#
+        ));
+    }
+
+    #[test]
     fn compacts_tool_observation_for_model_context() {
         let raw = "a".repeat(MAX_MODEL_TOOL_OBSERVATION_CHARS + 10);
         let compact = compact_model_observation(&raw);
@@ -772,6 +1203,83 @@ mod tests {
         );
         assert_eq!(first, second);
     }
+
+    #[test]
+    fn parses_explicit_agent_lifecycle_actions() {
+        assert_eq!(
+            parse_agent_directive("FINAL: 结论"),
+            AgentDirective::Final("结论".into())
+        );
+        assert_eq!(
+            parse_agent_directive("ASK_USER: 请提供测试账号"),
+            AgentDirective::AskUser("请提供测试账号".into())
+        );
+        assert_eq!(
+            parse_agent_directive("NO_PATH: 缺少浏览器能力"),
+            AgentDirective::NoPath("缺少浏览器能力".into())
+        );
+        assert_eq!(
+            parse_agent_directive("REPLAN: 改用响应差异验证"),
+            AgentDirective::Replan("改用响应差异验证".into())
+        );
+    }
+
+    #[test]
+    fn parses_json_action_protocol() {
+        assert_eq!(
+            parse_agent_directive(r#"{"action":"final","content":"目标已完成，证据 ev-1"}"#),
+            AgentDirective::Final("目标已完成，证据 ev-1".into())
+        );
+        assert_eq!(
+            parse_agent_directive(r#"{"action":"ASK_USER","content":"请提供目标 URL"}"#),
+            AgentDirective::AskUser("请提供目标 URL".into())
+        );
+        assert_eq!(
+            parse_agent_directive(r#"{"action":"no_path","content":"当前授权不支持该操作"}"#),
+            AgentDirective::NoPath("当前授权不支持该操作".into())
+        );
+        assert_eq!(
+            parse_agent_directive(r#"{"action":"replan","content":"改用目录扫描验证"}"#),
+            AgentDirective::Replan("改用目录扫描验证".into())
+        );
+    }
+
+    #[test]
+    fn json_action_without_content_falls_back_to_raw() {
+        assert_eq!(
+            parse_agent_directive(r#"{"action":"final"}"#),
+            AgentDirective::Final(r#"{"action":"final"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn plain_text_without_marker_is_candidate_final() {
+        let directive = parse_agent_directive("目标似乎没有开放端口");
+        assert_eq!(
+            directive,
+            AgentDirective::CandidateFinal("目标似乎没有开放端口".into())
+        );
+    }
+
+    #[test]
+    fn chinese_markers_are_recognized() {
+        assert_eq!(
+            parse_agent_directive("最终结果：目标安全"),
+            AgentDirective::Final("目标安全".into())
+        );
+        assert_eq!(
+            parse_agent_directive("需要用户：请提供 API 密钥"),
+            AgentDirective::AskUser("请提供 API 密钥".into())
+        );
+        assert_eq!(
+            parse_agent_directive("无法继续：防火墙拦截所有请求"),
+            AgentDirective::NoPath("防火墙拦截所有请求".into())
+        );
+        assert_eq!(
+            parse_agent_directive("重新规划：改用 POST 请求测试"),
+            AgentDirective::Replan("改用 POST 请求测试".into())
+        );
+    }
 }
 
 fn has_effective_observation(tool_name: &str, content: &str) -> bool {
@@ -784,6 +1292,9 @@ fn has_effective_observation(tool_name: &str, content: &str) -> bool {
         return false;
     }
     match tool_name {
+        // Knowledge is methodology, not target evidence. It may guide the next
+        // action but cannot by itself satisfy a security completion gate.
+        "knowledge_search" | "evidence_list" | "evidence_search" | "evidence_view" => false,
         "js_analyze" => ["endpoints", "security_hints", "technology_hints"]
             .iter()
             .any(|key| {
@@ -810,58 +1321,24 @@ fn has_effective_observation(tool_name: &str, content: &str) -> bool {
     }
 }
 
-/// Check if the user input needs a plan before tool execution.
-/// Mirrors PentAGI CLI's `should_prepare_tool_plan`.
-fn needs_planning(input: &str) -> bool {
-    let input = input.trim();
-    input.len() >= 80
-        || input.contains("http://")
-        || input.contains("https://")
-        || input.contains("渗透")
-        || input.contains("漏洞")
-        || input.contains("测试")
-        || input.contains("分析")
-        || input.contains("扫描")
-        || input.contains("目标")
-        || input.contains("评估")
-        || input.contains("安全")
+fn is_evidence_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "evidence_list" | "evidence_search" | "evidence_view"
+    )
 }
 
-impl ConversationRuntime {
-    /// Generate a plan before tool execution, similar to PentAGI CLI's tool_plan_instruction.
-    async fn generate_plan(
-        &self,
-        turn_id: &str,
-        session_id: &str,
-        user_input: &str,
-        context: &ConversationContext,
-        intent: &ConversationIntent,
-    ) -> anyhow::Result<String> {
-        // Build a planning-specific context with only the system prompt + user input
-        let mut plan_context = context.clone();
-        // Add a planning instruction as a user message
-        plan_context.recent_messages.push(AgentMessage {
-            message_id: format!("plan_req:{}", turn_id),
-            role: "user".into(),
-            content: format!(
-                "在调用任何工具之前，请先用中文输出一份简洁的攻击计划。\n\n\
-                 用户任务：{user_input}\n\n\
-                 计划要求：\n\
-                 1. 列出你将使用的工具和顺序\n\
-                 2. 说明每个阶段的目标\n\
-                 3. 标注预期风险等级\n\
-                 4. 不要调用工具，只输出计划文本\n\n\
-                 输出格式：## 📋 攻击计划\\n\\n### 阶段1：信息收集\\n- ...\\n\\n### 阶段2：...\\n- ..."
-            ),
-            format: "text".into(),
-        });
+fn is_traffic_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "traffic_list" | "traffic_view" | "traffic_diff" | "traffic_replay" | "traffic_sitemap"
+    )
+}
 
-        let output = self.model_gateway.generate(&plan_context, intent).await?;
-        let plan = if output.content.trim().is_empty() {
-            "## 📋 攻击计划\n\n### 阶段1：信息收集\n- 探测目标 HTTP/HTTPS 服务存活状态\n- 爬取页面收集 JS 文件和 API 端点\n- DNS 查询获取域名信息\n\n### 阶段2：分析\n- 分析收集到的信息\n- 识别潜在攻击面\n\n### 阶段3：验证\n- 对发现的漏洞点进行验证".to_string()
-        } else {
-            output.content
-        };
-        Ok(plan)
-    }
+fn is_skill_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "skill_list" | "skill_load")
+}
+
+fn is_reference_tool(tool_name: &str) -> bool {
+    tool_name == "knowledge_search" || is_evidence_tool(tool_name) || is_skill_tool(tool_name)
 }

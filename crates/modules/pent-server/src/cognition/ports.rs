@@ -14,8 +14,16 @@ pub trait PlanRepository: Send + Sync {
         delta: &PlanDelta,
     ) -> anyhow::Result<TaskCoordinationGraph>;
     async fn record_meta(&self, snapshot: &MetaCognitiveSnapshot) -> anyhow::Result<()>;
-    async fn record_preflection(&self, reflection: &PreFlection) -> anyhow::Result<()>;
-    async fn record_action_reflection(&self, reflection: &ActionReflection) -> anyhow::Result<()>;
+    async fn record_preflection(
+        &self,
+        graph: &TaskCoordinationGraph,
+        reflection: &PreFlection,
+    ) -> anyhow::Result<()>;
+    async fn record_action_reflection(
+        &self,
+        graph: &TaskCoordinationGraph,
+        reflection: &ActionReflection,
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]

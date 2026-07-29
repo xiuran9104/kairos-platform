@@ -1,11 +1,7 @@
-//! Ports used by the ToolOrchestrator.
+//! Tool dispatch, execution backends and ports.
 
-pub mod http;
-pub mod orchestrator;
-pub mod ports;
-
-pub use orchestrator::*;
-pub use ports::*;
 pub mod dispatcher;
 pub mod executors;
+pub mod http;
+pub mod ports;
 pub mod reranker;

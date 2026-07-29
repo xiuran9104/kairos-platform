@@ -3,6 +3,9 @@ mod episodes;
 mod projects;
 mod scenes;
 mod shared;
+pub mod tool_catalog;
+mod toonflow_tasks;
+mod toonflow_executors;
 mod toonflow;
 mod toonflow_agent_runtime;
 mod toonflow_agent_tools;
@@ -263,6 +266,8 @@ pub fn routes(state: ToonState) -> Router {
             axum::routing::delete(toonflow_resources::delete_art_style),
         )
         .route("/toonflow/tasks", get(toonflow_resources::list_tasks))
+        .route("/toonflow/tasks/cancel", post(toonflow_resources::cancel_task))
+        .route("/toonflow/tasks/retry", post(toonflow_resources::retry_task))
         .route(
             "/toonflow/prompts",
             get(toonflow_resources::list_prompts).post(toonflow_resources::save_prompt),
@@ -272,6 +277,9 @@ pub fn routes(state: ToonState) -> Router {
             axum::routing::delete(toonflow_resources::delete_prompt),
         )
         .route("/toonflow/skills", get(toonflow_resources::list_skills))
+        .route("/toonflow/tools", get(toonflow_resources::list_tools).post(toonflow_resources::create_tool))
+        .route("/toonflow/tools/{tool_id}/versions/{version}", get(toonflow_resources::get_tool).put(toonflow_resources::update_tool))
+        .route("/toonflow/tools/{tool_id}/versions/{version}/status", put(toonflow_resources::update_tool_status))
         .route(
             "/api/setting/skillManagement/getSkillList",
             post(toonflow_resources::skill_paths),
