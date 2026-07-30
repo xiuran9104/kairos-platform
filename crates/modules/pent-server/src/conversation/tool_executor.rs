@@ -33,7 +33,9 @@ fn docker_conversation_tool(tool_name: &str) -> bool {
 pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
     let implemented = matches!(
         tool_name,
+        // ── Conversation-native tools ────────────────────────────────────
         "dir_fuzz"
+            | "dirsearch"
             | "dns_lookup"
             | "file_upload_validate"
             | "http_probe"
@@ -53,7 +55,75 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "web_crawl"
             | "web_fingerprint"
             | "web_url_collect"
+            // ── Run-mode container tools (via tool_registry) ────────────
+            | "tcp_scan"
+            | "nmap"
+            | "nmap_scan"
+            | "nuclei"
+            | "web_vuln_scan"
+            | "sqli_validate"
+            | "xss_validate"
+            | "csrf_validate"
+            | "command_injection_validate"
+            | "file_inclusion_validate"
+            | "afrog"
+            | "ssh_exec"
+            | "sql_query"
+            | "sqlmap"
+            | "sqlmap_scan"
+            | "subfinder"
+            | "amass"
+            | "dnsx"
+            | "masscan"
+            | "naabu"
+            | "ffuf"
+            | "gobuster"
+            | "nikto"
+            | "whatweb"
+            | "wafw00f"
+            | "wpscan"
+            | "web_wordpress_scan"
+            | "xsser"
+            | "web_xss_scan"
+            | "dalfox"
+            | "commix"
+            | "testssl"
+            | "web_tls_scan"
+            | "feroxbuster"
+            | "wfuzz"
+            | "hakrawler"
+            | "httrack"
+            | "arjun"
+            | "dirb"
+            | "dnsrecon"
+            | "dnsenum"
+            | "fierce"
+            | "dmitry"
+            | "theharvester"
+            | "enum4linux"
+            | "smbmap"
+            | "smtp-user-enum"
+            | "swaks"
+            | "davtest"
+            | "nbtscan"
+            | "netdiscover"
+            | "sslyze"
+            | "qsslcaudit"
+            | "wapiti"
+            | "skipfish"
+            | "lbd"
+            | "whois"
+            | "whois_lookup"
+            | "sslscan"
+            | "tls_inspect"
+            | "curl"
+            // ── Builtin local tools ────────────────────────────────────────
+            | "read"
+            | "grep"
+            | "bash"
+            | "web_search"
     );
+    let implemented = implemented || tool_name.starts_with("mcp_");
     implemented
         && (!NETWORK_TOOLS.contains(&tool_name)
             || docker_conversation_tool(tool_name)
@@ -123,6 +193,17 @@ pub async fn execute_tool(
             super::tool_extensions::execute_file_upload_validate(arguments).await
         }
 
+        // ── Builtin local tools ────────────────────────────────────
+        "read" => execute_builtin_local("read", arguments).await,
+        "grep" => execute_builtin_local("grep", arguments).await,
+        "bash" => execute_builtin_local("bash", arguments).await,
+        "web_search" => execute_builtin_local("web_search", arguments).await,
+
+        // ── MCP tools (dynamic) ────────────────────────────────────
+        name if name.starts_with("mcp_") => {
+            execute_mcp_tool(name, arguments).await
+        }
+
         // ── Fallback ────────────────────────────────────────────
         other => ConversationToolResult {
             tool_call_id: String::new(),
@@ -134,6 +215,134 @@ pub async fn execute_tool(
             .to_string(),
             success: false,
         },
+    }
+}
+
+// ── Builtin local tool dispatch ────────────────────────────────────────
+
+async fn execute_builtin_local(name: &str, arguments: &str) -> ConversationToolResult {
+    use crate::tooling::builtin::local_tools;
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(e) => return tool_error(name, format!("参数解析失败: {e}")),
+    };
+    let result = match name {
+        "read" => local_tools::execute_read(args).await,
+        "grep" => local_tools::execute_grep(args).await,
+        "bash" => local_tools::execute_bash(args).await,
+        "web_search" => local_tools::execute_web_search(args).await,
+        _ => {
+            return tool_error(name, format!("本地工具 '{name}' 尚未实现"));
+        }
+    };
+    match result {
+        Ok(value) => ConversationToolResult {
+            tool_call_id: String::new(),
+            tool_name: name.into(),
+            content: value.to_string(),
+            success: true,
+        },
+        Err(error) => tool_error(name, format!("{error}")),
+    }
+}
+
+// ── MCP tool dispatch ──────────────────────────────────────────────────
+
+static MCP_REGISTRY: std::sync::OnceLock<
+    std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>,
+> = std::sync::OnceLock::new();
+
+async fn get_mcp_registry() -> Option<
+    std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>,
+> {
+    let registry = MCP_REGISTRY.get_or_init(|| {
+        let registry =
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(crate::tooling::mcp::registry::McpRegistry::init())
+            });
+        std::sync::Arc::new(registry)
+    });
+    if tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(async { registry.server_count().await })
+    }) > 0
+    {
+        Some(registry.clone())
+    } else {
+        None
+    }
+}
+
+async fn execute_mcp_tool(name: &str, arguments: &str) -> ConversationToolResult {
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(e) => return tool_error(name, format!("参数解析失败: {e}")),
+    };
+
+    let registry = match get_mcp_registry().await {
+        Some(r) => r,
+        None => {
+            return ConversationToolResult {
+                tool_call_id: String::new(),
+                tool_name: name.into(),
+                content: serde_json::json!({
+                    "error": "MCP 服务未配置或未启动",
+                    "hint": "检查 PENTA_MCP_SERVERS 环境变量"
+                })
+                .to_string(),
+                success: false,
+            };
+        }
+    };
+
+    // Find the server that has this tool
+    let all_tools = registry.all_tools().await;
+    let mcp_tool_name = name.strip_prefix("mcp_").unwrap_or(name);
+    let server_id = match all_tools.iter().find(|(_, t)| t.name == mcp_tool_name) {
+        Some((sid, _)) => sid.clone(),
+        None => {
+            return tool_error(
+                name,
+                format!("MCP 工具 '{mcp_tool_name}' 在已连接的服务器中未找到"),
+            );
+        }
+    };
+
+    match registry.call_tool(&server_id, mcp_tool_name, args).await {
+        Ok(result) => {
+            let text: String = result
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    crate::tooling::mcp::protocol::ContentBlock::Text { text } => {
+                        Some(text.clone())
+                    }
+                    crate::tooling::mcp::protocol::ContentBlock::Image {
+                        mime_type,
+                        ..
+                    } => Some(format!("[image: {mime_type}]")),
+                    crate::tooling::mcp::protocol::ContentBlock::Resource {
+                        uri,
+                        ..
+                    } => Some(format!("[resource: {uri}]")),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            ConversationToolResult {
+                tool_call_id: String::new(),
+                tool_name: name.into(),
+                content: serde_json::json!({
+                    "result": text,
+                    "is_error": result.is_error,
+                    "server": server_id,
+                })
+                .to_string(),
+                success: !result.is_error,
+            }
+        }
+        Err(error) => tool_error(name, format!("MCP 调用失败: {error}")),
     }
 }
 
@@ -987,4 +1196,48 @@ fn analyze_http_response(status: u16, body: &str, headers: &[(String, String)]) 
     } else {
         hints.join("; ")
     }
+}
+
+// ── Parallel tool execution ──────────────────────────────────────────────
+
+/// Execute multiple tool calls in parallel using tokio::spawn. Each tool gets
+/// its own timeout. Results are returned in the same order as the input calls.
+/// Enabled when `PENTA_PARALLEL_TOOLS` is not `"false"` (default: enabled).
+pub async fn execute_tools_parallel(
+    tool_calls: &[(String, String, String)], // (call_id, name, arguments_json)
+    scope_snapshot: &serde_json::Value,
+    session_id: &str,
+) -> Vec<ConversationToolResult> {
+    let handles: Vec<_> = tool_calls
+        .iter()
+        .enumerate()
+        .map(|(idx, (call_id, name, args))| {
+            let cid = call_id.clone();
+            let n = name.clone();
+            let a = args.clone();
+            let scope = scope_snapshot.clone();
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                let result =
+                    execute_tool(&n, &a, &scope, &sid).await;
+                (idx, cid, result)
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok((idx, cid, result)) => {
+                let mut r = result;
+                r.tool_call_id = cid;
+                results.push((idx, r));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "parallel tool task panicked");
+            }
+        }
+    }
+    results.sort_by_key(|(idx, _)| *idx);
+    results.into_iter().map(|(_, r)| r).collect()
 }

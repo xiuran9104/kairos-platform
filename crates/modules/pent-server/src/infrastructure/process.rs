@@ -201,7 +201,7 @@ fn validate_container_image(image: &str) -> Result<(), String> {
         !cfg!(test) && std::env::var("PENTA_REQUIRE_IMAGE_DIGEST").as_deref() != Ok("false");
     if require_digest && !image.contains("@sha256:") {
         return Err(format!(
-            "工具镜像 {image} 未固定 digest；请配置 PENTA_TOOL_IMAGE_* 为 name@sha256:..."
+            "工具镜像 {image} 未固定 digest；请配置 PENTA_TOOLKIT_IMAGE 为 name@sha256:..."
         ));
     }
     Ok(())
@@ -308,6 +308,7 @@ fn build_runner(
                     limits.network_access.audit_name()
                 ),
                 prepared.container_image.clone(),
+                prepared.program.into(),
             ]);
             args.extend(prepared.args.clone());
             Ok(("/usr/bin/docker", args))
@@ -413,5 +414,12 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--cap-drop", "ALL"]));
         assert!(args.contains(&"--read-only".to_string()));
         assert!(args.contains(&"no-new-privileges".to_string()));
+        assert!(args.windows(2).any(|pair| {
+            pair
+                == [
+                    "kairos-platform/pent-toolkit:kali-2026.1",
+                    "/usr/bin/nmap",
+                ]
+        }));
     }
 }

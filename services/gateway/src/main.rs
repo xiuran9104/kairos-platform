@@ -17,7 +17,7 @@ const SERVICE_NAME: &str = "gateway";
 #[derive(Debug, Serialize)]
 struct GatewayIndex {
     service: &'static str,
-    modules: [&'static str; 7],
+    modules: [&'static str; 6],
 }
 
 #[tokio::main]
@@ -35,12 +35,18 @@ async fn main() -> anyhow::Result<()> {
     );
     let infra_state = kairos_platform_infra_server::InfraState::new(database.clone());
     let ai_state = kairos_platform_ai_server::AiState::new(database.clone(), tokens.clone());
-    let toon_state = kairos_platform_toon_server::ToonState::new(database.clone(), tokens.clone());
     let media_state = kairos_platform_media_server::MediaState::new(database.clone(), tokens);
     let scan_state = kairos_platform_scan_server::ScanState::new(database.clone());
-    let pent_state = kairos_platform_pent_server::PentState::new(database.clone());
+    let nats_bus = kairos_platform_pent_server::transport::mq::NatsEventBus::connect(
+        &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
+    )
+    .await;
+    let pent_state = kairos_platform_pent_server::PentState::new(database.clone())
+        .with_nats(nats_bus.handle());
     kairos_platform_pent_server::start_worker(database.clone(), "worker-gateway".into(), 120).await;
     system_state.bootstrap().await?;
+    // Recover orphaned conversation turns left from previous shutdown
+    recover_orphaned_turns(&database).await;
     let database_auth = system_state.database_auth_state();
 
     let mut app = Router::new()
@@ -49,7 +55,6 @@ async fn main() -> anyhow::Result<()> {
         .merge(kairos_platform_system_server::routes(system_state))
         .merge(kairos_platform_infra_server::routes(infra_state))
         .merge(kairos_platform_ai_server::routes(ai_state))
-        .merge(kairos_platform_toon_server::routes(toon_state))
         .merge(kairos_platform_media_server::routes(media_state))
         .merge(kairos_platform_scan_server::routes(scan_state))
         .merge(kairos_platform_pent_server::routes(pent_state))
@@ -87,6 +92,27 @@ async fn connect_redis() -> Option<RedisClient> {
     }
 }
 
+/// Recover any conversation turns orphaned by a previous shutdown.
+async fn recover_orphaned_turns(pool: &kairos_platform_framework_database::PgPool) {
+    let result = sqlx::query(
+        "UPDATE pent_conversation_turns SET status='failed', error_message='网关重启自动恢复', retryable=true WHERE status IN ('thinking','queued') AND created_at < now() - interval '30 seconds'"
+    )
+    .execute(pool)
+    .await;
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!(count = r.rows_affected(), "recovered orphaned conversation turns");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "failed to recover orphaned turns"),
+    }
+    let _ = sqlx::query(
+        "UPDATE pent_agent_sessions SET status='ready' WHERE status='running' AND NOT EXISTS (SELECT 1 FROM pent_conversation_turns WHERE pent_conversation_turns.session_id = pent_agent_sessions.id AND status IN ('thinking','queued'))"
+    )
+    .execute(pool)
+    .await;
+}
+
 async fn not_found() -> AppError {
     AppError::not_found("route not found")
 }
@@ -94,6 +120,6 @@ async fn not_found() -> AppError {
 async fn index() -> Json<ApiResponse<GatewayIndex>> {
     Json(ApiResponse::new(GatewayIndex {
         service: SERVICE_NAME,
-        modules: ["system", "infra", "ai", "toon", "media", "scan", "pent"],
+        modules: ["system", "infra", "ai", "media", "scan", "pent"],
     }))
 }

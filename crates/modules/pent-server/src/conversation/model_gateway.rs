@@ -8,9 +8,13 @@ use kairos_platform_pent_api::{ConversationContext, ConversationIntent, ModelUsa
 use kairos_platform_pent_core::conversation::DEFAULT_CONTEXT_TOKEN_BUDGET;
 use serde_json::Value;
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 pub struct AiModelGateway {
     pool: PgPool,
     factory: AiModelFactory,
+    exhausted_tools: Mutex<HashSet<String>>,
 }
 
 impl AiModelGateway {
@@ -18,6 +22,7 @@ impl AiModelGateway {
         Self {
             factory: AiModelFactory::new(pool.clone()),
             pool,
+            exhausted_tools: Mutex::new(HashSet::new()),
         }
     }
 
@@ -105,6 +110,12 @@ fn routing_max_risk(context: &ConversationContext) -> &'static str {
 
 #[async_trait]
 impl ConversationModelGateway for AiModelGateway {
+    fn set_exhausted_tools(&self, tools: HashSet<String>) {
+        if let Ok(mut guard) = self.exhausted_tools.lock() {
+            *guard = tools;
+        }
+    }
+
     async fn generate(
         &self,
         context: &ConversationContext,
@@ -160,6 +171,27 @@ impl ConversationModelGateway for AiModelGateway {
                     "tool routing failed; falling back to full conversation catalog"
                 );
                 super::tool_catalog::load_conversation_tool_definitions(&self.pool).await?
+            }
+        };
+        // Filter out tools that have exceeded their consecutive failure limit.
+        let tools: Vec<Value> = {
+            let exhausted = self
+                .exhausted_tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if exhausted.is_empty() {
+                tools
+            } else {
+                tools
+                    .into_iter()
+                    .filter(|t| {
+                        let name = t
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        !exhausted.contains(name)
+                    })
+                    .collect()
             }
         };
         let mut api_messages: Vec<Value> =

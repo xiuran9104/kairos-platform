@@ -22,7 +22,6 @@ use kairos_platform_framework_database::PgPool;
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
 use serde_json::{Value, json};
-use sha2::Digest;
 use uuid::Uuid;
 
 pub use config::PentConfig;
@@ -31,6 +30,7 @@ pub use config::PentConfig;
 pub struct PentState {
     pub pool: PgPool,
     conversation_tasks: conversation::turn_tasks::TurnTaskRegistry,
+    pub nats: Option<crate::transport::mq::NatsHandle>,
 }
 
 impl PentState {
@@ -38,7 +38,13 @@ impl PentState {
         Self {
             pool,
             conversation_tasks: Default::default(),
+            nats: None,
         }
+    }
+
+    pub fn with_nats(mut self, nats: crate::transport::mq::NatsHandle) -> Self {
+        self.nats = Some(nats);
+        self
     }
 }
 
@@ -301,8 +307,18 @@ async fn list_runs(
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_runs t
-         WHERE tenant_id=$1 AND ($2 OR user_id=$3) ORDER BY created_at DESC LIMIT 100",
+        "SELECT jsonb_build_object(
+            'id', r.id, 'task_id', r.task_id, 'task_name', tk.name,
+            'status', r.status, 'session_id', r.session_id,
+            'objective_snapshot', r.objective_snapshot,
+            'scope_snapshot', r.scope_snapshot,
+            'started_at', r.started_at, 'completed_at', r.completed_at,
+            'created_at', r.created_at, 'updated_at', r.updated_at
+         )
+         FROM pent_runs r
+         LEFT JOIN pent_tasks tk ON tk.id = r.task_id
+         WHERE r.tenant_id=$1 AND ($2 OR r.user_id=$3)
+         ORDER BY r.created_at DESC LIMIT 100",
     )
     .bind(tenant_id)
     .bind(security::tenant_wide(&user))
@@ -319,8 +335,17 @@ async fn get_run(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let v = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_runs t
-         WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4)",
+        "SELECT jsonb_build_object(
+            'id', r.id, 'task_id', r.task_id, 'task_name', tk.name,
+            'status', r.status, 'session_id', r.session_id,
+            'objective_snapshot', r.objective_snapshot,
+            'scope_snapshot', r.scope_snapshot,
+            'started_at', r.started_at, 'completed_at', r.completed_at,
+            'created_at', r.created_at, 'updated_at', r.updated_at
+         )
+         FROM pent_runs r
+         LEFT JOIN pent_tasks tk ON tk.id = r.task_id
+         WHERE r.id=$1 AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)",
     )
     .bind(&id)
     .bind(tenant_id)
@@ -375,6 +400,11 @@ async fn create_run(
         return Err(AppError::bad_request(
             "任务不存在、无权访问或未确认目标范围",
         ));
+    }
+    // NATS: notify workers that a new run is available
+    if let Some(ref nats) = s.nats {
+        let payload = serde_json::to_vec(&json!({"run_id": id, "task_id": task_id})).unwrap_or_default();
+        nats.publish("penta.run.requested", &payload).await;
     }
     Ok(Json(ApiResponse::new(
         json!({"id":id,"message":"Run 创建成功"}),
@@ -561,74 +591,6 @@ async fn list_tools(State(s): State<PentState>) -> Result<Json<ApiResponse<Vec<V
         "SELECT to_jsonb(t) FROM pent_tool_definitions t WHERE lifecycle_status='active' ORDER BY namespace, name LIMIT 100"
     ).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
-}
-
-// ── AI Agent integration ─────────────────────────────────────────────────
-
-/// Load the default AI model config from the ai module's database tables.
-async fn load_ai_model_config(pool: &PgPool) -> Option<(String, String, String)> {
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT model, url, api_key FROM ai.model_configs WHERE status = 0 ORDER BY id LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    row
-}
-
-/// Call the AI model (reuses ai-server configured models).
-async fn ai_analyze(
-    pool: &PgPool,
-    target: &str,
-    ports: &[u16],
-    findings: &[&str],
-    max_tokens: u32,
-) -> String {
-    let prompt = format!(
-        "你是一名安全专家。对目标 {target} 进行安全分析。\n开放端口: {}\n发现: {}\n请用中文给出简要的安全评估和建议。",
-        ports
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
-        findings.join(", ")
-    );
-    // Try to use the configured AI model from ai-server
-    if let Some((model, base_url, api_key)) = load_ai_model_config(pool).await {
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
-            let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-            let body = serde_json::json!({
-                "model": model,
-                "messages": [{"role": "system", "content": "你是一名资深安全专家，负责分析网络安全扫描结果。"}, {"role": "user", "content": &prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.7
-            });
-            if let Ok(resp) = client
-                .post(&endpoint)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .json(&body)
-                .send()
-                .await
-            {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
-                        return content.to_string();
-                    }
-                }
-            }
-        }
-    }
-    // Fallback analysis when AI is unavailable
-    format!(
-        "[AI 分析] 目标 {} 开放 {} 个端口，发现 {} 个潜在问题。建议：限制对外开放端口，禁用不必要的服务，定期更新系统补丁。",
-        target,
-        ports.len(),
-        findings.len()
-    )
 }
 
 // ── Worker executor with AI agent and lease renewal ─────────────────────
@@ -939,6 +901,9 @@ enum ToolAuthorization {
     WaitingForApproval,
 }
 
+// Approval machinery is kept for the approvals API and its integration test;
+// the unified conversation runtime enforces scope guards instead of per-tool approvals.
+#[allow(dead_code)]
 async fn authorize_tool_call(
     pool: &PgPool,
     run_id: &str,
@@ -1165,6 +1130,12 @@ async fn execute_claimed_run(
     if run_cancel_requested(pool, &run_id).await? {
         return Err("RUN_CANCELLED".into());
     }
+    // Every run executes through the session-driven conversation runtime.
+    // Runs created outside the chat flow (e.g. from a task) get a synthetic
+    // agent session attached so the autonomous tool loop, evidence gates and
+    // reporting apply uniformly. The H-PER-M cognition engine code is kept but
+    // is no longer dispatched.
+    ensure_run_session(pool, &run_id).await?;
     let session_run = tokio::select! {
         result = crate::conversation::run_bridge::execute_session_run(pool, &run_id, worker_id) => result,
         _ = wait_for_run_cancellation(pool, &run_id) => return Err("RUN_CANCELLED".into()),
@@ -1172,594 +1143,70 @@ async fn execute_claimed_run(
     if session_run? {
         return Ok(());
     }
-
-    // ── H-PER-M cognition engine (opt-in) ──
-    if std::env::var("PENTA_COGNITION_ENGINE").as_deref() == Ok("true") {
-        append_run_event(
-            pool,
-            &run_id,
-            "run.engine.selected",
-            json!({"engine": "cognition", "worker_id": worker_id}),
-        )
-        .await?;
-        return crate::cognition::engine::execute_cognition_run(pool, &run_id, worker_id).await;
-    }
-
-    // ── PentAGI Security Tools 执行 ──
-    let store = crate::infrastructure::knowledge::KnowledgeStore::new(pool.clone());
-    let mut embedder = crate::infrastructure::embedding::EmbeddingProvider::new(pool.clone());
-    let _ = embedder.try_configure().await;
-    let memory = crate::infrastructure::memory::AutoMemory::new(store, Some(embedder));
-    let target: Option<String> = sqlx::query_scalar(
-        "SELECT CASE
-             WHEN scope_snapshot->>'confirmed'='true'
-               OR (
-                   scope_snapshot ? 'confirmed_at'
-                   AND scope_snapshot ? 'confirmed_by'
-               )
-             THEN scope_snapshot->'targets'->>0
-             ELSE NULL
-         END
-         FROM pent_runs WHERE id=$1",
-    )
-    .bind(&run_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| e.to_string())?
-    .flatten();
-    let Some(target) = target.filter(|target| !target.trim().is_empty()) else {
-        sqlx::query(
-            "UPDATE pent_runs
-             SET status='failed',completed_at=now(),lease_expires_at=NULL,worker_id=NULL,
-                 updated_at=now()
-             WHERE id=$1",
-        )
-        .bind(&run_id)
-        .execute(pool)
-        .await
-        .map_err(|error| error.to_string())?;
-        return Err(format!("Run {run_id} 缺少已确认的不可变目标范围"));
-    };
-    let tools = [
-        "tcp_scan",
-        "http_probe",
-        "dns_lookup",
-        "ssh_exec",
-        "sql_query",
-        "sqli_validate",
-        "xss_validate",
-        "csrf_validate",
-        "command_injection_validate",
-        "file_inclusion_validate",
-        "file_upload_validate",
-    ];
-
-    // Phase 1: Start with PentAGI tools catalog
-    let events = [
-        (
-            "run.started",
-            json!({"worker_id": worker_id, "agent": "penta-v1", "tools_available": tools}),
-        ),
-        ("flow.planned", json!({"phases": ["侦察", "探测", "分析"]})),
-        (
-            "agent.message.delta",
-            json!({"content": "开始调用 PentAGI 安全工具引擎..."}),
-        ),
-    ];
-
-    for (event_type, payload) in events {
-        append_run_event(pool, &run_id, event_type, payload).await?;
-    }
-
-    let validators = [
-        "sqli_validate",
-        "xss_validate",
-        "csrf_validate",
-        "command_injection_validate",
-        "file_inclusion_validate",
-        "file_upload_validate",
-    ];
-    let planned_tools: Vec<&str> = std::iter::once("tcp_scan")
-        .chain(std::iter::once("http_probe"))
-        .chain(validators)
-        .take(usize::try_from(claim.max_tool_rounds.min(claim.max_requests).max(0)).unwrap_or(0))
-        .collect();
-    let budget_limited = planned_tools.len() < 2 + validators.len();
-    if planned_tools.is_empty() {
-        return Err("RUN_INCOMPLETE: tool round/request budget is zero".into());
-    }
-    for tool_name in &planned_tools {
-        if authorize_tool_call(pool, &run_id, tool_name, &target).await?
-            == ToolAuthorization::WaitingForApproval
-        {
-            return Ok(());
-        }
-    }
-    // Phase 2: Execute PentAGI scan (calls external binary)
-    let backend = infrastructure::process::ExecutionBackend::from_env();
-    let egress_lease = if backend == infrastructure::process::ExecutionBackend::Docker {
-        Some(infrastructure::egress::EgressLease::prepare(&run_id, &target).await?)
-    } else {
-        None
-    };
-    if let Some(lease) = &egress_lease {
-        append_run_event(
-            pool,
-            &run_id,
-            "egress.policy.applied",
-            json!({
-                "policy_id": lease.policy_id,
-                "network_name": lease.network_name,
-                "target": target
-            }),
-        )
-        .await?;
-    }
-    let limits = infrastructure::process::ContainerLimits {
-        timeout_seconds: claim.max_tool_timeout_seconds.max(10) as u64,
-        network_access: infrastructure::process::NetworkPolicy::TargetOnly(target.clone()),
-        network_name: egress_lease
-            .as_ref()
-            .map(|lease| lease.network_name.clone()),
-        backend,
-        ..Default::default()
-    };
-    let scan_result = execute_run_tool(
-        pool,
-        &run_id,
-        "tcp_scan",
-        &["scan".to_string(), target.to_string()],
-        &limits,
-    )
-    .await;
-    if scan_result.as_ref().err().map(String::as_str) == Some("RUN_CANCELLED") {
-        return Err("RUN_CANCELLED".into());
-    }
-    let mut execution_records = Vec::new();
-    execution_records.push(match &scan_result {
-        Ok(output) => (
-            "tcp_scan".to_string(),
-            target.clone(),
-            json!(output.audit),
-            json!({"stdout": output.stdout, "stderr": output.stderr}).to_string(),
-        ),
-        Err(error) => (
-            "tcp_scan".to_string(),
-            target.clone(),
-            json!({"backend": "docker"}),
-            json!({"error": error}).to_string(),
-        ),
-    });
-    let normalized_result = match &scan_result {
-        Ok(output) => kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
-            "tcp_scan",
-            &target,
-            output.exit_code,
-            &output.stdout,
-            &output.stderr,
-            output.duration_ms,
-        ),
-        Err(error) => kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
-            "tcp_scan",
-            &target,
-            -1,
-            "",
-            &format!("PentAGI 未就绪: {error}"),
-            0,
-        ),
-    };
-    append_run_event(
-        pool,
-        &run_id,
-        "tool.result.normalized",
-        json!(normalized_result),
-    )
-    .await?;
-
-    // Auto-memory: record tool execution result
-    let _ = memory
-        .record_tool_run(
-            "tcp_scan",
-            &target,
-            &normalized_result.summary,
-            normalized_result.metrics.exit_code,
-            normalized_result.metrics.duration_ms,
-            None,
-            None,
-        )
-        .await;
-
-    // Phase 3: Feed the canonical result back to the planner.
-    let planning_feedback =
-        kairos_platform_pent_core::planning::derive_planning_feedback(&normalized_result);
-    append_run_event(pool, &run_id, "planner.feedback", json!(planning_feedback)).await?;
-
-    let mut normalized_results = vec![normalized_result.clone()];
-    if let Some(next) = kairos_platform_pent_core::planning::plan_next_tool(
-        &normalized_result,
-        &["tcp_scan".into()],
-    )
-    .filter(|next| planned_tools.contains(&next.tool_name.as_str()))
-    {
-        append_run_event(pool, &run_id, "tool.requested", json!(next)).await?;
-        let next_output = execute_run_tool(
-            pool,
-            &run_id,
-            &next.tool_name,
-            &["probe".into(), next.target.clone()],
-            &limits,
-        )
-        .await;
-        if next_output.as_ref().err().map(String::as_str) == Some("RUN_CANCELLED") {
-            return Err("RUN_CANCELLED".into());
-        }
-        execution_records.push(match &next_output {
-            Ok(output) => (
-                next.tool_name.clone(),
-                next.target.clone(),
-                json!(output.audit),
-                json!({"stdout": output.stdout, "stderr": output.stderr}).to_string(),
-            ),
-            Err(error) => (
-                next.tool_name.clone(),
-                next.target.clone(),
-                json!({"backend": "docker"}),
-                json!({"error": error}).to_string(),
-            ),
-        });
-        let next_result = match next_output {
-            Ok(output) => {
-                kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
-                    &next.tool_name,
-                    &next.target,
-                    output.exit_code,
-                    &output.stdout,
-                    &output.stderr,
-                    output.duration_ms,
-                )
-            }
-            Err(error) => {
-                kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
-                    &next.tool_name,
-                    &next.target,
-                    -1,
-                    "",
-                    &error,
-                    0,
-                )
-            }
-        };
-        append_run_event(pool, &run_id, "tool.result.normalized", json!(next_result)).await?;
-        let feedback = kairos_platform_pent_core::planning::derive_planning_feedback(&next_result);
-        append_run_event(pool, &run_id, "planner.feedback", json!(feedback)).await?;
-        normalized_results.push(next_result);
-    }
-
-    for validator in validators {
-        if !planned_tools.contains(&validator) {
-            continue;
-        }
-        let output = execute_run_tool(
-            pool,
-            &run_id,
-            validator,
-            &["validate".into(), target.clone()],
-            &limits,
-        )
-        .await;
-        if output.as_ref().err().map(String::as_str) == Some("RUN_CANCELLED") {
-            return Err("RUN_CANCELLED".into());
-        }
-        execution_records.push(match &output {
-            Ok(output) => (
-                validator.to_string(),
-                target.clone(),
-                json!(output.audit),
-                json!({"stdout": output.stdout, "stderr": output.stderr}).to_string(),
-            ),
-            Err(error) => (
-                validator.to_string(),
-                target.clone(),
-                json!({"backend": "docker"}),
-                json!({"error": error}).to_string(),
-            ),
-        });
-        let normalized = match output {
-            Ok(output) => {
-                kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
-                    validator,
-                    &target,
-                    output.exit_code,
-                    &output.stdout,
-                    &output.stderr,
-                    output.duration_ms,
-                )
-            }
-            Err(error) => {
-                kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
-                    validator, &target, -1, "", &error, 0,
-                )
-            }
-        };
-        append_run_event(pool, &run_id, "tool.result.normalized", json!(normalized)).await?;
-        normalized_results.push(normalized);
-    }
-
-    // Phase 2: AI 安全分析
-    let open_ports: Vec<u16> = normalized_result
-        .observations
-        .iter()
-        .find(|observation| observation.key == "ports")
-        .and_then(|observation| observation.value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|port| {
-            port.get("port")?
-                .as_u64()
-                .and_then(|value| u16::try_from(value).ok())
-        })
-        .collect();
-    let scan_findings: Vec<&str> = normalized_result
-        .findings
-        .iter()
-        .map(|finding| finding.title.as_str())
-        .collect();
-    // Search knowledge base for relevant guides before analysis
-    let guides = memory
-        .search_guides(&format!("{} open ports {:?}", target, open_ports), None, 3)
-        .await;
-    let ai_analysis = if guides.is_empty() {
-        ai_analyze(
-            pool,
-            &target,
-            &open_ports,
-            &scan_findings,
-            claim.max_tokens.clamp(1, 500) as u32,
-        )
-        .await
-    } else {
-        let enhanced_prompt = format!("知识库相关指南:\n{}\n\n---\n", guides.join("\n---\n"));
-        // Re-run analysis with knowledge context
-        let analysis = ai_analyze(
-            pool,
-            &target,
-            &open_ports,
-            &scan_findings,
-            claim.max_tokens.clamp(1, 500) as u32,
-        )
-        .await;
-        format!("【知识库】\n{}\n【AI分析】\n{}", enhanced_prompt, analysis)
-    };
-    append_run_event(
-        pool,
-        &run_id,
-        "agent.message.completed",
-        json!({"content": &ai_analysis}),
-    )
-    .await?;
-
-    // Persist evidence and tool calls for each executed tool
-    for result in &normalized_results {
-        let approved_call: Option<String> = sqlx::query_scalar(
-            "SELECT id
-             FROM pent_tool_calls
-             WHERE run_id=$1 AND tool_name=$2
-               AND params_summary->>'target'=$3
-               AND permission_decision='approved'
-               AND started_at IS NULL
-             ORDER BY created_at DESC
-             LIMIT 1",
-        )
-        .bind(&run_id)
-        .bind(&result.tool_name)
-        .bind(&result.target)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        let tc_id = approved_call.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let ev_id = uuid::Uuid::new_v4().to_string();
-        let execution_record = execution_records
-            .iter()
-            .find(|(tool, target, _, _)| tool == &result.tool_name && target == &result.target);
-        let execution_audit = execution_record
-            .map(|(_, _, audit, _)| audit.clone())
-            .unwrap_or_else(|| json!({"backend":"docker"}));
-        let raw_response = execution_record
-            .map(|(_, _, _, raw)| raw.as_str())
-            .unwrap_or(&result.summary);
-        let hash = format!("sha256:{:x}", sha2::Sha256::digest(raw_response.as_bytes()));
-        sqlx::query(
-            "INSERT INTO pent_tool_calls(
-                 id,run_id,tool_name,params_summary,permission_decision,
-                 exit_code,duration_ms,started_at,completed_at,
-                 executor_backend,executor_image,network_policy,execution_audit
-             ) VALUES(
-                 $1,$2,$3,$4,'allowed',$5,$6,now(),now(),
-                 $7->>'backend',$7->>'container_image',$7->>'network_policy',$7
-             )
-             ON CONFLICT(id) DO UPDATE SET
-                 exit_code=excluded.exit_code,
-                 duration_ms=excluded.duration_ms,
-                 started_at=excluded.started_at,
-                 completed_at=excluded.completed_at,
-                 executor_backend=excluded.executor_backend,
-                 executor_image=excluded.executor_image,
-                 network_policy=excluded.network_policy,
-                 execution_audit=excluded.execution_audit",
-        )
-        .bind(&tc_id)
-        .bind(&run_id)
-        .bind(&result.tool_name)
-        .bind(&json!({"target":&result.target}))
-        .bind(result.metrics.exit_code)
-        .bind(result.metrics.duration_ms as i64)
-        .bind(execution_audit)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        sqlx::query("INSERT INTO pent_evidence(id,run_id,tool_call_id,source,content_hash,content_type) VALUES($1,$2,$3,$4,$5,$6)")
-            .bind(&ev_id).bind(&run_id).bind(&tc_id).bind(raw_response).bind(&hash).bind("application/json")
-            .execute(pool).await.map_err(|e| e.to_string())?;
-        for finding in &result.findings {
-            let fingerprint = format!(
-                "sha256:{:x}",
-                sha2::Sha256::digest(
-                    format!(
-                        "{}\n{}\n{}",
-                        finding.title.to_ascii_lowercase(),
-                        finding.target.to_ascii_lowercase(),
-                        finding.severity.to_ascii_lowercase()
-                    )
-                    .as_bytes()
-                )
-            );
-            let fid = uuid::Uuid::new_v4().to_string();
-            sqlx::query(
-                "INSERT INTO pent_findings(
-                     id,run_id,title,severity,status,target,evidence_ids,description,
-                     fingerprint,confidence,false_positive_status
-                 ) VALUES($1,$2,$3,$4,'needs_review',$5,$6,$7,$8,$9,'unreviewed')
-                 ON CONFLICT(run_id,fingerprint) DO UPDATE SET
-                     confidence=GREATEST(pent_findings.confidence,excluded.confidence),
-                     evidence_ids=(
-                         SELECT COALESCE(jsonb_agg(DISTINCT evidence_id),'[]'::jsonb)
-                         FROM jsonb_array_elements(
-                             pent_findings.evidence_ids || excluded.evidence_ids
-                         ) evidence_id
-                     ),
-                     updated_at=now()",
-            )
-            .bind(&fid)
-            .bind(&run_id)
-            .bind(&finding.title)
-            .bind(&finding.severity)
-            .bind(&finding.target)
-            .bind(json!([ev_id]))
-            .bind(&finding.description)
-            .bind(&fingerprint)
-            .bind(finding.confidence)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            append_run_event(
-                pool,
-                &run_id,
-                "finding.created",
-                json!({
-                    "fingerprint": fingerprint,
-                    "evidence_id": ev_id,
-                    "finding": finding
-                }),
-            )
-            .await?;
-        }
-    }
-    let effective_observations = normalized_results
-        .iter()
-        .map(|result| result.observations.len() + result.findings.len())
-        .sum::<usize>();
-    if effective_observations == 0 {
-        sqlx::query(
-            "UPDATE pent_runs
-             SET status='blocked',failure_code='no_effective_observation',
-                 failure_message='工具失败或未产生有效观察',completed_at=now(),updated_at=now()
-             WHERE id=$1",
-        )
-        .bind(&run_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        append_run_event(
-            pool,
-            &run_id,
-            "run.blocked",
-            json!({"reason": "no_effective_observation"}),
-        )
-        .await?;
-        return Ok(());
-    }
-    if budget_limited {
-        sqlx::query(
-            "UPDATE pent_runs
-             SET status='blocked',failure_code='budget_exhausted',
-                 failure_message='工具轮次或请求预算在验证完成前耗尽',
-                 completed_at=now(),updated_at=now()
-             WHERE id=$1",
-        )
-        .bind(&run_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        append_run_event(
-            pool,
-            &run_id,
-            "run.incomplete",
-            json!({
-                "reason": "budget_exhausted",
-                "tools_executed": normalized_results.len()
-            }),
-        )
-        .await?;
-        return Ok(());
-    }
-    sqlx::query(
-        "UPDATE pent_runs SET status='completed', completed_at=now(), updated_at=now() WHERE id=$1",
-    )
-    .bind(&run_id)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    append_run_event(
-        pool,
-        &run_id,
-        "run.completed",
-        json!({
-            "tools_executed": normalized_results.len(),
-            "open_ports": open_ports,
-            "findings": scan_findings
-        }),
-    )
-    .await?;
-    match report::generate_run_report(pool, &run_id, None).await {
-        Ok(artifact) => {
-            append_run_event(
-                pool,
-                &run_id,
-                "run.report.completed",
-                json!({
-                    "artifact_id": artifact.artifact_id,
-                    "object_key": artifact.object_key,
-                    "size_bytes": artifact.size_bytes,
-                    "sha256": artifact.sha256,
-                }),
-            )
-            .await?;
-        }
-        Err(error) => {
-            tracing::error!(run_id = %run_id, error = %error, "run report generation failed");
-            append_run_event(
-                pool,
-                &run_id,
-                "run.report.failed",
-                json!({"error": error}),
-            )
-            .await?;
-        }
-    }
-    Ok(())
+    Err(format!("Run {run_id} 未能关联 Agent 会话，无法进入会话运行时"))
 }
 
-async fn execute_run_tool(
-    pool: &PgPool,
-    run_id: &str,
-    tool_name: &str,
-    command: &[String],
-    limits: &infrastructure::process::ContainerLimits,
-) -> Result<infrastructure::process::ToolOutput, String> {
-    tokio::select! {
-        result = infrastructure::process::execute_tool(tool_name, command, limits) => result,
-        _ = wait_for_run_cancellation(pool, run_id) => Err("RUN_CANCELLED".into()),
+/// Attach a synthetic agent session to a run created outside the chat flow so
+/// the worker can execute it through the conversation runtime.
+async fn ensure_run_session(pool: &PgPool, run_id: &str) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    let run: Option<(
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        Value,
+        Value,
+        Value,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT tenant_id, project_id, user_id, objective_snapshot, scope_snapshot,
+                policy_snapshot, budget_snapshot, session_id
+         FROM pent_runs WHERE id=$1 FOR UPDATE",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some((tenant_id, project_id, user_id, objective, scope, policy, budget, session_id)) = run
+    else {
+        return Err(format!("Run {run_id} 不存在"));
+    };
+    if session_id.is_some() {
+        tx.commit().await.map_err(|error| error.to_string())?;
+        return Ok(());
     }
+    let objective = objective
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("安全测试运行 {run_id}"));
+    let new_session_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO pent_agent_sessions(
+             id, tenant_id, project_id, objective, constraints, budget,
+             scope_proposal, confirmed_scope_snapshot, status, active_run_id, created_by
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$7,'running',$8,$9)",
+    )
+    .bind(&new_session_id)
+    .bind(tenant_id)
+    .bind(&project_id)
+    .bind(&objective)
+    .bind(&policy)
+    .bind(&budget)
+    .bind(&scope)
+    .bind(run_id)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    sqlx::query("UPDATE pent_runs SET session_id=$2, updated_at=now() WHERE id=$1")
+        .bind(run_id)
+        .bind(&new_session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| error.to_string())?;
+    tx.commit().await.map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 async fn wait_for_run_cancellation(pool: &PgPool, run_id: &str) {

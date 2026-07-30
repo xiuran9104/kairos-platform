@@ -145,11 +145,22 @@ async function sendMessage() {
   try {
     abortController.value = new AbortController();
     const hasActiveRun = !!session.value?.active_run_id;
-    if (hasActiveRun) {
+    if (hasActiveRun || hasConfirmedScope()) {
       await sendPollingMessage(currentSessionId, text);
     } else {
-      await sendStreamingMessage(currentSessionId, text);
+      const runTurnId = await sendStreamingMessage(currentSessionId, text);
+      // Backend upgraded the turn to the autonomous agent loop (scope confirmed):
+      // follow it through the polling channel like any other agent turn.
+      if (runTurnId) {
+        activeTurnId.value = runTurnId;
+        await pollTurn(currentSessionId, runTurnId);
+      }
     }
+    // Refresh session state (status/active run) so the header tag and the
+    // next message's mode decision see the latest backend state.
+    try { session.value = await getPentSession(currentSessionId); } catch { /* best-effort */ }
+    // Also refresh sidebar list so "运行中" tag disappears
+    await loadSessions();
   } catch (e: any) {
     if (!cancelling.value) {
       messages.value.push({
@@ -170,6 +181,13 @@ async function sendMessage() {
   await nextTick(); scrollToBottom(true);
 }
 
+/** A session with a confirmed authorization scope must use the agent
+ * (tool-loop) channel so the pentest actually starts. */
+function hasConfirmedScope() {
+  const targets = session.value?.confirmed_scope_snapshot?.targets;
+  return Array.isArray(targets) && targets.length > 0;
+}
+
 async function sendPollingMessage(currentSessionId: string, text: string) {
   const resp: any = await createTurn(currentSessionId, {
     client_request_id: createClientRequestId(), content: text,
@@ -177,10 +195,12 @@ async function sendPollingMessage(currentSessionId: string, text: string) {
   const turnId = resp?.turn_id ?? resp?.data?.turn_id;
   if (!turnId) throw new Error('no turn_id');
   activeTurnId.value = turnId;
+  await pollTurn(currentSessionId, turnId, session.value?.active_run_id);
+}
 
+async function pollTurn(currentSessionId: string, turnId: string, runId?: string) {
   // Poll for turn completion (SSE-backed via fetchEventSource with Authorization header, falls back to polling)
   const seenIds = new Set<string>();
-  const runId = session.value?.active_run_id;
   const sseEvents: any[] = [];
   let sseActive = false;
   const sseAbort = new AbortController();
@@ -277,9 +297,13 @@ async function sendPollingMessage(currentSessionId: string, text: string) {
   sseAbort.abort();
 }
 
-async function sendStreamingMessage(currentSessionId: string, text: string) {
-  return new Promise<void>((resolve, reject) => {
+/** Stream a plain chat turn. Resolves with a turn id when the backend upgraded
+ * the message to an autonomous agent run (`run_started`), otherwise undefined. */
+async function sendStreamingMessage(currentSessionId: string, text: string): Promise<string | undefined> {
+  return new Promise((resolve, reject) => {
     let assistantMsg: any = null;
+    let runTurnId: string | undefined;
+    let receivedAny = false;
     createTurnStream(
       currentSessionId,
       text,
@@ -288,7 +312,19 @@ async function sendStreamingMessage(currentSessionId: string, text: string) {
       (event: any) => {
         try {
           const data = JSON.parse(event.data || '{}');
-          if (data.type === 'delta') {
+          if (data.type === 'run_started') {
+            receivedAny = true;
+            runTurnId = data.turn_id;
+          } else if (data.type === 'already_exists') {
+            receivedAny = true;
+          } else if (event.event === 'error' || data.type === 'error') {
+            receivedAny = true;
+            if (assistantMsg) {
+              assistantMsg.status = 'failed';
+            }
+            reject(new Error(data.msg || data.message || data.error || '流式响应失败'));
+          } else if (data.type === 'delta') {
+            receivedAny = true;
             if (!assistantMsg) {
               assistantMsg = {
                 id: data.message_id,
@@ -304,15 +340,11 @@ async function sendStreamingMessage(currentSessionId: string, text: string) {
             }
             nextTick().then(() => scrollToBottom(true));
           } else if (data.type === 'complete') {
+            receivedAny = true;
             if (assistantMsg) {
               assistantMsg.content = data.content;
               assistantMsg.status = 'completed';
             }
-          } else if (data.type === 'error') {
-            if (assistantMsg) {
-              assistantMsg.status = 'failed';
-            }
-            reject(new Error(data.msg || '流式响应失败'));
           }
         } catch (err) {
           console.error('parse stream event failed', err);
@@ -327,10 +359,19 @@ async function sendStreamingMessage(currentSessionId: string, text: string) {
         throw err;
       },
       () => {
+        if (runTurnId) {
+          resolve(runTurnId);
+          return;
+        }
         if (assistantMsg && assistantMsg.status === 'streaming') {
           assistantMsg.status = 'completed';
         }
-        resolve();
+        if (!receivedAny) {
+          // Never fail silently: surface that the backend returned nothing.
+          reject(new Error('服务未返回任何内容，请检查后端日志'));
+          return;
+        }
+        resolve(undefined);
       },
     );
   });

@@ -94,7 +94,7 @@ async fn create_turn(
     // Create the turn and user message synchronously, then run the tool loop
     // in a background task so the HTTP response returns immediately.
     let pool = s.pool.clone();
-    let rt = crate::conversation::build_runtime(&pool);
+    let rt = crate::conversation::build_runtime(&pool, None);
     let (turn_id, _run_id) = rt
         .begin_turn_only(&request)
         .await
@@ -108,14 +108,28 @@ async fn create_turn(
     let cleanup_registry = task_registry.clone();
     let (abort_handle, abort_registration) = AbortHandle::new_pair();
     task_registry.register(turn_id.clone(), abort_handle);
+    let bg_pool = pool.clone();
     tokio::spawn(async move {
-        match Abortable::new(rt.execute_turn(bg_turn_id, &request), abort_registration).await {
+        let result = Abortable::new(rt.execute_turn(bg_turn_id.clone(), &request), abort_registration).await;
+        match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::error!(error = %error, "conversation turn failed");
             }
-            Err(_) => {
-                tracing::info!(turn_id = %cleanup_turn_id, "conversation turn aborted");
+            Err(_aborted) => {
+                tracing::info!(turn_id = %cleanup_turn_id, "conversation turn aborted — marking as failed");
+                let _ = sqlx::query(
+                    "UPDATE pent_conversation_turns SET status='failed', error_message='任务被中止', retryable=true WHERE id=$1"
+                )
+                .bind(&cleanup_turn_id)
+                .execute(&bg_pool)
+                .await;
+                let _ = sqlx::query(
+                    "UPDATE pent_agent_sessions SET status='ready' WHERE id=$1 AND status='running'"
+                )
+                .bind(&request.session_id)
+                .execute(&bg_pool)
+                .await;
             }
         }
         cleanup_registry.remove(&cleanup_turn_id);
@@ -187,11 +201,6 @@ async fn create_turn_stream(
         ));
     }
 
-    // Try auto-authorization: detect explicit user declaration of authorised scope.
-    let turn_id = uuid::Uuid::new_v4().to_string();
-    let user_message_id = uuid::Uuid::new_v4().to_string();
-    let assistant_message_id = uuid::Uuid::new_v4().to_string();
-
     // Apply authorization auto-detection before persisting messages so the session
     // transitions to "ready" when the user explicitly declares scope in chat.
     let auth_service =
@@ -199,6 +208,69 @@ async fn create_turn_stream(
     let _ = auth_service
         .reconcile_explicit_authorization(&session_id, &content)
         .await;
+
+    // A session with confirmed scope must act, not chat: hand the message to the
+    // autonomous tool loop (which creates the execution run on demand) and tell
+    // the client to follow the turn through the polling channel.
+    let scope_confirmed = sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT confirmed_scope_snapshot FROM pent_agent_sessions WHERE id=$1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .flatten()
+    .is_some_and(|scope| {
+        scope
+            .get("targets")
+            .and_then(Value::as_array)
+            .is_some_and(|targets| !targets.is_empty())
+    });
+    if scope_confirmed {
+        let request = AgentTurnRequest {
+            session_id,
+            content,
+            message_type: ConversationMessageType::Chat,
+            client_request_id: client_req_id,
+            attachments: vec![],
+        };
+        let rt = crate::conversation::build_runtime(&s.pool, s.nats.clone());
+        let (turn_id, _run_id) = rt
+            .begin_turn_only(&request)
+            .await
+            .map_err(|error| AppError::internal(format!(" Pent 对话处理失败: {error}")))?;
+        let bg_turn_id = turn_id.clone();
+        let cleanup_turn_id = turn_id.clone();
+        let task_registry = s.conversation_tasks.clone();
+        let cleanup_registry = task_registry.clone();
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        task_registry.register(turn_id.clone(), abort_handle);
+        tokio::spawn(async move {
+            match Abortable::new(rt.execute_turn(bg_turn_id, &request), abort_registration).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(error = %error, "conversation turn failed");
+                }
+                Err(_) => {
+                    tracing::info!(turn_id = %cleanup_turn_id, "conversation turn aborted");
+                }
+            }
+            cleanup_registry.remove(&cleanup_turn_id);
+        });
+        let body = Body::from(format!(
+            "data: {}\n\nevent: done\ndata: [DONE]\n\n",
+            json!({"type":"run_started","turn_id":turn_id})
+        ));
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(body)
+            .map_err(|_| AppError::internal("创建流失败"));
+    }
+
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let user_message_id = uuid::Uuid::new_v4().to_string();
+    let assistant_message_id = uuid::Uuid::new_v4().to_string();
 
     // Persist turn, user message, and a placeholder streaming assistant message.
     sqlx::query(
@@ -422,7 +494,7 @@ async fn create_turn_stream(
                 .execute(&pool)
                 .await;
 
-                let payload = json!({"code":500,"msg":error_msg});
+                let payload = json!({"type":"error","code":500,"msg":error_msg});
                 let _ = tx.send(Ok(format!("event: error\ndata: {}\n\n", payload))).await;
             }
         }
@@ -520,7 +592,7 @@ async fn retry_turn(
         client_request_id: format!("retry-{}", uuid::Uuid::new_v4()),
         attachments: vec![],
     };
-    let result = crate::conversation::build_runtime(&s.pool)
+    let result = crate::conversation::build_runtime(&s.pool, s.nats.clone())
         .handle(&request)
         .await
         .map_err(|error| AppError::internal(format!(" Pent 对话重试失败: {error}")))?;

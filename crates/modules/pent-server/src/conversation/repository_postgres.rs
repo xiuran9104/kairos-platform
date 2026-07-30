@@ -141,6 +141,7 @@ impl ConversationRepository for PgConversationRepository {
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let run_id = uuid::Uuid::new_v4().to_string();
+        let task_name = task_display_name(&session.2, &session.3);
         sqlx::query(
             "INSERT INTO pent_tasks(
                  id,tenant_id,project_id,name,description,target_scope,status,created_by
@@ -149,7 +150,7 @@ impl ConversationRepository for PgConversationRepository {
         .bind(&task_id)
         .bind(session.0)
         .bind(&session.1)
-        .bind(&session.2)
+        .bind(&task_name)
         .bind(&session.3)
         .bind(&session.6)
         .execute(&mut *tx)
@@ -250,6 +251,19 @@ impl ConversationRepository for PgConversationRepository {
         .bind(result.usage.latency_ms as i64)
         .execute(&mut *tx)
         .await?;
+        // Release session and close active run so the frontend reflects correct state
+        sqlx::query(
+            "WITH closed AS (
+                UPDATE pent_runs SET status='completed', completed_at=now()
+                WHERE id=$2 AND status='running'
+             )
+             UPDATE pent_agent_sessions SET status='ready', active_run_id=NULL, updated_at=now()
+             WHERE id=$1 AND status='running'",
+        )
+        .bind(&result.session_id)
+        .bind(&result.run_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -261,6 +275,7 @@ impl ConversationRepository for PgConversationRepository {
         message: &str,
         retryable: bool,
     ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE pent_conversation_turns
              SET status='failed', error_code=$2, error_message=$3,
@@ -271,8 +286,23 @@ impl ConversationRepository for PgConversationRepository {
         .bind(code)
         .bind(message)
         .bind(retryable)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // Reset session to ready, clear active_run_id, and close stale runs
+        sqlx::query(
+            "WITH s AS (
+                SELECT session_id, active_run_id FROM pent_conversation_turns WHERE id=$1
+             ), closed AS (
+                UPDATE pent_runs SET status='completed', completed_at=now()
+                FROM s WHERE pent_runs.id = s.active_run_id AND pent_runs.status='running'
+             )
+             UPDATE pent_agent_sessions SET status='ready', active_run_id=NULL, updated_at=now()
+             FROM s WHERE pent_agent_sessions.id = s.session_id AND pent_agent_sessions.status='running'",
+        )
+        .bind(turn_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1007,6 +1037,25 @@ impl ConversationRepository for PgConversationRepository {
         }))
     }
 
+    async fn record_run_event(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO pent_run_events(event_id, run_id, sequence, event_type, payload)
+             VALUES($1, $2, COALESCE((SELECT max(sequence)+1 FROM pent_run_events WHERE run_id=$2), 1), $3, $4)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(run_id)
+        .bind(event_type)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn checkpoint_context(
         &self,
         turn_id: &str,
@@ -1380,5 +1429,20 @@ mod traffic_tests {
             .execute(&pool)
             .await
             .expect("cleanup run after test");
+    }
+}
+
+/// Build a human-readable task name from the session objective and scope.
+fn task_display_name(objective: &str, scope: &serde_json::Value) -> String {
+    let first_target = scope
+        .get("targets")
+        .and_then(|t| t.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !first_target.is_empty() && objective != first_target {
+        format!("{objective} → {first_target}")
+    } else {
+        objective.to_string()
     }
 }

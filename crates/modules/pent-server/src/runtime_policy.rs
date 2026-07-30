@@ -35,13 +35,9 @@ pub struct ClaimedRun {
     pub id: String,
     pub tenant_id: i64,
     pub lease_ttl_seconds: i32,
-    pub max_tool_timeout_seconds: i32,
     pub max_retries_per_run: i32,
     pub retry_base_delay_seconds: i32,
-    pub max_tool_rounds: i32,
     pub max_duration_seconds: i32,
-    pub max_requests: i32,
-    pub max_tokens: i64,
 }
 
 pub async fn load(pool: &PgPool, tenant_id: i64) -> Result<RuntimePolicy, AppError> {
@@ -116,13 +112,9 @@ pub async fn claim(
              SELECT r.id,r.tenant_id,
                     COALESCE(tp.max_concurrent_runs,dp.max_concurrent_runs) max_concurrent_runs,
                     COALESCE(tp.lease_ttl_seconds,dp.lease_ttl_seconds,$2::integer) lease_ttl_seconds,
-                    COALESCE(tp.max_tool_timeout_seconds,dp.max_tool_timeout_seconds) max_tool_timeout_seconds,
                     COALESCE(tp.max_retries_per_run,dp.max_retries_per_run) max_retries_per_run,
-                    COALESCE(tp.retry_base_delay_seconds,dp.retry_base_delay_seconds) retry_base_delay_seconds
-                    ,LEAST(GREATEST(COALESCE((r.budget_snapshot->>'max_tool_rounds')::integer,50),1),50) max_tool_rounds
-                    ,LEAST(GREATEST(COALESCE((r.budget_snapshot->>'max_duration_seconds')::integer,7200),1),7200) max_duration_seconds
-                    ,LEAST(GREATEST(COALESCE((r.budget_snapshot->>'max_requests')::integer,200),1),10000) max_requests
-                    ,LEAST(GREATEST(COALESCE((r.budget_snapshot->>'max_tokens')::bigint,200000),1),2000000) max_tokens
+                    COALESCE(tp.retry_base_delay_seconds,dp.retry_base_delay_seconds) retry_base_delay_seconds,
+                    LEAST(GREATEST(COALESCE((r.budget_snapshot->>'max_duration_seconds')::integer,7200),1),7200) max_duration_seconds
              FROM pent_runs r
              LEFT JOIN pent_runtime_policies tp ON tp.tenant_id=r.tenant_id
              LEFT JOIN pent_runtime_policies dp ON dp.tenant_id=0
@@ -143,16 +135,14 @@ pub async fn claim(
              started_at=COALESCE(started_at,now()),updated_at=now(),
              policy_snapshot=policy_snapshot || jsonb_build_object(
                  'lease_ttl_seconds',candidate.lease_ttl_seconds,
-                 'max_tool_timeout_seconds',candidate.max_tool_timeout_seconds,
                  'max_retries_per_run',candidate.max_retries_per_run,
                  'retry_base_delay_seconds',candidate.retry_base_delay_seconds
              )
          FROM candidate
          WHERE r.id=candidate.id
          RETURNING r.id,r.tenant_id,candidate.lease_ttl_seconds,
-                   candidate.max_tool_timeout_seconds,candidate.max_retries_per_run,
-                   candidate.retry_base_delay_seconds,candidate.max_tool_rounds,
-                   candidate.max_duration_seconds,candidate.max_requests,candidate.max_tokens",
+                   candidate.max_retries_per_run,candidate.retry_base_delay_seconds,
+                   candidate.max_duration_seconds",
     )
     .bind(worker_id)
     .bind(fallback_lease_ttl.clamp(30, 3600) as i32)

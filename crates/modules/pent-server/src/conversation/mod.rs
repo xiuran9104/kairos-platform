@@ -17,8 +17,9 @@ use repository_postgres::PgConversationRepository;
 
 pub(crate) fn build_runtime(
     pool: &kairos_platform_framework_database::PgPool,
+    nats: Option<crate::transport::mq::NatsHandle>,
 ) -> ConversationRuntime {
-    ConversationRuntime::new(
+    let rt = ConversationRuntime::new(
         Arc::new(PgConversationRepository::new(pool.clone())),
         Arc::new(PgConversationAuthorizationService::new(pool.clone())),
         Arc::new(PgContextSource::new(pool.clone())),
@@ -27,7 +28,12 @@ pub(crate) fn build_runtime(
         Arc::new(MemoryAdapter::new(pool.clone())),
         Arc::new(InstructionSink::new(pool.clone())),
         Arc::new(LoggingConversationEventSink),
-    )
+    );
+    if let Some(n) = nats {
+        rt.with_nats(n)
+    } else {
+        rt
+    }
 }
 
 pub mod adapters;
@@ -44,6 +50,7 @@ pub(crate) mod run_bridge;
 mod scan_progress;
 pub mod stream;
 pub mod structured_output;
+pub mod tool_bus;
 pub mod tool_catalog;
 pub mod tool_executor;
 mod tool_extensions;

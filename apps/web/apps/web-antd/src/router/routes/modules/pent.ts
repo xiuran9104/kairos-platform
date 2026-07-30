@@ -53,12 +53,6 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '运行', icon: 'lucide:play-circle' },
       },
       {
-        path: '/pent/approvals',
-        component: () => import('#/views/pent/approvals/index.vue'),
-        name: 'PentApprovals',
-        meta: { title: '审批', icon: 'lucide:shield-check' },
-      },
-      {
         path: '/pent/findings',
         component: () => import('#/views/pent/findings/index.vue'),
         name: 'PentFindings',

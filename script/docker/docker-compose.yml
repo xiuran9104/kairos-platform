@@ -73,7 +73,28 @@ services:
       OPENAI_API_KEY: ${OPEN_AI_KEY:-}
       PORT: 8000
 
+  # ── MCP: Headless Chromium with CDP endpoint ──────────────────────
+  headless-chrome:
+    image: chromedp/headless-shell:latest
+    container_name: kairos-platform-headless-chrome
+    ports:
+      - "127.0.0.1:9222:9222"
+    shm_size: 2gb
+
+  # mitmproxy — transparent HTTP proxy for Burp-like capture/replay
+  mitmproxy:
+    image: mitmproxy/mitmproxy:latest
+    container_name: kairos-platform-mitmproxy
+    command: mitmweb --web-host 0.0.0.0 --web-port 8081 --listen-port 8085
+    ports:
+      - "127.0.0.1:8081:8081"  # mitmweb UI
+      - "127.0.0.1:8085:8085"  # proxy port
+    volumes:
+      - kairos-platform-mitmproxy-data:/home/mitmproxy
+
 volumes:
   kairos-platform-postgres:
   kairos-platform-minio:
   kairos-platform-neo4j:
+  kairos-platform-chrome-data:
+  kairos-platform-mitmproxy-data:

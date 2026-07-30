@@ -1,7 +1,7 @@
 //! MinIO object store adapter.
 //!
 //! Minimal S3 SigV4 client for pent artifacts (reports, evidence payloads).
-//! Follows the same signing approach as `toon-server::toonflow_storage`.
+//! Uses a minimal in-repository S3 SigV4 implementation.
 //! Configuration comes from `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` /
 //! `MINIO_SECRET_KEY` / `MINIO_BUCKET` / `MINIO_REGION`.
 

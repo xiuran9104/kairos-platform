@@ -144,6 +144,13 @@ pub trait ConversationRepository: Send + Sync {
         run_summary: &str,
         evidence_ids: &[String],
     ) -> anyhow::Result<()>;
+
+    async fn record_run_event(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -169,6 +176,8 @@ pub trait ConversationIntentDetector: Send + Sync {
     ) -> anyhow::Result<ConversationIntent>;
 }
 
+use std::collections::HashSet;
+
 #[async_trait]
 pub trait ConversationModelGateway: Send + Sync {
     async fn generate(
@@ -176,6 +185,10 @@ pub trait ConversationModelGateway: Send + Sync {
         context: &ConversationContext,
         intent: &ConversationIntent,
     ) -> anyhow::Result<ModelTurnOutput>;
+
+    /// Temporarily hide tools that have exceeded their consecutive failure
+    /// limit. Called by the runtime before each model turn.
+    fn set_exhausted_tools(&self, _tools: HashSet<String>) {}
 }
 
 #[async_trait]

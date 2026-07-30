@@ -404,7 +404,7 @@ mod tests {
         assert!(has_conversation_handler("http_request"));
         assert!(has_conversation_handler("js_analyze"));
         assert!(has_conversation_handler("knowledge_search"));
-        assert!(!has_conversation_handler("sqlmap"));
+        assert!(!has_conversation_handler("tlssled"));
     }
 
     #[test]

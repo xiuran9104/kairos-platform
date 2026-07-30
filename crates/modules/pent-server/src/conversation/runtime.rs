@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use kairos_platform_pent_api::{
     AgentMessage, AgentTurnRequest, AgentTurnResult, ConversationContext, ConversationIntent,
-    ConversationTurnStatus,
+    ConversationMessageType, ConversationTurnStatus,
 };
 
 use super::{
@@ -15,7 +15,7 @@ use super::{
 /// Maximum tool-calling rounds before forcing a stop.
 /// PentAGI CLI uses 3 hours default runtime; the conversation agent
 /// limits rounds instead. 50 rounds ≈ 1-2 hours of typical execution.
-const MAX_TOOL_ROUNDS: usize = 50;
+const MAX_TOOL_ROUNDS: usize = 20;
 /// Absolute maximum runtime for a conversation turn (2 hours).
 const MAX_TURN_RUNTIME_SECS: u64 = 2 * 60 * 60;
 /// Tool observations sent back to the model are compact. The complete response
@@ -119,6 +119,7 @@ pub struct ConversationRuntime {
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     instruction_sink: Arc<dyn ConversationInstructionSink>,
     events: Arc<dyn ConversationEventSink>,
+    nats: Option<crate::transport::mq::NatsHandle>,
 }
 
 impl ConversationRuntime {
@@ -141,7 +142,13 @@ impl ConversationRuntime {
             knowledge_source,
             instruction_sink,
             events,
+            nats: None,
         }
+    }
+
+    pub fn with_nats(mut self, nats: crate::transport::mq::NatsHandle) -> Self {
+        self.nats = Some(nats);
+        self
     }
 
     /// Create the turn and user message in the database, return (turn_id, run_id).
@@ -151,7 +158,12 @@ impl ConversationRuntime {
         &self,
         request: &AgentTurnRequest,
     ) -> anyhow::Result<(String, Option<String>)> {
-        let intent = self.intent_detector.detect(request, false).await?;
+        let intent = ConversationIntent {
+            kind: ConversationMessageType::Chat,
+            confidence: 0.5,
+            requires_run_instruction: false,
+            requires_confirmation: false,
+        };
         self.repository.begin_turn(request, &intent).await
     }
 
@@ -196,12 +208,17 @@ impl ConversationRuntime {
             .await?;
         let run_id = context.run_id.clone();
 
-        self.events
-            .emit(
-                "conversation.turn.started",
-                serde_json::json!({"turn_id": turn_id, "session_id": request.session_id}),
-            )
-            .await?;
+        self.emit_event(
+            "conversation.turn.started",
+            serde_json::json!({"turn_id": turn_id, "session_id": request.session_id}),
+        )
+        .await;
+        // Write run event for the Run detail page
+        if let Some(ref run_id) = run_id {
+            self.repository
+                .record_run_event(run_id, "run.turn_started", &serde_json::json!({"turn_id": turn_id}))
+                .await?;
+        }
 
         let output = self
             .run_tool_loop(turn_id, &request.session_id, context, &intent)
@@ -470,7 +487,137 @@ impl ConversationRuntime {
                     format: "tool_calls".into(),
                 });
 
+                // ── Force summary when approaching turn limit ──────────
+                if round == 15 {
+                    context.recent_messages.push(AgentMessage {
+                        message_id: "runtime_force_summary".into(), role: "user".into(),
+                        content: "已执行大量工具调用。请立即停止调用工具，用纯文本总结所有发现和漏洞。不要调用任何工具。".into(),
+                        format: "text".into(),
+                    });
+                }
+                if round > 15 {
+                    context.recent_messages.push(AgentMessage {
+                        message_id: format!("runtime_stop_{round}"), role: "user".into(),
+                        content: "停止调用工具，输出最终报告。".into(), format: "text".into(),
+                    });
+                }
+
                 let mut loop_diagnostic = None;
+
+                // ── Phase 1: separate fast inline tools from slow parallel tools ──
+                let mut fast_results: Vec<(usize, super::tool_executor::ConversationToolResult, String, String, std::time::Duration)> = Vec::new();
+                let mut slow_spawns: Vec<(usize, String, String, String, tokio::task::JoinHandle<(String, String, String, super::tool_executor::ConversationToolResult, u64)>)> = Vec::new();
+
+                for (i, tc) in output.tool_calls.iter().enumerate() {
+                    if request_count >= budget.max_requests {
+                        stopped_by_budget = Some("requests");
+                        break;
+                    }
+                    request_count += 1;
+                    let tool_started = std::time::Instant::now();
+                    let fingerprint = tool_request_fingerprint(&tc.name, &tc.arguments);
+                    if !request_fingerprints.insert(fingerprint) {
+                        fast_results.push((i, super::tool_executor::ConversationToolResult {
+                            tool_call_id: tc.id.clone(), tool_name: tc.name.clone(),
+                            content: serde_json::json!({"duplicate_skipped":true,"message":"同一工具请求已在本轮执行"}).to_string(),
+                            success: true,
+                        }, tc.id.clone(), tc.name.clone(), tool_started.elapsed()));
+                    } else if matches!(tc.name.as_str(), "knowledge_search" | "evidence_list" | "evidence_search" | "evidence_view" | "traffic_list" | "traffic_view" | "traffic_sitemap" | "traffic_diff" | "traffic_replay" | "skill_list" | "skill_load") {
+                        let result = self.execute_fast_tool(tc, session_id, &context).await;
+                        fast_results.push((i, result, tc.id.clone(), tc.name.clone(), tool_started.elapsed()));
+                    } else {
+                        let call_id = tc.id.clone();
+                        let name = tc.name.clone();
+                        let args = tc.arguments.clone();
+                        let scope = context.scope_snapshot.clone();
+                        let sid = session_id.to_string();
+                        let handle = tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            let result = super::tool_executor::execute_tool(&name, &args, &scope, &sid).await;
+                            (call_id, name, args, result, start.elapsed().as_millis() as u64)
+                        });
+                        slow_spawns.push((i, tc.id.clone(), tc.name.clone(), tc.arguments.clone(), handle));
+                    }
+                }
+
+                // ── Phase 2: await all parallel tasks ──────────────────
+                for (_idx, call_id, tool_name, tool_args, handle) in slow_spawns {
+                    match handle.await {
+                        Ok((cid, name, args, result, elapsed_ms)) => {
+                            fast_results.push((0, result, cid, name, std::time::Duration::from_millis(elapsed_ms)));
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, tool = %tool_name, "parallel tool panicked");
+                            fast_results.push((0, super::tool_executor::ConversationToolResult {
+                                tool_call_id: call_id.clone(), tool_name: tool_name.clone(),
+                                content: serde_json::json!({"error": format!("{e}")}).to_string(), success: false,
+                            }, call_id, tool_name, std::time::Duration::ZERO));
+                        }
+                    }
+                }
+
+                // ── Phase 3: process all results (SSE + evidence + traffic + summary) ──
+                for (_idx, result, call_id, tool_name, elapsed) in &fast_results {
+                    let tool_args = ""; // fast tools use empty args for persistence
+                    // SSE: stream tool result as it arrives
+                    let event_payload = serde_json::json!({
+                        "turn_id": turn_id,
+                        "tool_name": tool_name,
+                        "tool_call_id": call_id,
+                        "success": result.success,
+                        "summary": result.content.chars().take(300).collect::<String>(),
+                    });
+                    self.events.emit("conversation.tool.completed", event_payload.clone()).await.ok();
+                    // NATS: publish for external subscribers (frontend SSE, monitoring)
+                    if let Some(ref nats) = self.nats {
+                        let payload = serde_json::to_vec(&event_payload).unwrap_or_default();
+                        nats.publish(&format!("penta.conversation.tools.{}", turn_id), &payload).await;
+                    }
+
+                    let duplicate_skipped = result.content.contains(r#""duplicate_skipped":true"#);
+                    let effective_observation = result.success && !duplicate_skipped
+                        && has_effective_observation(tool_name, &result.content);
+                    if effective_observation { successful_observations += 1; }
+                    if let Some(diagnostic) = scan_progress.record_tool_result(
+                        tool_name, result.success, duplicate_skipped, effective_observation, &result.content,
+                    ) { loop_diagnostic = Some(diagnostic); }
+                    if tool_name == "traffic_replay" && result.success { scan_progress.record_traffic_replay(); }
+
+                    let evidence_id = if is_evidence_tool(tool_name) || is_traffic_tool(tool_name) {
+                        None
+                    } else if let Some(run_id) = context.run_id.as_deref() {
+                        let eid = self.repository.record_tool_result(
+                            run_id, call_id, tool_name, &tool_args, result.success, &result.content,
+                            elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+                        ).await?;
+                        evidence_ids.push(eid.clone());
+                        scan_progress.record_evidence_tool(&eid, tool_name);
+                        Some(eid)
+                    } else { None };
+
+                    if let Some(run_id) = context.run_id.as_deref()
+                        && matches!(tool_name.as_str(), "http_request" | "http_probe")
+                    {
+                        self.repository.record_http_traffic(run_id, call_id, tool_name, &tool_args, &result.content, None).await?;
+                    }
+                    append_run_summary(&mut run_summary, round + 1, tool_name, result.success, evidence_id.as_deref(), &result.content);
+
+                    let display = serde_json::json!({"tool_name":tool_name,"tool_call_id":call_id,"success":result.success,"result":result.content});
+                    self.repository.write_intermediate_message(turn_id, session_id, "tool", &display.to_string(), "tool_result").await?;
+                    // Also write to pent_run_events so Run detail page shows progress
+                    if let Some(ref run_id) = context.run_id {
+                        self.repository.record_run_event(run_id, "tool.executed", &display).await?;
+                    }
+                    context.recent_messages.push(AgentMessage {
+                        message_id: format!("tool_result:{}", call_id), role: "tool".into(),
+                        content: serde_json::json!({"tool_call_id":call_id,"result":compact_model_observation(&result.content)}).to_string(),
+                        format: "tool_result".into(),
+                    });
+                }
+
+                // End of parallel tool execution (original loop ended here)
+                #[allow(unreachable_code)]
+                if false {
                 for tc in &output.tool_calls {
                     if request_count >= budget.max_requests {
                         stopped_by_budget = Some("requests");
@@ -663,6 +810,7 @@ impl ConversationRuntime {
                         format: "tool_result".into(),
                     });
                 }
+                } // end if false (dead code block containing old serial loop)
                 if stopped_by_budget.is_some() {
                     break;
                 }
@@ -824,6 +972,58 @@ impl ConversationRuntime {
         };
 
         Ok(final_content)
+    }
+
+    /// Execute a fast inline tool (knowledge, skill, traffic, evidence) synchronously.
+    async fn execute_fast_tool(
+        &self,
+        tc: &super::ports::ModelToolCall,
+        session_id: &str,
+        context: &ConversationContext,
+    ) -> super::tool_executor::ConversationToolResult {
+        match tc.name.as_str() {
+            "knowledge_search" => self.execute_knowledge_search(&tc.id, &tc.arguments).await,
+            "skill_list" | "skill_load" => {
+                let content = self.repository.execute_skill_tool(&tc.name, &tc.arguments).await.map(|v| v.to_string());
+                super::tool_executor::ConversationToolResult {
+                    tool_call_id: tc.id.clone(), tool_name: tc.name.clone(),
+                    success: content.is_ok(),
+                    content: content.unwrap_or_else(|e| serde_json::json!({"error":e.to_string(),"retryable":false}).to_string()),
+                }
+            }
+            name if is_traffic_tool(name) => {
+                let content = match context.run_id.as_deref() {
+                    Some(run_id) => self.execute_traffic_tool(run_id, session_id, name, &tc.id, &tc.arguments, &context.scope_snapshot).await,
+                    None => Err(anyhow::anyhow!("流量工具只能在已有执行 Run 中使用")),
+                };
+                super::tool_executor::ConversationToolResult {
+                    tool_call_id: tc.id.clone(), tool_name: tc.name.clone(),
+                    success: content.is_ok(),
+                    content: content.unwrap_or_else(|e| serde_json::json!({"error":e.to_string(),"retryable":false}).to_string()),
+                }
+            }
+            name if is_evidence_tool(name) => {
+                let content = match context.run_id.as_deref() {
+                    Some(run_id) => self.repository.execute_evidence_tool(run_id, name, &tc.arguments).await.map(|v| v.to_string()),
+                    None => Err(anyhow::anyhow!("Evidence 工具只能在已有执行 Run 中使用")),
+                };
+                super::tool_executor::ConversationToolResult {
+                    tool_call_id: tc.id.clone(), tool_name: tc.name.clone(),
+                    success: content.is_ok(),
+                    content: content.unwrap_or_else(|e| serde_json::json!({"error":e.to_string(),"retryable":false}).to_string()),
+                }
+            }
+            _ => super::tool_executor::execute_tool(&tc.name, &tc.arguments, &context.scope_snapshot, session_id).await,
+        }
+    }
+
+    /// Emit event to SSE sink and NATS (if connected).
+    async fn emit_event(&self, event: &str, payload: serde_json::Value) {
+        self.events.emit(event, payload.clone()).await.ok();
+        if let Some(ref nats) = self.nats {
+            let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+            nats.publish(&format!("penta.conversation.{}", event), &bytes).await;
+        }
     }
 
     async fn execute_knowledge_search(

@@ -80,6 +80,12 @@ pub(super) struct ScanProgress {
     evidence_tools: HashMap<String, String>,
     /// Whether traffic_replay was used successfully (E3 corroboration).
     traffic_replay_count: usize,
+    /// Per-tool consecutive failure count so the runtime can temporarily
+    /// remove exhausted tools from the model's catalog.
+    consecutive_tool_failures: HashMap<String, usize>,
+    /// Tools that have been temporarily removed from the catalog due to
+    /// consecutive failures. Cleared when any different tool succeeds.
+    exhausted_tools: HashSet<String>,
 }
 
 impl ScanProgress {
@@ -113,6 +119,8 @@ impl ScanProgress {
             tools_used: HashSet::new(),
             evidence_tools: HashMap::new(),
             traffic_replay_count: 0,
+            consecutive_tool_failures: HashMap::new(),
+            exhausted_tools: HashSet::new(),
         }
     }
 
@@ -162,12 +170,36 @@ impl ScanProgress {
             self.evidence_categories
                 .insert(ToolCategory::classify(tool_name));
             self.consecutive_no_progress = 0;
+            // Any successful observation clears per-tool failure tracking so
+            // previously-exhausted tools become available again.
+            self.consecutive_tool_failures.clear();
+            self.exhausted_tools.clear();
             return None;
         }
 
-        self.consecutive_no_progress += 1;
+        // A successful but fingerprint-identical result does not mean the
+        // tools are broken — it means the model needs to change strategy.
+        // Only failures, blocked calls and true duplicates increment the stall
+        // counter so a working-but-repetitive agent is caught by the budget
+        // limits (rounds / tokens / duration) instead of the stall detector.
+        if !success || duplicate_request {
+            self.consecutive_no_progress += 1;
+        }
         if !success {
             self.failed_calls += 1;
+            let failures = self
+                .consecutive_tool_failures
+                .entry(tool_name.to_string())
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+            if *failures >= 3 {
+                self.exhausted_tools.insert(tool_name.to_string());
+            }
+        } else {
+            // Successful but duplicate: clear failure streak for this specific
+            // tool (it still works), but keep exhausted set intact.
+            self.consecutive_tool_failures.remove(tool_name);
+            self.exhausted_tools.remove(tool_name);
         }
         if duplicate_request {
             self.duplicate_requests += 1;
@@ -230,6 +262,12 @@ impl ScanProgress {
 
     pub(super) fn stall_exhausted(&self) -> bool {
         self.consecutive_no_progress >= STALL_STOP_THRESHOLD
+    }
+
+    /// Tools that have failed ≥3 consecutive times and should be temporarily
+    /// removed from the model's catalog to force tool rotation.
+    pub(super) fn exhausted_tools(&self) -> &HashSet<String> {
+        &self.exhausted_tools
     }
 
     /// Reject a premature NO_PATH while the last call still produced new
@@ -658,7 +696,8 @@ mod tests {
                 r#"{"status":200,"body":"nonce abcdefghijklmnopqrstuvwxyz12 page"}"#,
             )),
         );
-        // Same page with a different nonce must NOT count as progress.
+        // Same page with a different nonce: a successful duplicate does NOT
+        // increment the stall counter (tools work, model must change strategy).
         let diagnostic = progress.record_tool_result(
             "http_request",
             true,
@@ -666,24 +705,41 @@ mod tests {
             true,
             r#"{"status":200,"body":"nonce zyxwvutsrqponmlkjihgfedcba987654 page"}"#,
         );
-        assert!(diagnostic.is_none(), "first no-progress call only warns at 3");
-        assert_eq!(progress.consecutive_no_progress(), 1);
+        assert!(diagnostic.is_none(), "successful repeat is not a stall");
+        assert_eq!(progress.consecutive_no_progress(), 0);
     }
 
     #[test]
-    fn repeated_results_trigger_stall_diagnostic() {
+    fn repeated_failures_trigger_stall_diagnostic() {
         let mut progress = ScanProgress::new("扫描 https://example.test");
         assert!(
             progress
                 .record_tool_result("http_request", true, false, true, r#"{"status":200}"#)
                 .is_none()
         );
+        // Successful duplicate results don't increment the stall counter.
         for _ in 0..2 {
             progress.record_tool_result("http_request", true, false, true, r#"{"status":200}"#);
         }
-        let diagnostic = progress
-            .record_tool_result("http_request", true, false, true, r#"{"status":200}"#)
-            .unwrap();
+        assert_eq!(
+            progress.consecutive_no_progress(),
+            0,
+            "successful duplicates are not stall"
+        );
+        // Failed calls DO increment the counter — that's the real stall signal.
+        let mut diagnostic = None;
+        for _ in 0..3 {
+            if let Some(d) = progress.record_tool_result(
+                "http_probe",
+                false,
+                false,
+                false,
+                r#"{"error":"network unreachable"}"#,
+            ) {
+                diagnostic = Some(d);
+            }
+        }
+        let diagnostic = diagnostic.expect("4th consecutive failure must emit diagnostic");
         assert!(diagnostic.contains("没有产生新观察"));
         assert!(diagnostic.contains("已用工具"));
         assert_eq!(progress.consecutive_no_progress(), 3);
@@ -700,28 +756,23 @@ mod tests {
             true,
             r#"{"status":200,"body":"<form action='/login'>"}"#,
         );
-        // Then stall on repeated requests
+        // Failed vuln-validation tools push the counter to the warning threshold.
+        let mut diagnostic = None;
         for _ in 0..3 {
-            progress.record_tool_result(
-                "http_request",
-                true,
+            if let Some(d) = progress.record_tool_result(
+                "sqli_validate",
                 false,
-                true,
-                r#"{"status":200,"body":"same"}"#,
-            );
+                false,
+                false,
+                r#"{"error":"no injection point configured"}"#,
+            ) {
+                diagnostic = Some(d);
+            }
         }
-        let diagnostic = progress
-            .record_tool_result(
-                "http_request",
-                true,
-                false,
-                true,
-                r#"{"status":200,"body":"same"}"#,
-            )
-            .unwrap();
+        let diagnostic = diagnostic.expect("3rd consecutive failure must emit diagnostic");
         assert!(
             diagnostic.contains("漏洞验证"),
-            "should suggest vuln validation after recon, got: {diagnostic}"
+            "should suggest vuln validation after recon failures, got: {diagnostic}"
         );
     }
 

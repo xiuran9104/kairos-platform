@@ -41,7 +41,7 @@ pub(crate) async fn execute_session_run(
         client_request_id: format!("run-{run_id}"),
         attachments: vec![],
     };
-    let runtime = super::build_runtime(pool);
+    let runtime = super::build_runtime(pool, None);
     match runtime.handle(&request).await {
         Ok(result) => {
             let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
