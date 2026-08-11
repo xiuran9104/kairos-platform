@@ -15,6 +15,9 @@ Pent 模块页面、组件、交互、路由、API 映射和 UI 验收标准见
 分层规划、PreFlect、动态重规划、多级反思和元认知控制的具体任务拆分见
 [ Pent H-PER-M 认知运行时实施任务书](./ Pent-H-PER-M认知运行时实施任务书.md)。
 
+与 DesRedTeam 的能力对照、已移植机制清单、剩余任务（D-xx）和移植边界见
+[Pent 与 DesRedTeam 对齐实施计划](./Pent-DesRed对齐实施计划.md)。
+
 ## 1. 背景与结论
 
 `/home/xiuran/PentAGI` 当前是一个本地优先的 Rust 安全智能工作台，主要入口是
