@@ -38,6 +38,15 @@ async fn main() -> anyhow::Result<()> {
     let config = PentConfig::from_env();
     let tokens = TokenService::new(SecurityConfig::from_env()?);
     let state = PentState::new(database.clone());
+    match kairos_platform_pent_server::infrastructure::recipe::load_from_db(&database).await {
+        Ok(count) => tracing::info!(count, "tool recipes loaded from pent_tool_definitions"),
+        Err(error) => tracing::warn!(%error, "tool recipe load failed; falling back to hardcoded registry"),
+    }
+    let _ = kairos_platform_pent_server::infrastructure::execution::init_global_executor(
+        std::sync::Arc::new(
+            kairos_platform_pent_server::infrastructure::execution::ElasticExecutor::from_env(),
+        ),
+    );
 
     // Start the worker for async task processing
     kairos_platform_pent_server::start_worker(

@@ -82,8 +82,12 @@ impl Default for ContainerLimits {
     }
 }
 
-/// Execute a tool command in a sandboxed environment.
-pub async fn execute_tool(
+/// Execute a tool command directly in a sandboxed environment.
+///
+/// This is the low-level implementation. Callers should usually use
+/// [`execute_tool`] so that the global elastic executor (concurrency limits,
+/// circuit breaker, cancellation) can participate.
+pub(crate) async fn execute_tool_direct(
     tool_name: &str,
     command: &[String],
     limits: &ContainerLimits,
@@ -146,6 +150,25 @@ pub async fn execute_tool(
         duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         audit,
     })
+}
+
+/// Execute a tool command in a sandboxed environment.
+///
+/// When a global elastic executor is initialized (via
+/// [`crate::infrastructure::execution::init_global_executor`]) this routes the
+/// call through the executor so that per-tool concurrency limits, circuit
+/// breaker, and cancellation are applied. Otherwise it falls back to the
+/// direct implementation.
+pub async fn execute_tool(
+    tool_name: &str,
+    command: &[String],
+    limits: &ContainerLimits,
+) -> Result<ToolOutput, String> {
+    if let Some(executor) = crate::infrastructure::execution::global_executor() {
+        executor.execute(tool_name, command, limits).await
+    } else {
+        execute_tool_direct(tool_name, command, limits).await
+    }
 }
 
 fn execution_audit(

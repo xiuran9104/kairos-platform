@@ -14,6 +14,12 @@ pub fn prepare_tool(
     request: &[String],
     network_policy: &NetworkPolicy,
 ) -> Result<PreparedTool, String> {
+    // Executable recipes loaded from pent_tool_definitions take precedence;
+    // the hardcoded whitelist below remains the fallback for builtin and
+    // not-yet-migrated tools.
+    if let Some(recipe) = super::recipe::lookup(tool_name) {
+        return super::recipe::render_recipe(&recipe, request, network_policy);
+    }
     let target = if tool_name == "http_request" {
         request.first()
     } else {
@@ -261,6 +267,17 @@ pub fn prepare_tool(
             container_image: toolkit_image(),
             args: vec![target.into()],
         }),
+        "httpx" => Ok(PreparedTool {
+            program: "/usr/bin/httpx",
+            container_image: toolkit_image(),
+            args: vec![
+                "-u".into(),
+                target.into(),
+                "-silent".into(),
+                "-json".into(),
+                "-no-color".into(),
+            ],
+        }),
         "wpscan" => Ok(PreparedTool {
             program: "/usr/bin/wpscan",
             container_image: toolkit_image(),
@@ -319,6 +336,21 @@ pub fn prepare_tool(
             program: "/usr/bin/hakrawler",
             container_image: toolkit_image(),
             args: vec!["-url".into(), target.into()],
+        }),
+        "katana" => Ok(PreparedTool {
+            program: "/usr/bin/katana",
+            container_image: toolkit_image(),
+            args: vec![
+                "-u".into(),
+                target.into(),
+                "-silent".into(),
+                "-json".into(),
+            ],
+        }),
+        "gau" => Ok(PreparedTool {
+            program: "/usr/bin/gau",
+            container_image: toolkit_image(),
+            args: vec![target.into()],
         }),
         "httrack" => Ok(PreparedTool {
             program: "/usr/bin/httrack",
@@ -394,6 +426,11 @@ pub fn prepare_tool(
             args: vec!["-r".into(), target.into()],
         }),
         // ── TLS scanners ────────────────────────────────────────────────────
+        "sslscan" => Ok(PreparedTool {
+            program: "/usr/bin/sslscan",
+            container_image: toolkit_image(),
+            args: vec!["--no-colour".into(), target.into()],
+        }),
         "sslyze" => Ok(PreparedTool {
             program: "/usr/bin/sslyze",
             container_image: toolkit_image(),
@@ -471,7 +508,7 @@ pub fn prepare_tool(
     }
 }
 
-fn toolkit_image() -> String {
+pub(crate) fn toolkit_image() -> String {
     std::env::var("PENTA_TOOLKIT_IMAGE")
         .unwrap_or_else(|_| "kairos-platform/pent-toolkit:kali-2026.1".to_string())
 }
@@ -485,7 +522,7 @@ fn normalize_http_probe_target(target: &str) -> String {
     }
 }
 
-fn validate_target(target: &str, policy: &NetworkPolicy) -> Result<(), String> {
+pub(crate) fn validate_target(target: &str, policy: &NetworkPolicy) -> Result<(), String> {
     if target.is_empty()
         || target.starts_with('-')
         || target.chars().any(char::is_whitespace)
@@ -597,13 +634,15 @@ mod tests {
             "ffuf", "gobuster", "nikto", "feroxbuster", "wfuzz",
             "hakrawler", "httrack", "arjun", "dirb", "dir_fuzz",
             "dirsearch",
-            // Fingerprinting
-            "whatweb", "wafw00f", "wpscan", "web_wordpress_scan",
+            // Fingerprinting / HTTP probe
+            "whatweb", "wafw00f", "httpx", "wpscan", "web_wordpress_scan",
+            // Crawling
+            "katana", "gau",
             // Injection
             "sqlmap", "sqlmap_scan", "xsser", "web_xss_scan",
             "dalfox", "commix",
             // TLS
-            "testssl", "web_tls_scan", "sslyze", "qsslcaudit",
+            "sslscan", "testssl", "web_tls_scan", "sslyze", "qsslcaudit",
             // Service enum
             "enum4linux", "smbmap", "smtp-user-enum", "swaks",
             "davtest", "nbtscan", "netdiscover",

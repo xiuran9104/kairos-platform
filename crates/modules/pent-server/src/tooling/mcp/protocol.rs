@@ -140,6 +140,7 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
     pub id: String,
+    /// Command to spawn for stdio transport. Ignored when `url` is set.
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -147,6 +148,20 @@ pub struct McpServerConfig {
     pub env: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub auto_start: bool,
+    /// Optional HTTP/SSE endpoint. When present, the client uses HTTP/SSE
+    /// transport instead of spawning a local child process.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra HTTP headers for HTTP/SSE transport (e.g., authorization).
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+impl McpServerConfig {
+    /// True when this server should be reached over HTTP/SSE instead of stdio.
+    pub fn is_http(&self) -> bool {
+        self.url.as_ref().is_some_and(|u| !u.is_empty())
+    }
 }
 
 impl Default for ClientCapabilities {

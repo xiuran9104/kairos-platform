@@ -78,6 +78,7 @@ kairos-platform-scan-api = { path = "crates/modules/scan-api" }
 kairos-platform-scan-server = { path = "crates/modules/scan-server" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
 async-nats = "0.38"

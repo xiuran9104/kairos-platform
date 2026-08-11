@@ -229,6 +229,18 @@ async fn applies_all_migrations_to_empty_postgres() {
     .expect("inspect active vulnerability validators");
     assert_eq!(active_validators, 6);
 
+    // YAML tool recipes: executable tools carry command + args templates in
+    // the executor JSON after the recipe import.
+    let recipe_backed_tools: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pent_tool_definitions
+         WHERE lifecycle_status='active'
+           AND executor ? 'args' AND executor ? 'command'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect recipe-backed tool executors");
+    assert!(recipe_backed_tools >= 60);
+
     let pent_event_trigger_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM pg_trigger

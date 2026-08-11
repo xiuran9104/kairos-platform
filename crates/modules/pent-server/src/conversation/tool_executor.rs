@@ -81,6 +81,7 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "nikto"
             | "whatweb"
             | "wafw00f"
+            | "httpx"
             | "wpscan"
             | "web_wordpress_scan"
             | "xsser"
@@ -92,6 +93,8 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "feroxbuster"
             | "wfuzz"
             | "hakrawler"
+            | "katana"
+            | "gau"
             | "httrack"
             | "arjun"
             | "dirb"
@@ -123,7 +126,9 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "bash"
             | "web_search"
     );
-    let implemented = implemented || tool_name.starts_with("mcp_");
+    let implemented = implemented
+        || tool_name.starts_with("mcp_")
+        || crate::infrastructure::recipe::has_executable(tool_name);
     implemented
         && (!NETWORK_TOOLS.contains(&tool_name)
             || docker_conversation_tool(tool_name)

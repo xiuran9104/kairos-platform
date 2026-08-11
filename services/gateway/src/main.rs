@@ -43,6 +43,15 @@ async fn main() -> anyhow::Result<()> {
     .await;
     let pent_state = kairos_platform_pent_server::PentState::new(database.clone())
         .with_nats(nats_bus.handle());
+    match kairos_platform_pent_server::infrastructure::recipe::load_from_db(&database).await {
+        Ok(count) => tracing::info!(count, "tool recipes loaded from pent_tool_definitions"),
+        Err(error) => warn!(%error, "tool recipe load failed; falling back to hardcoded registry"),
+    }
+    let _ = kairos_platform_pent_server::infrastructure::execution::init_global_executor(
+        std::sync::Arc::new(
+            kairos_platform_pent_server::infrastructure::execution::ElasticExecutor::from_env(),
+        ),
+    );
     kairos_platform_pent_server::start_worker(database.clone(), "worker-gateway".into(), 120).await;
     system_state.bootstrap().await?;
     // Recover orphaned conversation turns left from previous shutdown

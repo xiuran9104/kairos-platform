@@ -26,9 +26,11 @@ reqwest.workspace = true
 regex = "1"
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["io-util", "process", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
 uuid.workspace = true
 md-5 = "0.10"

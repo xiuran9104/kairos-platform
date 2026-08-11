@@ -86,11 +86,7 @@ impl McpRegistry {
     }
 
     async fn connect(config: &McpServerConfig) -> anyhow::Result<McpServerEntry> {
-        let client = McpClient::new(
-            config.id.clone(),
-            config.command.clone(),
-            config.args.clone(),
-        );
+        let client = McpClient::new(config);
         let init_result = client.start().await?;
         let tools = client.list_tools().await?;
         Ok(McpServerEntry {

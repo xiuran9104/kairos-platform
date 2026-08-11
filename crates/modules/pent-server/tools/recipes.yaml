@@ -1,0 +1,1398 @@
+# Pent 工具配方清单。
+#
+# 本文件是 pent_tool_definitions 的编写格式；运行时不直接读取本文件，
+# 由 `import_tool_recipes` 校验后 upsert 进数据库，gateway 启动时从数据库
+# 加载到内存配方表。executor.program/args 直接驱动执行，但保留以下约束：
+# 不使用 shell、program 必须在允许前缀内、目标仍受 Scope/NetworkPolicy 校验。
+recipes:
+  # ── 核心扫描 ──────────────────────────────────────────────────────────
+  - tool_id: tcp_scan
+    namespace: scanner
+    name: TCP 端口扫描
+    description: 基于 Nmap 执行 TCP 端口扫描与服务识别。
+    capabilities: [network, scanning, service-discovery]
+    tags: [nmap, port-scan, recon]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4, ipv6, cidr]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string, description: 目标 IP 或主机名}
+    executor:
+      type: container
+      program: /usr/bin/nmap
+      args: ["-sT", "-Pn", "--reason", "--", "{{target}}"]
+    resource_profile: {cpu_cores: 1, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: Nmap TCP 端口扫描与服务识别
+
+  - tool_id: nmap
+    namespace: scanner
+    name: Nmap
+    description: Nmap 端口扫描器。
+    capabilities: [network, scanning]
+    tags: [nmap, port-scan]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4, ipv6, cidr]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nmap
+      args: ["-sT", "-Pn", "--reason", "--", "{{target}}"]
+    resource_profile: {cpu_cores: 1, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: Nmap 端口扫描器
+
+  - tool_id: nmap_scan
+    namespace: scanner
+    name: Nmap 端口扫描
+    description: 基于 Nmap 执行 TCP/UDP 端口扫描与服务识别。支持自定义端口范围和扫描参数。
+    capabilities: [network, scanning, service-discovery]
+    tags: [nmap, port-scan, recon]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4, ipv6, cidr]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string, description: 目标 IP 或主机名}
+        ports: {type: string, description: 端口范围，如 80,443,8000-8100}
+    output_schema:
+      type: object
+      properties:
+        services: {type: array}
+        open_ports: {type: array}
+    executor:
+      type: container
+      program: /usr/bin/nmap
+      args: ["-sT", "-Pn", "--reason", "--", "{{target}}"]
+    resource_profile: {cpu_cores: 1, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: Nmap 网络扫描器安装及使用指南
+
+  - tool_id: http_probe
+    namespace: http
+    name: HTTP 探测
+    description: 使用 curl 对目标执行 HTTP/HTTPS 探测，返回状态行与响应头。
+    capabilities: [http, web, recon]
+    tags: [http, curl, probe]
+    risk_level: low
+    supported_target_types: [url, hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string, description: 目标 URL 或主机}
+    executor:
+      type: container
+      program: /usr/bin/curl
+      normalize_target: url_https
+      args: ["--silent", "--show-error", "--insecure", "--dump-header", "-", "--max-redirs", "0", "--max-time", "30", "--url", "{{target}}"]
+    resource_profile: {cpu_cores: 0.1, memory_mb: 32, timeout_seconds: 30}
+    embedding_document: curl HTTP 探测工具
+
+  - tool_id: http_request
+    namespace: http
+    name: HTTP 请求
+    description: 在 Docker 隔离执行器中发送有状态 HTTP 请求，支持 Cookie Jar、CSRF Token、重定向和表单编码。
+    capabilities: [http, request, web, stateful]
+    tags: [http, request, curl, web, cookie, csrf]
+    risk_level: low
+    supported_target_types: [url, hostname, ipv4]
+    input_schema:
+      type: object
+      required: [url]
+      properties:
+        url: {type: string}
+        method: {type: string}
+        body: {type: string}
+        form: {type: object}
+        headers: {type: object}
+        csrf_header: {type: string}
+    output_schema:
+      type: object
+      properties:
+        status: {type: integer}
+        raw_response: {type: string}
+        csrf_token_captured: {type: boolean}
+    executor:
+      # 复杂有状态逻辑（headers/body/form/cookie）保留内置 handler，
+      # 配方只提供元数据，不参与模板执行。
+      type: builtin
+    resource_profile: {cpu_cores: 0.1, memory_mb: 32, timeout_seconds: 30}
+    embedding_document: curl HTTP 请求工具使用文档
+
+  # ── 漏洞扫描 / 验证 ────────────────────────────────────────────────────
+  - tool_id: nuclei
+    namespace: scanner
+    name: Nuclei
+    description: 基于 Nuclei 的模板化漏洞扫描。
+    capabilities: [web, vulnerability, scanning]
+    tags: [nuclei, vuln, web]
+    risk_level: high
+    supported_target_types: [url, hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-jsonl", "-silent", "-no-interactsh"]
+    resource_profile: {cpu_cores: 1, memory_mb: 512, timeout_seconds: 600}
+    embedding_document: Nuclei 漏洞扫描器
+
+  - tool_id: web_vuln_scan
+    namespace: scanner
+    name: Web 漏洞扫描
+    description: 基于 Nuclei 执行 Web 应用漏洞扫描，支持自定义模板和严重级别过滤。
+    capabilities: [web, vulnerability, scanning]
+    tags: [nuclei, vuln, web, cve]
+    risk_level: high
+    supported_target_types: [url, hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string, description: 目标 URL 或主机}
+        severity: {type: string, description: 严重级别过滤 low,medium,high,critical}
+        templates: {type: string, description: Nuclei 模板路径或标签}
+    output_schema:
+      type: object
+      properties:
+        findings: {type: array}
+        templates_used: {type: integer}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-jsonl", "-silent", "-no-interactsh"]
+    resource_profile: {cpu_cores: 1, memory_mb: 512, timeout_seconds: 600}
+    embedding_document: Nuclei 漏洞扫描器使用指南
+
+  - tool_id: sqli_validate
+    namespace: scanner
+    name: SQL 注入验证
+    description: 使用 Nuclei sqli 标签模板验证 SQL 注入。
+    capabilities: [web, injection, sql, validation]
+    tags: [nuclei, sqli, validate]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-tags", "sqli", "-jsonl", "-silent", "-rate-limit", "5", "-bulk-size", "1", "-no-interactsh"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: SQL 注入验证
+
+  - tool_id: xss_validate
+    namespace: scanner
+    name: XSS 验证
+    description: 使用 Nuclei xss 标签模板验证跨站脚本。
+    capabilities: [web, xss, validation]
+    tags: [nuclei, xss, validate]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-tags", "xss", "-jsonl", "-silent", "-rate-limit", "5", "-bulk-size", "1", "-no-interactsh"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: XSS 验证
+
+  - tool_id: csrf_validate
+    namespace: scanner
+    name: CSRF 验证
+    description: 使用 Nuclei csrf 标签模板验证跨站请求伪造。
+    capabilities: [web, csrf, validation]
+    tags: [nuclei, csrf, validate]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-tags", "csrf", "-jsonl", "-silent", "-rate-limit", "5", "-bulk-size", "1", "-no-interactsh"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: CSRF 验证
+
+  - tool_id: command_injection_validate
+    namespace: scanner
+    name: 命令注入验证
+    description: 使用 Nuclei cmdi 标签模板验证命令注入。
+    capabilities: [web, injection, validation]
+    tags: [nuclei, cmdi, validate]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-tags", "cmdi", "-jsonl", "-silent", "-rate-limit", "5", "-bulk-size", "1", "-no-interactsh"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: 命令注入验证
+
+  - tool_id: file_inclusion_validate
+    namespace: scanner
+    name: 文件包含验证
+    description: 使用 Nuclei lfi 标签模板验证文件包含。
+    capabilities: [web, lfi, validation]
+    tags: [nuclei, lfi, validate]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-tags", "lfi", "-jsonl", "-silent", "-rate-limit", "5", "-bulk-size", "1", "-no-interactsh"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: 文件包含验证
+
+  - tool_id: file_upload_validate
+    namespace: scanner
+    name: 文件上传验证
+    description: 使用 Nuclei file-upload 标签模板验证文件上传缺陷。
+    capabilities: [web, upload, validation]
+    tags: [nuclei, file-upload, validate]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nuclei
+      args: ["-u", "{{target}}", "-tags", "file-upload", "-jsonl", "-silent", "-rate-limit", "5", "-bulk-size", "1", "-no-interactsh"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: 文件上传验证
+
+  - tool_id: afrog
+    namespace: scanner
+    name: Afrog
+    description: Afrog 漏洞扫描器。
+    capabilities: [web, vulnerability, scanning]
+    tags: [afrog, vuln]
+    risk_level: high
+    supported_target_types: [url, hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/local/bin/afrog
+      args: ["-t", "{{target}}", "-json"]
+    resource_profile: {cpu_cores: 1, memory_mb: 512, timeout_seconds: 600}
+    embedding_document: Afrog 漏洞扫描器
+
+  # ── 基础网络 ──────────────────────────────────────────────────────────
+  - tool_id: dns_lookup
+    namespace: network
+    name: DNS 查询
+    description: 使用 dig 查询目标 DNS 记录。
+    capabilities: [network, dns, recon]
+    tags: [dns, dig]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/dig
+      args: ["+short", "{{target}}"]
+    resource_profile: {cpu_cores: 0.1, memory_mb: 32, timeout_seconds: 30}
+    embedding_document: DNS 查询
+
+  - tool_id: ssh_exec
+    namespace: network
+    name: SSH 执行
+    description: 对目标执行受限 SSH 命令（需审批）。
+    capabilities: [network, ssh, execution]
+    tags: [ssh, exec]
+    risk_level: high
+    approval_policy: always
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/ssh
+      args: ["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", "{{target}}", "id; uptime; uname -a"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: SSH 执行
+
+  - tool_id: sql_query
+    namespace: network
+    name: SQL 查询
+    description: 对目标 PostgreSQL 执行受限查询。
+    capabilities: [network, database]
+    tags: [sql, psql]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/psql
+      args: ["-h", "{{target}}", "-c", "SELECT version()"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: SQL 查询
+
+  # ── 侦察 / 子域名 ──────────────────────────────────────────────────────
+  - tool_id: subfinder
+    namespace: recon
+    name: Subfinder
+    description: 被动子域名发现。
+    capabilities: [osint, subdomain, passive]
+    tags: [subfinder, subdomain, passive]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/subfinder
+      args: ["-d", "{{target}}", "-silent"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 128, timeout_seconds: 120}
+    embedding_document: Subfinder 被动子域名发现
+
+  - tool_id: amass
+    namespace: recon
+    name: Amass
+    description: 子域名枚举和网络映射。
+    capabilities: [osint, subdomain, enumeration]
+    tags: [amass, subdomain, enumeration]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/amass
+      args: ["enum", "-d", "{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 300}
+    embedding_document: Amass 子域名枚举
+
+  - tool_id: dnsx
+    namespace: recon
+    name: DNSx
+    description: 快速 DNS 工具包。
+    capabilities: [dns, fast, toolkit]
+    tags: [dnsx, dns, fast]
+    risk_level: low
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/dnsx
+      args: ["-d", "{{target}}", "-silent"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: DNSx 快速 DNS 工具包
+
+  - tool_id: masscan
+    namespace: recon
+    name: Masscan
+    description: 超高速端口扫描器。
+    capabilities: [network, scanning, masscan]
+    tags: [masscan, port-scan, fast]
+    risk_level: medium
+    supported_target_types: [ipv4, cidr]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+        rate: {type: integer}
+    executor:
+      type: container
+      program: /usr/bin/masscan
+      args: ["{{target}}", "-p", "1-65535", "--rate", "1000"]
+    resource_profile: {cpu_cores: 2, memory_mb: 512, timeout_seconds: 300}
+    embedding_document: Masscan 高速端口扫描
+
+  - tool_id: naabu
+    namespace: recon
+    name: Naabu
+    description: 快速端口扫描。
+    capabilities: [network, scanning]
+    tags: [naabu, port-scan]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/naabu
+      args: ["-host", "{{target}}", "-silent"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 120}
+    embedding_document: Naabu 端口扫描
+
+  # ── Web 发现 ──────────────────────────────────────────────────────────
+  - tool_id: ffuf
+    namespace: web
+    name: ffuf
+    description: Web 目录与参数 Fuzz。
+    capabilities: [web, fuzzing, discovery]
+    tags: [ffuf, fuzz]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/ffuf
+      args: ["-u", "{{target}}/FUZZ", "-w", "/usr/share/wordlists/dirb/common.txt", "-mc", "200,204,301,302,307,401,403,405,500"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 600}
+    embedding_document: ffuf 目录爆破
+
+  - tool_id: gobuster
+    namespace: web
+    name: Gobuster
+    description: 目录与文件爆破。
+    capabilities: [web, fuzzing, discovery]
+    tags: [gobuster, fuzz]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/gobuster
+      args: ["dir", "-u", "{{target}}", "-w", "/usr/share/wordlists/dirb/common.txt", "-q"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 600}
+    embedding_document: Gobuster 目录爆破
+
+  - tool_id: nikto
+    namespace: web
+    name: Nikto
+    description: Web 服务器漏洞扫描。
+    capabilities: [web, vulnerability, scanning]
+    tags: [nikto, vuln, web]
+    risk_level: medium
+    supported_target_types: [url, hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nikto
+      args: ["-h", "{{target}}", "-Format", "json"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 600}
+    embedding_document: Nikto Web 漏洞扫描
+
+  - tool_id: whatweb
+    namespace: web
+    name: WhatWeb
+    description: Web 技术栈指纹识别。
+    capabilities: [web, fingerprint, recon]
+    tags: [whatweb, fingerprint]
+    risk_level: low
+    supported_target_types: [url, hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/whatweb
+      args: ["{{target}}", "--no-errors"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: WhatWeb 指纹识别
+
+  - tool_id: wafw00f
+    namespace: web
+    name: Wafw00f
+    description: WAF 指纹识别。
+    capabilities: [web, fingerprint, waf]
+    tags: [wafw00f, waf]
+    risk_level: low
+    supported_target_types: [url, hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/wafw00f
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: Wafw00f WAF 识别
+
+  - tool_id: httpx
+    namespace: web
+    name: httpx
+    description: HTTP 服务探测与指纹。
+    capabilities: [web, http, recon]
+    tags: [httpx, http, probe]
+    risk_level: low
+    supported_target_types: [url, hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/httpx
+      args: ["-u", "{{target}}", "-silent", "-json", "-no-color"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: httpx HTTP 探测
+
+  - tool_id: wpscan
+    namespace: web
+    name: WPScan
+    description: WordPress 安全扫描。
+    capabilities: [web, wordpress, cms]
+    tags: [wpscan, wordpress]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/wpscan
+      args: ["--url", "{{target}}", "--no-update", "--format", "json"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 600}
+    embedding_document: WPScan WordPress 扫描
+
+  - tool_id: web_wordpress_scan
+    namespace: scanner
+    name: WordPress 安全扫描
+    description: 基于 WPScan 执行 WordPress 站点安全审计，检测插件/主题漏洞。
+    capabilities: [web, wordpress, cms]
+    tags: [wpscan, wordpress, cms, web]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [url]
+      properties:
+        url: {type: string, description: WordPress 站点 URL}
+    output_schema:
+      type: object
+      properties:
+        plugins: {type: array}
+        version: {type: string}
+        vulnerabilities: {type: array}
+    executor:
+      type: container
+      program: /usr/bin/wpscan
+      args: ["--url", "{{target}}", "--no-update", "--format", "json"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 600}
+    embedding_document: WPScan WordPress 安全扫描器文档
+
+  # ── 注入 ──────────────────────────────────────────────────────────────
+  - tool_id: sqlmap
+    namespace: web
+    name: SQLMap
+    description: 自动化 SQL 注入检测与利用。
+    capabilities: [web, injection, sql]
+    tags: [sqlmap, sqli]
+    risk_level: high
+    approval_policy: always
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/sqlmap
+      args: ["-u", "{{target}}", "--batch"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 900}
+    embedding_document: SQLMap 注入检测
+
+  - tool_id: sqlmap_scan
+    namespace: scanner
+    name: SQLMap 注入检测
+    description: 基于 sqlmap 自动检测和利用 SQL 注入漏洞。
+    capabilities: [web, injection, sql]
+    tags: [sqlmap, sqli, injection, web]
+    risk_level: high
+    approval_policy: always
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [url]
+      properties:
+        url: {type: string, description: 目标 URL}
+        method: {type: string, description: HTTP 方法}
+    output_schema:
+      type: object
+      properties:
+        findings: {type: array}
+        vulnerable: {type: boolean}
+    executor:
+      type: container
+      program: /usr/bin/sqlmap
+      args: ["-u", "{{target}}", "--batch"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 900}
+    embedding_document: SQLMap 自动化 SQL 注入工具使用指南
+
+  - tool_id: xsser
+    namespace: web
+    name: XSSer
+    description: XSS 自动化检测。
+    capabilities: [web, xss, injection]
+    tags: [xsser, xss]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/xsser
+      args: ["--url", "{{target}}", "--auto"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 300}
+    embedding_document: XSSer XSS 检测
+
+  - tool_id: commix
+    namespace: web
+    name: Commix
+    description: 命令注入自动化检测。
+    capabilities: [web, injection]
+    tags: [commix, cmdi]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/commix
+      args: ["--url", "{{target}}", "--batch"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 300}
+    embedding_document: Commix 命令注入检测
+
+  # ── TLS ───────────────────────────────────────────────────────────────
+  - tool_id: testssl
+    namespace: web
+    name: testssl
+    description: TLS/SSL 配置安全审计。
+    capabilities: [web, tls, ssl, crypto]
+    tags: [testssl, tls, ssl]
+    risk_level: medium
+    supported_target_types: [url, hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/testssl
+      args: ["--quiet", "{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 300}
+    embedding_document: testssl TLS 审计
+
+  - tool_id: web_tls_scan
+    namespace: scanner
+    name: TLS/SSL 安全检测
+    description: 基于 testssl.sh/sslscan 执行 TLS/SSL 配置安全审计。
+    capabilities: [web, tls, ssl, crypto]
+    tags: [testssl, sslscan, tls, ssl, crypto]
+    risk_level: medium
+    supported_target_types: [url, hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string, description: HTTPS URL、主机或 host:port}
+    output_schema:
+      type: object
+      properties:
+        grade: {type: string}
+        findings: {type: array}
+    executor:
+      type: container
+      program: /usr/bin/testssl
+      args: ["--quiet", "{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 300}
+    embedding_document: testssl.sh TLS 安全审计工具文档
+
+  - tool_id: sslscan
+    namespace: web
+    name: SSLScan
+    description: SSL/TLS 配置扫描。
+    capabilities: [web, tls, ssl]
+    tags: [sslscan, tls]
+    risk_level: medium
+    supported_target_types: [hostname, url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/sslscan
+      args: ["--no-colour", "{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: SSLScan TLS 扫描
+
+  - tool_id: sslyze
+    namespace: web
+    name: SSLyze
+    description: TLS 配置分析。
+    capabilities: [web, tls, ssl]
+    tags: [sslyze, tls]
+    risk_level: medium
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/sslyze
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: SSLyze TLS 分析
+
+  - tool_id: qsslcaudit
+    namespace: web
+    name: QSslCAudit
+    description: SSL/TLS 证书审计。
+    capabilities: [web, tls, ssl]
+    tags: [qsslcaudit, tls]
+    risk_level: medium
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/qsslcaudit
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: QSslCAudit 证书审计
+
+  # ── 目录与爬虫 ─────────────────────────────────────────────────────────
+  - tool_id: dir_fuzz
+    namespace: scanner
+    name: 目录/文件 Fuzz
+    description: 基于 ffuf/dirsearch 执行 Web 目录和文件爆破，发现隐藏资源。
+    capabilities: [web, fuzzing, discovery]
+    tags: [ffuf, dirsearch, fuzz, web]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [url]
+      properties:
+        url: {type: string, description: 目标 URL 或 URL 模板}
+        wordlist: {type: string, description: 字典路径}
+    output_schema:
+      type: object
+      properties:
+        total: {type: integer}
+        results: {type: array}
+    executor:
+      type: container
+      program: /usr/bin/dirsearch
+      args: ["-u", "{{target}}", "--quiet"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 600}
+    embedding_document: ffuf 目录爆破工具使用文档
+
+  - tool_id: dirsearch
+    namespace: web
+    name: Dirsearch
+    description: Web 目录扫描。
+    capabilities: [web, fuzzing, discovery]
+    tags: [dirsearch, fuzz]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/dirsearch
+      args: ["-u", "{{target}}", "--quiet"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 600}
+    embedding_document: Dirsearch 目录扫描
+
+  - tool_id: dirb
+    namespace: web
+    name: Dirb
+    description: Web 内容爆破。
+    capabilities: [web, fuzzing, discovery]
+    tags: [dirb, fuzz]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/dirb
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 600}
+    embedding_document: Dirb 内容爆破
+
+  - tool_id: feroxbuster
+    namespace: web
+    name: Feroxbuster
+    description: 高性能目录爆破。
+    capabilities: [web, fuzzing, discovery]
+    tags: [feroxbuster, fuzz]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/feroxbuster
+      args: ["-u", "{{target}}", "--quiet"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 600}
+    embedding_document: Feroxbuster 目录爆破
+
+  - tool_id: wfuzz
+    namespace: web
+    name: Wfuzz
+    description: Web Fuzz 工具。
+    capabilities: [web, fuzzing]
+    tags: [wfuzz, fuzz]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/wfuzz
+      args: ["-u", "{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 600}
+    embedding_document: Wfuzz Web Fuzz
+
+  - tool_id: hakrawler
+    namespace: web
+    name: Hakrawler
+    description: 快速 Web 爬虫。
+    capabilities: [web, crawl, discovery]
+    tags: [hakrawler, crawl]
+    risk_level: low
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/hakrawler
+      args: ["-url", "{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: Hakrawler 爬虫
+
+  - tool_id: katana
+    namespace: web
+    name: Katana
+    description: 下一代爬虫与 URL 发现。
+    capabilities: [web, crawl, discovery]
+    tags: [katana, crawl]
+    risk_level: low
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/katana
+      args: ["-u", "{{target}}", "-silent", "-json"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 128, timeout_seconds: 300}
+    embedding_document: Katana 爬虫
+
+  - tool_id: gau
+    namespace: web
+    name: Gau
+    description: 历史 URL 收集（Wayback 等）。
+    capabilities: [web, url, osint]
+    tags: [gau, url]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/gau
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: Gau 历史 URL 收集
+
+  - tool_id: httrack
+    namespace: web
+    name: HTTrack
+    description: 站点镜像抓取。
+    capabilities: [web, crawl, mirror]
+    tags: [httrack, mirror]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/httrack
+      args: ["{{target}}", "-O", "/tmp/httrack-out", "--quiet"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 600}
+    embedding_document: HTTrack 站点镜像
+
+  - tool_id: arjun
+    namespace: web
+    name: Arjun
+    description: HTTP 参数发现。
+    capabilities: [web, parameter, discovery]
+    tags: [arjun, parameter]
+    risk_level: low
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/arjun
+      args: ["-u", "{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: Arjun 参数发现
+
+  # ── DNS 枚举 ──────────────────────────────────────────────────────────
+  - tool_id: dnsrecon
+    namespace: recon
+    name: DNSRecon
+    description: DNS 枚举和信息收集。
+    capabilities: [dns, recon, enumeration]
+    tags: [dnsrecon, dns, enumeration]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/dnsrecon
+      args: ["-d", "{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 128, timeout_seconds: 120}
+    embedding_document: DNSRecon DNS 枚举
+
+  - tool_id: dnsenum
+    namespace: recon
+    name: DNSenum
+    description: DNS 枚举和信息收集工具。
+    capabilities: [dns, recon, enumeration]
+    tags: [dnsenum, dns, enumeration]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/dnsenum
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 128, timeout_seconds: 120}
+    embedding_document: DNSenum DNS 枚举
+
+  - tool_id: fierce
+    namespace: recon
+    name: Fierce
+    description: DNS 枚举工具。
+    capabilities: [dns, recon, enumeration]
+    tags: [fierce, dns, enumeration]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/fierce
+      args: ["--domain", "{{target}}"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: Fierce DNS 枚举
+
+  # ── OSINT ─────────────────────────────────────────────────────────────
+  - tool_id: dmitry
+    namespace: recon
+    name: DMitry
+    description: 深度信息收集工具。
+    capabilities: [osint, recon, information-gathering]
+    tags: [dmitry, osint, recon]
+    risk_level: low
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/dmitry
+      args: ["-s", "{{target}}"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 64, timeout_seconds: 60}
+    embedding_document: DMitry 信息收集
+
+  - tool_id: theharvester
+    namespace: recon
+    name: theHarvester
+    description: 邮箱和子域名收集工具。
+    capabilities: [osint, email, subdomain]
+    tags: [theharvester, osint, email]
+    risk_level: low
+    supported_target_types: [hostname]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/theharvester
+      args: ["-d", "{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 128, timeout_seconds: 180}
+    embedding_document: theHarvester 邮箱与子域名收集
+
+  # ── 服务枚举 ──────────────────────────────────────────────────────────
+  - tool_id: enum4linux
+    namespace: recon
+    name: Enum4linux
+    description: SMB/Windows 信息枚举。
+    capabilities: [network, smb, enumeration]
+    tags: [enum4linux, smb]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/enum4linux
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: Enum4linux SMB 枚举
+
+  - tool_id: smbmap
+    namespace: recon
+    name: SmbMap
+    description: SMB 共享枚举。
+    capabilities: [network, smb, enumeration]
+    tags: [smbmap, smb]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/smbmap
+      args: ["-H", "{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: SmbMap SMB 共享枚举
+
+  - tool_id: smtp-user-enum
+    namespace: recon
+    name: smtp-user-enum
+    description: SMTP 用户枚举。
+    capabilities: [network, smtp, enumeration]
+    tags: [smtp, user-enum]
+    risk_level: medium
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/smtp-user-enum
+      args: ["-M", "VRFY", "-t", "{{target}}"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 32, timeout_seconds: 60}
+    embedding_document: SMTP 用户枚举
+
+  - tool_id: swaks
+    namespace: recon
+    name: Swaks
+    description: SMTP 测试工具。
+    capabilities: [network, smtp]
+    tags: [swaks, smtp]
+    risk_level: low
+    supported_target_types: [hostname, ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/swaks
+      args: ["--server", "{{target}}", "--quit-after", "CONNECT"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 32, timeout_seconds: 60}
+    embedding_document: Swaks SMTP 测试
+
+  - tool_id: davtest
+    namespace: web
+    name: DAVTest
+    description: WebDAV 上传测试。
+    capabilities: [web, webdav]
+    tags: [davtest, webdav]
+    risk_level: medium
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/davtest
+      args: ["-url", "{{target}}"]
+    resource_profile: {cpu_cores: 0.3, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: DAVTest WebDAV 测试
+
+  - tool_id: nbtscan
+    namespace: recon
+    name: NBTscan
+    description: NetBIOS 名称扫描器。
+    capabilities: [network, netbios, windows]
+    tags: [nbtscan, netbios, smb]
+    risk_level: low
+    supported_target_types: [ipv4]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/nbtscan
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 32, timeout_seconds: 60}
+    embedding_document: NBTscan NetBIOS 扫描
+
+  - tool_id: netdiscover
+    namespace: recon
+    name: Netdiscover
+    description: ARP 网络发现工具。
+    capabilities: [network, discovery, arp]
+    tags: [netdiscover, arp, discovery]
+    risk_level: low
+    supported_target_types: [cidr]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/netdiscover
+      args: ["-r", "{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 64, timeout_seconds: 120}
+    embedding_document: Netdiscover ARP 发现
+
+  # ── Web 漏洞扫描 ───────────────────────────────────────────────────────
+  - tool_id: wapiti
+    namespace: web
+    name: Wapiti
+    description: Web 应用漏洞扫描。
+    capabilities: [web, vulnerability, scanning]
+    tags: [wapiti, vuln]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/wapiti
+      args: ["-u", "{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 900}
+    embedding_document: Wapiti 漏洞扫描
+
+  - tool_id: skipfish
+    namespace: web
+    name: Skipfish
+    description: Web 应用安全侦察。
+    capabilities: [web, vulnerability, scanning]
+    tags: [skipfish, vuln]
+    risk_level: high
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/skipfish
+      args: ["-o", "/tmp/skipfish-out", "{{target}}"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 256, timeout_seconds: 900}
+    embedding_document: Skipfish 安全侦察
+
+  - tool_id: lbd
+    namespace: web
+    name: LBD
+    description: 负载均衡检测。
+    capabilities: [web, recon]
+    tags: [lbd, load-balancer]
+    risk_level: low
+    supported_target_types: [hostname, url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/bin/lbd
+      args: ["{{target}}"]
+    resource_profile: {cpu_cores: 0.2, memory_mb: 32, timeout_seconds: 60}
+    embedding_document: LBD 负载均衡检测
+
+  - tool_id: dalfox
+    namespace: web
+    name: Dalfox
+    description: XSS 自动化检测与验证。
+    capabilities: [web, xss, injection]
+    tags: [dalfox, xss]
+    risk_level: high
+    approval_policy: always
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [target]
+      properties:
+        target: {type: string}
+    executor:
+      type: container
+      program: /usr/local/bin/dalfox
+      args: ["url", "{{target}}", "--silence"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 300}
+    embedding_document: Dalfox XSS 检测
+
+  - tool_id: web_xss_scan
+    namespace: scanner
+    name: XSS 跨站脚本检测
+    description: 基于 Dalfox 执行 XSS 漏洞自动化检测与验证。
+    capabilities: [web, xss, injection]
+    tags: [dalfox, xss, web, injection]
+    risk_level: high
+    approval_policy: always
+    supported_target_types: [url]
+    input_schema:
+      type: object
+      required: [url]
+      properties:
+        url: {type: string, description: 目标 URL}
+        method: {type: string}
+    output_schema:
+      type: object
+      properties:
+        poc: {type: string}
+        findings: {type: array}
+    executor:
+      type: container
+      program: /usr/local/bin/dalfox
+      args: ["url", "{{target}}", "--silence"]
+    resource_profile: {cpu_cores: 0.5, memory_mb: 128, timeout_seconds: 300}
+    embedding_document: Dalfox XSS 检测工具使用文档
