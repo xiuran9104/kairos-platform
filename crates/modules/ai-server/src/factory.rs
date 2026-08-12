@@ -105,7 +105,15 @@ impl AiModelFactory {
         let config = self.typed(id, AiModelType::Chat).await?;
         let platform = AiPlatform::parse(&config.platform)
             .ok_or_else(|| AppError::bad_request("unsupported AI platform"))?;
-        let mut body = serde_json::json!({"model":config.model,"messages":messages,"tools":tools,"tool_choice":"auto","temperature":temperature.unwrap_or(0.7)});
+        let mut body = serde_json::json!({
+            "model": config.model,
+            "messages": messages,
+            "temperature": temperature.unwrap_or(0.7)
+        });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::json!(tools);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
         if let Some(limit) = max_tokens {
             body["max_tokens"] = serde_json::json!(limit)
         }

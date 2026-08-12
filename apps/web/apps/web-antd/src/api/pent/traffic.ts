@@ -17,3 +17,7 @@ export function getPentTrafficPage(params: PentTrafficQuery) {
 export function getPentTrafficDetail(id: string) {
   return requestClient.get(`/pent/traffic/${id}`);
 }
+
+export function getPentRunTraffic(runId: string) {
+  return requestClient.get(`/pent/runs/${runId}/traffic`);
+}

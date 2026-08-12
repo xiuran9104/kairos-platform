@@ -38,8 +38,7 @@ impl ToolExecutionBackend for BuiltinExecutor {
                 tool_name: desc.tool_id.clone(),
                 target: inv.target.clone(),
                 status: ToolExecutionStatus::Succeeded,
-                summary: serde_json::to_string(&value)
-                    .unwrap_or_else(|_| "ok".into()),
+                summary: serde_json::to_string(&value).unwrap_or_else(|_| "ok".into()),
                 observations: vec![],
                 findings: vec![],
                 artifacts: vec![],

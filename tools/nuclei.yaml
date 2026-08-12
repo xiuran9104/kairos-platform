@@ -1,0 +1,14 @@
+name: nuclei
+short_description: 对授权 Web 目标执行 Nuclei 模板漏洞扫描。
+command: /usr/bin/nuclei
+args:
+  - -jsonl
+  - -silent
+  - -no-interactsh
+  - -u
+  - '{{target}}'
+parameters:
+  - name: target
+    type: string
+    description: 已授权的 HTTP(S) 目标。
+    required: true

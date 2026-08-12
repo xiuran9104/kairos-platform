@@ -2,8 +2,7 @@
 
 启元智能中台是面向智能业务研发与运营的一体化技术平台。平台以 Rust/Axum
 作为统一服务底座，以 Vue 3、Vben 和 Ant Design Vue 提供管理控制面，并通过模块化
-能力承载系统治理、AI 模型与 Agent、资产运营、自动化扫描、授权渗透测试和 Toon
-内容生产等不同业务域。
+能力承载系统治理、AI 模型与 Agent、资产运营、自动化扫描和授权渗透测试等不同业务域。
 
 ## 功能组成
 
@@ -13,7 +12,6 @@
 - Pent：授权渗透任务、Agent 会话、工具路由、安全护栏、运行时编排与结果追踪。
 - Scan：扫描器、扫描任务、资产发现及异构扫描结果归一化。
 - Asset Ops：资产、机房、区域、端点、指纹与风险运营能力。
-- Toonflow：项目、小说、剧本、事件、资产、分镜、音频、视频、Agent、提示词、Skill 和任务中心。
 - Media：素材上传及媒体基础能力。
 
 ## 环境要求
@@ -79,12 +77,18 @@ pnpm dev:antd
 ## 验证
 
 ```bash
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:9222/json/version
+/usr/bin/nmap -sT -Pn --reason -- 127.0.0.1
 cargo test --workspace
 bash script/test-database-migrations.sh
 bash script/test-ai-e2e.sh
 pnpm --dir apps/web --filter @vben/web-antd run typecheck
 pnpm --dir apps/web --filter @vben/web-antd run build
 ```
+
+Pent 主动检测工具走宿主机本地二进制，不走 Docker 工具镜像；Docker 仅推荐用于本地基础设施。
+如 `dalfox`、`nuclei`、`sqlmap` 等工具缺失，对应工具调用会失败，需要先在宿主机安装。
 
 ## 文档
 

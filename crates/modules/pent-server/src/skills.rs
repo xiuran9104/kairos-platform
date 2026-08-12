@@ -26,7 +26,8 @@ const ALLOWED_TRANSITIONS: &[(&str, &str)] = &[
 pub fn routes() -> Router<PentState> {
     Router::new()
         .route("/pent/skills", get(list_skills).post(create_skill))
-        .route("/pent/skills/{id}", get(get_skill))
+        .route("/pent/skills/stats", get(skill_stats).delete(reset_skill_stats))
+        .route("/pent/skills/{id}", get(get_skill).put(update_skill))
         .route("/pent/skills/{id}/status", put(update_skill_status))
 }
 
@@ -36,12 +37,18 @@ async fn list_skills(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let _tenant_id = security::tenant_id(&user)?;
-    let status = params.get("status").map(String::as_str).filter(|v| !v.is_empty());
+    let status = params
+        .get("status")
+        .map(String::as_str)
+        .filter(|v| !v.is_empty());
     let category = params
         .get("category")
         .map(String::as_str)
         .filter(|v| !v.is_empty());
-    let query = params.get("query").map(String::as_str).filter(|v| !v.is_empty());
+    let query = params
+        .get("query")
+        .map(String::as_str)
+        .filter(|v| !v.is_empty());
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT to_jsonb(s) FROM (
              SELECT id, name, title, description, category, risk_level, status,
@@ -69,14 +76,13 @@ async fn get_skill(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let _tenant_id = security::tenant_id(&user)?;
-    let value = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(s) FROM pent_skills s WHERE s.id=$1",
-    )
-    .bind(&id)
-    .fetch_optional(&s.pool)
-    .await
-    .map_err(|error| AppError::internal(error.to_string()))?
-    .ok_or_else(|| AppError::not_found("Skill 不存在"))?;
+    let value =
+        sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM pent_skills s WHERE s.id=$1")
+            .bind(&id)
+            .fetch_optional(&s.pool)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+            .ok_or_else(|| AppError::not_found("Skill 不存在"))?;
     Ok(Json(ApiResponse::new(value)))
 }
 
@@ -124,7 +130,11 @@ async fn create_skill(
     .bind(&id)
     .bind(name)
     .bind(title)
-    .bind(body.get("description").and_then(Value::as_str).unwrap_or(""))
+    .bind(
+        body.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    )
     .bind(
         body.get("category")
             .and_then(Value::as_str)
@@ -145,13 +155,12 @@ async fn create_skill(
     .execute(&s.pool)
     .await
     .map_err(|error| AppError::internal(format!("创建 Skill 失败（名称版本重复？）：{error}")))?;
-    let created = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(s) FROM pent_skills s WHERE s.id=$1",
-    )
-    .bind(&id)
-    .fetch_one(&s.pool)
-    .await
-    .map_err(|error| AppError::internal(error.to_string()))?;
+    let created =
+        sqlx::query_scalar::<_, Value>("SELECT to_jsonb(s) FROM pent_skills s WHERE s.id=$1")
+            .bind(&id)
+            .fetch_one(&s.pool)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
     Ok(Json(ApiResponse::new(created)))
 }
 
@@ -166,12 +175,11 @@ async fn update_skill_status(
         .get("status")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::bad_request("status 不能为空"))?;
-    let current: Option<String> =
-        sqlx::query_scalar("SELECT status FROM pent_skills WHERE id=$1")
-            .bind(&id)
-            .fetch_optional(&s.pool)
-            .await
-            .map_err(|error| AppError::internal(error.to_string()))?;
+    let current: Option<String> = sqlx::query_scalar("SELECT status FROM pent_skills WHERE id=$1")
+        .bind(&id)
+        .fetch_optional(&s.pool)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
     let current = current.ok_or_else(|| AppError::not_found("Skill 不存在"))?;
     if current == target {
         return Err(AppError::bad_request("状态未变化"));
@@ -191,6 +199,143 @@ async fn update_skill_status(
     .await
     .map_err(|error| AppError::internal(error.to_string()))?;
     Ok(Json(ApiResponse::new(updated)))
+}
+
+async fn update_skill(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let _tenant_id = security::tenant_id(&user)?;
+    let current: Option<String> = sqlx::query_scalar("SELECT status FROM pent_skills WHERE id=$1")
+        .bind(&id)
+        .fetch_optional(&s.pool)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let current = current.ok_or_else(|| AppError::not_found("Skill 不存在"))?;
+    if !matches!(current.as_str(), "draft" | "reviewed") {
+        return Err(AppError::bad_request(format!(
+            "仅 draft/reviewed 状态的 Skill 可编辑，当前状态：{current}"
+        )));
+    }
+    if let Some(name) = body.get("name").and_then(Value::as_str) {
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            || name.len() < 2
+            || name.len() > 64
+        {
+            return Err(AppError::bad_request(
+                "name 只能包含小写字母、数字和中划线，长度 2-64",
+            ));
+        }
+    }
+    let updated = sqlx::query_scalar::<_, Value>(
+        "UPDATE pent_skills SET
+             name=COALESCE($2, name),
+             title=COALESCE($3, title),
+             description=COALESCE($4, description),
+             category=COALESCE($5, category),
+             risk_level=COALESCE($6, risk_level),
+             content=COALESCE($7, content),
+             revision=revision+1,
+             updated_at=now()
+         WHERE id=$1 RETURNING to_jsonb(pent_skills)",
+    )
+    .bind(&id)
+    .bind(body.get("name").and_then(Value::as_str))
+    .bind(body.get("title").and_then(Value::as_str))
+    .bind(body.get("description").and_then(Value::as_str))
+    .bind(body.get("category").and_then(Value::as_str))
+    .bind(body.get("risk_level").and_then(Value::as_str))
+    .bind(body.get("content").and_then(Value::as_str))
+    .fetch_one(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(format!("更新 Skill 失败（名称版本重复？）：{error}")))?;
+    Ok(Json(ApiResponse::new(updated)))
+}
+
+async fn skill_stats(
+    State(s): State<PentState>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let stats = sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(jsonb_agg(bucket ORDER BY (bucket->>'total_calls')::int DESC), '[]'::jsonb)
+         FROM (
+             SELECT jsonb_build_object(
+                 'skill_name', c.params_summary->>'name',
+                 'total_calls', count(*),
+                 'success_calls', count(*) FILTER (WHERE c.exit_code=0),
+                 'failed_calls', count(*) FILTER (WHERE c.completed_at IS NOT NULL AND c.exit_code<>0),
+                 'last_call_time', max(c.created_at)
+             ) AS bucket
+             FROM pent_tool_calls c JOIN pent_runs r ON r.id=c.run_id
+             WHERE c.tool_name='skill_load' AND r.tenant_id=$1
+               AND c.created_at >= COALESCE(
+                   (SELECT stats_since FROM pent_skill_stats_meta WHERE tenant_id=$1),
+                   '-infinity'
+               )
+             GROUP BY c.params_summary->>'name'
+         ) t",
+    )
+    .bind(tenant_id)
+    .fetch_one(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    let total_skills: i64 = sqlx::query_scalar("SELECT count(*) FROM pent_skills")
+        .fetch_one(&s.pool)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let total_calls: i64 = stats
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["total_calls"].as_i64())
+                .sum()
+        })
+        .unwrap_or(0);
+    let total_success: i64 = stats
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["success_calls"].as_i64())
+                .sum()
+        })
+        .unwrap_or(0);
+    let total_failed: i64 = stats
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["failed_calls"].as_i64())
+                .sum()
+        })
+        .unwrap_or(0);
+    Ok(Json(ApiResponse::new(json!({
+        "total_skills": total_skills,
+        "total_calls": total_calls,
+        "total_success": total_success,
+        "total_failed": total_failed,
+        "stats": stats,
+    }))))
+}
+
+async fn reset_skill_stats(
+    State(s): State<PentState>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let stats_since = sqlx::query_scalar::<_, Value>(
+        "INSERT INTO pent_skill_stats_meta(tenant_id, stats_since) VALUES($1, now())
+         ON CONFLICT(tenant_id) DO UPDATE SET stats_since=now()
+         RETURNING to_jsonb(pent_skill_stats_meta)->'stats_since'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    Ok(Json(ApiResponse::new(json!({"stats_since": stats_since}))))
 }
 
 /// Agent-facing: index of published skills (no content bodies).
@@ -324,12 +469,7 @@ mod tests {
             .await
             .expect("load skill");
         assert_eq!(loaded["title"], "SQL 注入验证");
-        assert!(
-            loaded["content"]
-                .as_str()
-                .unwrap()
-                .contains("证据要求")
-        );
+        assert!(loaded["content"].as_str().unwrap().contains("证据要求"));
         assert_eq!(loaded["truncated"], false);
         assert!(loaded["manifest"]["required_tools"].is_array());
 

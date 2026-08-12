@@ -18,50 +18,12 @@ async fn applies_all_migrations_to_empty_postgres() {
         .expect("read migration history");
     assert_eq!(applied, 1);
 
-    let storyboard_asset_order_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-           SELECT 1 FROM information_schema.columns
-           WHERE table_schema='toonflow'
-             AND table_name='assets_storyboards'
-             AND column_name='sort_order'
-         )",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("inspect storyboard asset ordering column");
-    assert!(storyboard_asset_order_exists);
-
-    // AI-02: workflow migration columns
-    for (table, column) in [
-        ("toonflow.projects", "global_seed"),
-        ("toonflow.storyboards", "confirm_state"),
-        ("toonflow.tasks", "payload"),
-        ("toonflow.tasks", "cancel_requested"),
-        ("toonflow.tasks", "progress"),
-        ("toonflow.assets", "scope"),
-        ("toonflow.images", "seed"),
-        ("toonflow.videos", "seed"),
-    ] {
-        let row: Option<(bool,)> = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema||'.'||table_name=$1 AND column_name=$2)",
-        )
-        .bind(table)
-        .bind(column)
-        .fetch_optional(&pool)
-        .await
-        .expect("inspect workflow column");
-        let exists = row.is_some_and(|(found,)| found);
-        assert!(exists, "workflow column {table}.{column} must exist");
-    }
-
     for table in [
         "ai.model_configs",
         "ai.chat_roles",
         "ai.knowledge_segments",
         "ai.images",
         "ai.music",
-        "toonflow.projects",
-        "toonflow.project_assets",
         "system_users",
         "system_role",
         "system_menu",
@@ -79,6 +41,13 @@ async fn applies_all_migrations_to_empty_postgres() {
         "pent_skills",
         "pent_tool_calls",
         "pent_workers",
+        "pent_mcp_servers",
+        "pent_knowledge_retrieval_logs",
+        "pent_skill_stats_meta",
+        "pent_assets",
+        "pent_facts",
+        "pent_fact_edges",
+        "pent_workflows",
         "yudao_demo01_contact",
         "yudao_demo02_category",
         "yudao_demo03_student",
@@ -92,20 +61,35 @@ async fn applies_all_migrations_to_empty_postgres() {
             .expect("inspect expected table");
         assert!(exists, "expected table {table}");
     }
-    for removed in ["toonflow.vendor_configs", "toonflow.model_prompts"] {
-        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(removed)
-            .fetch_one(&pool)
-            .await
-            .expect("inspect removed table");
-        assert!(!exists, "legacy table {removed} must be removed");
-    }
+    let toon_schema_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM pg_namespace WHERE nspname IN ('toon', 'toonflow')
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect removed Toon schemas");
+    assert!(!toon_schema_exists, "Toon schemas must be removed");
     let menu = sqlx::query("SELECT component,deleted FROM system_menu WHERE id=30006")
         .fetch_one(&pool)
         .await
         .expect("AI model menu exists");
     assert_eq!(menu.get::<String, _>("component"), "ai/model/model/index");
     assert_eq!(menu.get::<i16, _>("deleted"), 1);
+
+    let pent_capability_ops_menus: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM system_menu
+         WHERE deleted = 0 AND status = 0
+           AND id IN (30500, 30501, 30502, 30503, 30504, 30505, 30506, 30507, 30508,
+                      30510, 30511, 30512, 30513, 30514, 30515, 30516, 30517)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read pent capability/ops menus");
+    assert_eq!(
+        pent_capability_ops_menus, 17,
+        "pent capability/ops menus must be bootstrapped"
+    );
 
     let duplicate_route_names: i64 = sqlx::query_scalar(
         "SELECT count(*)
@@ -168,7 +152,7 @@ async fn applies_all_migrations_to_empty_postgres() {
          WHERE deleted=0 AND type=3
            AND permission IN (
                'pent:project:create','pent:task:create','pent:task:cancel',
-               'pent:run:execute','pent:approval:decide','pent:evidence:read',
+               'pent:run:execute','pent:evidence:read',
                'pent:artifact:download','pent:tool:manage',
                'pent:rmos:feedback','pent:settings:manage'
            )",
@@ -177,7 +161,7 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("read Pent action permissions");
     assert_eq!(
-        pent_action_permissions, 10,
+        pent_action_permissions, 9,
         "all Pent action permissions must be seeded"
     );
 
@@ -193,6 +177,206 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("inspect Pent run state columns");
     assert_eq!(pent_runtime_columns, 6);
+
+    let cloud_hierarchy_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public'
+           AND (table_name,column_name) IN (
+               ('scan_cloud_zones','zone_type'),
+               ('scan_cloud_zones','provider_id'),
+               ('scan_machine_rooms','platform_id')
+           )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cloud resource hierarchy columns");
+    assert_eq!(cloud_hierarchy_columns, 3);
+
+    let machine_room_has_duplicate_provider: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='scan_machine_rooms'
+              AND column_name='provider_id'
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect machine room ownership columns");
+    assert!(
+        !machine_room_has_duplicate_provider,
+        "machine room provider must be derived through its cloud platform"
+    );
+
+    let platform_has_duplicate_provider: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='scan_cloud_platforms'
+              AND column_name='provider_id'
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cloud platform ownership columns");
+    assert!(
+        !platform_has_duplicate_provider,
+        "cloud platform provider must be derived through its cloud zone"
+    );
+
+    let zone_provider_binding_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.scan_cloud_zone_providers') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect cloud zone provider binding table");
+    assert!(
+        !zone_provider_binding_exists,
+        "a cloud zone belongs to one operator directly; no join table is needed"
+    );
+
+    let provider_config_binds_only_platform: bool = sqlx::query_scalar(
+        "SELECT
+           EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='scan_cloud_provider_configs' AND column_name='platform_id')
+           AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='scan_cloud_provider_configs' AND column_name='zone_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cloud provider config hierarchy columns");
+    assert!(
+        provider_config_binds_only_platform,
+        "cloud provider config must bind only to its cloud platform"
+    );
+
+    let provider_auth_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_cloud_provider_configs'
+           AND column_name IN ('auth_type','auth_username','auth_password','auth_domain','project_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cloud provider authentication columns");
+    assert_eq!(provider_auth_columns, 5);
+
+    let cloud_instance_source_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_business_resources'
+           AND column_name='cloud_provider_config_id' AND is_nullable='YES')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cloud instance reconciliation source");
+    assert!(cloud_instance_source_exists);
+
+    let physical_resource_location_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_business_resources'
+           AND column_name='machine_room_id' AND is_nullable='YES')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect optional physical resource machine room");
+    assert!(physical_resource_location_exists);
+
+    let physical_resource_network_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_business_resources'
+           AND column_name IN ('deployment_type','management_ip','business_ip','network_cidr','gateway','vlan_id','dns_servers','mac_address','switch_name','switch_port')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect physical resource network columns");
+    assert_eq!(physical_resource_network_columns, 10);
+
+    let physical_rack_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_business_resources'
+           AND column_name IN ('cabinet_id','cabinet_name','chassis_name','chassis_slot','rack_start_u','rack_end_u')",
+    ).fetch_one(&pool).await.expect("inspect physical rack location columns");
+    assert_eq!(physical_rack_columns, 6);
+
+    for table in ["scan_cabinet_rows", "scan_cabinets"] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("inspect cabinet inventory table");
+        assert!(exists, "expected cabinet inventory table {table}");
+    }
+
+    let infrastructure_device_table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.scan_infrastructure_devices') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect infrastructure device table");
+    assert!(infrastructure_device_table_exists);
+
+    let infrastructure_menu_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM system_menu WHERE id IN (30311,30313,30314,30315,30316,30317)
+           AND parent_id=30310 AND deleted=0
+           AND name IN ('机房管理','安全设备','物理服务器','网络设备','存储设备','机柜布局')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect infrastructure menus");
+    assert_eq!(infrastructure_menu_count, 6);
+
+    let scan_task_scanner_column: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_tasks' AND column_name='scanner_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect scan task scanner binding");
+    assert_eq!(scan_task_scanner_column, 1);
+
+    let scanner_menu_name: String =
+        sqlx::query_scalar("SELECT name FROM system_menu WHERE id=30304 AND deleted=0")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect scanner menu name");
+    assert_eq!(scanner_menu_name, "扫描节点");
+
+    let scanner_agent_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_scanners'
+           AND column_name IN ('registration_token_hash','token_expires_at','agent_status','agent_version','agent_hostname','agent_ip','capabilities','registered_at','last_heartbeat')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect scanner agent registration columns");
+    assert_eq!(scanner_agent_columns, 9);
+
+    let service_provider_menu_name: String =
+        sqlx::query_scalar("SELECT name FROM system_menu WHERE id=30312 AND deleted=0")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect service provider menu name");
+    assert_eq!(service_provider_menu_name, "服务商");
+
+    let resource_ticket_workflow_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_resource_tickets'
+           AND column_name IN ('applicant_name','application_name','contract_name','data_disk','expire_at','security_products','delivery_status')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect resource ticket workflow columns");
+    assert_eq!(resource_ticket_workflow_columns, 7);
+
+    let resource_ticket_approval_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_resource_tickets'
+           AND column_name IN ('ticket_type','risk_level','target_resource_id','maintenance_window','backup_confirmed','rollback_plan','approval_stage','approval_total','current_approval_role')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect multi-level approval columns");
+    assert_eq!(resource_ticket_approval_columns, 9);
+    let approval_history_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.scan_resource_ticket_approvals') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect resource ticket approval history table");
+    assert!(approval_history_exists);
 
     let finding_evidence_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns
@@ -215,6 +399,43 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("inspect default Pent approval policy");
     assert!(medium_risk_requires_approval);
+
+    let hitl_policy_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='pent_runtime_policies'
+           AND column_name IN (
+               'hitl_enabled','hitl_mode','hitl_reviewer','hitl_tool_whitelist',
+               'hitl_audit_model_id','hitl_audit_system_prompt','hitl_audit_user_prompt'
+           )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect HITL policy columns");
+    assert_eq!(hitl_policy_columns, 7);
+
+    let agent_config_valid: bool = sqlx::query_scalar(
+        "SELECT jsonb_typeof(agent_config)='object'
+                AND agent_config->>'orchestration'='deep'
+                AND (agent_config->>'run_retry_max_attempts')::int=4
+         FROM pent_runtime_policies WHERE tenant_id=0",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect DesRed-compatible Agent defaults");
+    assert!(agent_config_valid);
+
+    let hitl_approval_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='pent_approvals'
+           AND column_name IN (
+               'hitl_mode','reviewer','original_arguments','effective_arguments',
+               'audit_request','audit_response','decision_comment','resumed_at'
+           )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect HITL approval columns");
+    assert_eq!(hitl_approval_columns, 8);
 
     let active_validators: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pent_tool_definitions

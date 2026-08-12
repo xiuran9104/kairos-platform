@@ -6,6 +6,8 @@ const routes: RouteRecordRaw[] = [
     name: 'Scan',
     meta: { title: '安全扫描', icon: 'lucide:shield-check', order: 30 },
     children: [
+      { path: '/asset-ops/physical-server', component: () => import('#/views/asset-ops/physical-server/index.vue'), name: 'ScanPhysicalServer', meta: { title: '物理服务器', icon: 'lucide:server' } },
+      { path: '/asset-ops/network-device', component: () => import('#/views/asset-ops/network-device/index.vue'), name: 'ScanNetworkDevice', meta: { title: '网络设备', icon: 'lucide:network' } },
       {
         path: '/asset-ops/dashboard',
         component: () => import('#/views/asset-ops/dashboard/index.vue'),
@@ -28,7 +30,7 @@ const routes: RouteRecordRaw[] = [
         path: '/asset-ops/scanner',
         component: () => import('#/views/asset-ops/scanner/index.vue'),
         name: 'ScanScanner',
-        meta: { title: '扫描器', icon: 'lucide:scan-search' },
+        meta: { title: '扫描节点', icon: 'lucide:scan-search' },
       },
       {
         path: '/asset-ops/task',
@@ -50,23 +52,26 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '基础设施', icon: 'lucide:building-2', order: 31 },
     children: [
       {
-        path: '/asset-ops/machine-room',
+        path: '/asset-ops/infra/machine-room',
+        alias: ['/asset-ops/machine-room', '/asset-ops/cloud/machine-room'],
         component: () => import('#/views/asset-ops/machine-room/index.vue'),
         name: 'ScanMachineRoom',
         meta: { title: '机房管理', icon: 'lucide:warehouse' },
       },
       {
-        path: '/asset-ops/service-provider',
-        component: () => import('#/views/asset-ops/service-provider/index.vue'),
-        name: 'ScanServiceProvider',
-        meta: { title: '服务商管理', icon: 'lucide:truck' },
+        path: '/asset-ops/infra/cabinet',
+        alias: '/asset-ops/cloud/cabinet',
+        component: () => import('#/views/asset-ops/cabinet/index.vue'),
+        name: 'ScanCabinet',
+        meta: { title: '机柜布局', icon: 'lucide:columns-3' },
       },
       {
         path: '/asset-ops/security-product',
         component: () => import('#/views/asset-ops/security-product/index.vue'),
         name: 'ScanSecurityProduct',
-        meta: { title: '安全产品', icon: 'lucide:shield' },
+        meta: { title: '安全设备', icon: 'lucide:shield' },
       },
+      { path: '/asset-ops/storage-device', component: () => import('#/views/asset-ops/storage-device/index.vue'), name: 'ScanStorageDevice', meta: { title: '存储设备', icon: 'lucide:database' } },
     ],
   },
   {
@@ -75,10 +80,16 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '云平台管理', icon: 'lucide:cloud', order: 32 },
     children: [
       {
+        path: '/asset-ops/service-provider',
+        component: () => import('#/views/asset-ops/service-provider/index.vue'),
+        name: 'ScanServiceProvider',
+        meta: { title: '服务商', icon: 'lucide:briefcase-business' },
+      },
+      {
         path: '/asset-ops/cloud-zone',
         component: () => import('#/views/asset-ops/cloud-platform/zone.vue'),
         name: 'ScanCloudZone',
-        meta: { title: '云区管理', icon: 'lucide:map-pin' },
+        meta: { title: '云资源区', icon: 'lucide:map-pin' },
       },
       {
         path: '/asset-ops/cloud-platform',
@@ -96,7 +107,7 @@ const routes: RouteRecordRaw[] = [
         path: '/asset-ops/cloud-service-asset',
         component: () => import('#/views/asset-ops/cloud-service-asset/index.vue'),
         name: 'ScanCloudServiceAsset',
-        meta: { title: '云服务资产', icon: 'lucide:server' },
+        meta: { title: '云资源实例', icon: 'lucide:server' },
       },
     ],
   },

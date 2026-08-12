@@ -1,14 +1,13 @@
 <script lang="ts" setup>
 import { ref, onMounted, computed } from 'vue';
-import { useRouter } from 'vue-router';
 import { Page } from '@vben/common-ui';
 import { message } from 'ant-design-vue';
 import { createAsset, getAssetList, updateAsset } from '#/api/scan/asset';
 import type { ScanAssetApi } from '#/api/scan/asset';
 
 type Asset = ScanAssetApi.Asset;
-const router = useRouter();
-const data = ref<Asset[]>([]); const loading = ref(false); const modalVisible = ref(false); const searchText = ref(''); const editingId = ref<number>();
+type UnifiedAsset = Omit<Asset, 'id'> & { id:string;record_id:number;source_type:'scan'|'cloud_platform'|'physical_inventory';source_label:string;editable:boolean;status:string;deployment_type?:string };
+const data = ref<UnifiedAsset[]>([]); const loading = ref(false); const modalVisible = ref(false); const searchText = ref(''); const editingId = ref<number>();
 const form = ref<Asset>({ name:'',ip:'',zone:'Intranet',ports:[],weight:50,labels:[] });
 
 const filtered = computed(() => {
@@ -21,7 +20,7 @@ const zoneInfo:Record<string,{color:string;bg:string;label:string}> = { Internet
 async function fetchData() { loading.value=true; try { data.value=(await getAssetList()) as any; } catch { message.error('加载失败'); } finally { loading.value=false; } }
 onMounted(fetchData);
 function openCreate() { editingId.value=undefined; form.value={ name:'',ip:'',zone:'Intranet',ports:[],weight:50,labels:[] }; modalVisible.value=true; }
-function openEdit(r:Asset) { editingId.value=r.id; form.value={...r}; modalVisible.value=true; }
+function openEdit(r:UnifiedAsset) { if (!r.editable) return; editingId.value=r.record_id; form.value={name:r.name,ip:r.ip,zone:r.zone,ports:r.ports,weight:r.weight,labels:r.labels,os:r.os,device_type:r.device_type,owner:r.owner,contact_person:r.contact_person,contact_phone:r.contact_phone}; modalVisible.value=true; }
 async function handleSubmit() {
   if (editingId.value) { await updateAsset(editingId.value,form.value as any); message.success('已更新'); } else { await createAsset(form.value as any); message.success('已创建'); }
   modalVisible.value=false; fetchData();
@@ -30,18 +29,18 @@ async function handleSubmit() {
 const viewMode = ref<'grid'|'table'>('grid');
 const statCards = [
   { title:'资产总数', value:()=>data.value.length, color:'var(--ant-color-primary)', bg:'#e6f4ff', icon:'lucide:hard-drive' },
-  { title:'外网资产', value:()=>data.value.filter(a=>a.zone==='Internet').length, color:'var(--ant-color-error)', bg:'#fff1f0', icon:'lucide:globe' },
-  { title:'内网资产', value:()=>data.value.filter(a=>a.zone==='Intranet').length, color:'var(--ant-color-success)', bg:'#f6ffed', icon:'lucide:lock' },
-  { title:'DMZ资产', value:()=>data.value.filter(a=>a.zone==='DMZ').length, color:'var(--ant-color-warning)', bg:'#fff7e6', icon:'lucide:shield-alert' },
+  { title:'云平台资源', value:()=>data.value.filter(a=>a.source_type==='cloud_platform').length, color:'#1677ff', bg:'#e6f4ff', icon:'lucide:cloud' },
+  { title:'物理基础设施', value:()=>data.value.filter(a=>a.source_type==='physical_inventory').length, color:'#722ed1', bg:'#f9f0ff', icon:'lucide:server' },
+  { title:'扫描发现资产', value:()=>data.value.filter(a=>a.source_type==='scan').length, color:'var(--ant-color-success)', bg:'#f6ffed', icon:'lucide:scan-search' },
 ];
 </script>
 
 <template>
   <Page auto-content-height>
     <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
-      <a-page-header title="资产管理" sub-title="网络资产发现 · 端口绑定 · 权责分配" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
+      <a-page-header title="资产管理" sub-title="统一汇总云平台资源、物理基础设施和扫描发现资产" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
         <template #extra>
-          <a-space>
+          <a-space :size="16">
             <a-input-search v-model:value="searchText" placeholder="搜索资产名称/IP/负责人..." style="width:260px" allow-clear />
             <a-segmented v-model:value="viewMode" :options="[{value:'grid',label:'卡片'},{value:'table',label:'列表'}]" />
             <a-button @click="fetchData"><Icon icon="lucide:refresh-cw" /> 刷新</a-button>
@@ -77,6 +76,7 @@ const statCards = [
                 <a-tag :color="zoneInfo[item.zone]?.color" size="small" style="margin-left:auto">{{ zoneInfo[item.zone]?.label||item.zone }}</a-tag>
               </div>
             </template>
+            <div style="margin-bottom:8px"><a-tag color="blue">{{ item.source_label }}</a-tag><a-tag>{{ item.device_type }}</a-tag></div>
             <div style="font-size:13px;color:#666;margin-bottom:4px"><Icon icon="lucide:wifi" style="margin-right:4px;color:#999" />{{ item.ip }}</div>
             <div style="font-size:12px;color:#999;margin-bottom:8px">
               <span v-if="item.os"><Icon icon="lucide:monitor" style="margin-right:4px" />{{ item.os }}</span>
@@ -90,7 +90,7 @@ const statCards = [
             </div>
             <a-row :gutter="8">
               <a-col :span="16"><a-progress :percent="item.weight" :size="20" :show-info="false" :stroke-color="item.weight>70?'var(--ant-color-error)':item.weight>40?'var(--ant-color-warning)':'var(--ant-color-success)'" /></a-col>
-              <a-col :span="8"><a-space size="0"><a-button type="link" size="small" @click="router.push(`/pent/assets/${item.id}`)">档案</a-button><a-button type="link" size="small" @click="openEdit(item)">编辑</a-button></a-space></a-col>
+              <a-col :span="8"><a-space size="0"><a-button v-if="item.editable" type="link" size="small" @click="openEdit(item)">编辑</a-button><a-tag v-else>来源只读</a-tag></a-space></a-col>
             </a-row>
           </a-card>
         </a-col>
@@ -99,14 +99,14 @@ const statCards = [
 
       <!-- Table View -->
       <a-card style="border-radius:10px;margin-top:16px" size="small" v-if="viewMode==='table'">
-        <a-table :columns="[{title:'名称',dataIndex:'name',width:160},{title:'IP/URL',dataIndex:'ip',width:150},{title:'区域',key:'zone',width:90},{title:'语言/系统',key:'technology',width:140},{title:'端口指纹',key:'ports',width:90},{title:'漏洞',key:'findings',width:70},{title:'风险评分',key:'weight',width:110},{title:'操作',key:'actions',width:150}]" :data-source="filtered" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:15,showTotal:(t:number)=>`共 ${t} 个`}">
+        <a-table :columns="[{title:'名称',dataIndex:'name',width:160},{title:'资产类型',dataIndex:'device_type',width:110},{title:'来源',dataIndex:'source_label',width:150},{title:'IP/URL',dataIndex:'ip',width:150},{title:'区域',key:'zone',width:90},{title:'语言/系统',key:'technology',width:140},{title:'端口指纹',key:'ports',width:90},{title:'漏洞',key:'findings',width:70},{title:'风险评分',key:'weight',width:110},{title:'操作',key:'actions',width:150}]" :data-source="filtered" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:15,showTotal:(t:number)=>`共 ${t} 个`}">
           <template #bodyCell="{ column, record }">
             <template v-if="column.key==='zone'"><a-tag :color="zoneInfo[record.zone]?.color">{{ zoneInfo[record.zone]?.label }}</a-tag></template>
             <template v-if="column.key==='technology'">{{ record.language || record.os || '-' }}</template>
             <template v-if="column.key==='ports'">{{ (record.ports||[]).length }}</template>
             <template v-if="column.key==='findings'">{{ record.finding_count || 0 }}</template>
             <template v-if="column.key==='weight'"><a-progress :percent="record.weight" :size="20" :show-info="false" :stroke-color="record.weight>70?'var(--ant-color-error)':record.weight>40?'var(--ant-color-warning)':'var(--ant-color-success)'" style="width:60px;display:inline-block" /><span style="font-size:11px;margin-left:4px">{{ record.weight }}</span></template>
-            <template v-if="column.key==='actions'"><a-space><a-button type="link" size="small" @click="router.push(`/pent/assets/${record.id}`)">档案</a-button><a-button type="link" size="small" @click="openEdit(record)">编辑</a-button></a-space></template>
+            <template v-if="column.key==='actions'"><a-space><a-button v-if="record.editable" type="link" size="small" @click="openEdit(record)">编辑</a-button><a-tag v-else>来源只读</a-tag></a-space></template>
           </template>
         </a-table>
       </a-card>

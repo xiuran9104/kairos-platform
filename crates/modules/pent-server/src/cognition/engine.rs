@@ -27,16 +27,14 @@ pub async fn execute_cognition_run(
     run_id: &str,
     worker_id: &str,
 ) -> Result<(), String> {
-    execute_cognition_run_with_backend(pool, run_id, worker_id, None).await
+    execute_cognition_run_with_backend(pool, run_id, worker_id).await
 }
 
-/// Same as [`execute_cognition_run`] with an explicit executor backend
-/// override (used by integration tests to run on the host backend).
+/// Compatibility wrapper for the cognition engine execution path.
 pub async fn execute_cognition_run_with_backend(
     pool: &PgPool,
     run_id: &str,
     worker_id: &str,
-    backend: Option<crate::infrastructure::process::ExecutionBackend>,
 ) -> Result<(), String> {
     let run: Option<(Option<String>, serde_json::Value, i64)> = sqlx::query_as(
         "SELECT objective_snapshot, scope_snapshot, tenant_id FROM pent_runs WHERE id=$1",
@@ -125,8 +123,7 @@ pub async fn execute_cognition_run_with_backend(
                         Some(s) => s.clone(),
                         None => continue,
                     };
-                    let children =
-                        super::stage_planner::StagePlanner::expand_stage(&stage, &[]);
+                    let children = super::stage_planner::StagePlanner::expand_stage(&stage, &[]);
                     if children.is_empty() {
                         graph = apply_driver_delta(
                             pool,
@@ -229,11 +226,11 @@ pub async fn execute_cognition_run_with_backend(
                         .map_err(|error| error.to_string())?;
                     match cycle.intervention {
                         MetaIntervention::Continue => {
-                            graph = apply_outcome_deltas(pool, &plans, current, &cycle)
-                                .await?;
+                            graph = apply_outcome_deltas(pool, &plans, current, &cycle).await?;
                             made_progress = true;
                         }
-                        MetaIntervention::Stop | MetaIntervention::Pause
+                        MetaIntervention::Stop
+                        | MetaIntervention::Pause
                         | MetaIntervention::AskUser => {
                             // Terminal intervention from any sub-agent stops
                             // the whole run.
@@ -242,10 +239,8 @@ pub async fn execute_cognition_run_with_backend(
                                 MetaIntervention::Pause => ("budget_pressure", "预算压力"),
                                 _ => ("needs_user_input", "需要用户输入"),
                             };
-                            return finish_blocked(
-                                pool, run_id, &current, reason.0, reason.1,
-                            )
-                            .await;
+                            return finish_blocked(pool, run_id, &current, reason.0, reason.1)
+                                .await;
                         }
                         _ => {
                             // Replan / GatherInformation / RequestApproval:
@@ -270,8 +265,7 @@ pub async fn execute_cognition_run_with_backend(
                                     }],
                                 )
                                 .await?;
-                                graph = apply_outcome_deltas(pool, &plans, graph, &cycle)
-                                    .await?;
+                                graph = apply_outcome_deltas(pool, &plans, graph, &cycle).await?;
                                 made_progress = true;
                             }
                         }
@@ -292,7 +286,10 @@ pub async fn execute_cognition_run_with_backend(
         if made_progress {
             no_progress = 0;
         }
-        graph = plans.current(run_id).await.map_err(|error| error.to_string())?;
+        graph = plans
+            .current(run_id)
+            .await
+            .map_err(|error| error.to_string())?;
         if plan_terminal(&graph) {
             break;
         }
@@ -469,7 +466,15 @@ async fn apply_outcome_deltas(
         });
     }
     if !rollup.is_empty() {
-        graph = apply_driver_delta(pool, plans, &graph, ReplanLevel::Stage, &["STAGE_ROLLUP"], rollup).await?;
+        graph = apply_driver_delta(
+            pool,
+            plans,
+            &graph,
+            ReplanLevel::Stage,
+            &["STAGE_ROLLUP"],
+            rollup,
+        )
+        .await?;
     }
     Ok(graph)
 }
@@ -561,8 +566,6 @@ async fn finish_completed(
 
 #[cfg(test)]
 mod tests {
-    use crate::infrastructure::process::ExecutionBackend;
-
     #[tokio::test]
     #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL), MinIO and /usr/bin/nmap"]
     async fn cognition_engine_completes_run_end_to_end() {
@@ -618,7 +621,6 @@ mod tests {
             &pool,
             run_id,
             "it-worker",
-            Some(ExecutionBackend::Host),
         )
         .await;
         assert!(result.is_ok(), "认知引擎必须完成，实际：{result:?}");
@@ -636,7 +638,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("count plan versions");
-        assert!(plan_versions >= 2, "计划必须有版本演进，实际 {plan_versions}");
+        assert!(
+            plan_versions >= 2,
+            "计划必须有版本演进，实际 {plan_versions}"
+        );
         let deltas: i64 =
             sqlx::query_scalar("SELECT count(*) FROM pent_plan_deltas WHERE run_id=$1")
                 .bind(run_id)
@@ -645,13 +650,12 @@ mod tests {
                 .expect("count deltas");
         assert!(deltas >= 1, "必须存在 PlanDelta 记录");
 
-        let executed_tools: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT tool_name FROM pent_tool_calls WHERE run_id=$1",
-        )
-        .bind(run_id)
-        .fetch_all(&pool)
-        .await
-        .expect("list executed tools");
+        let executed_tools: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT tool_name FROM pent_tool_calls WHERE run_id=$1")
+                .bind(run_id)
+                .fetch_all(&pool)
+                .await
+                .expect("list executed tools");
         assert!(
             executed_tools.iter().any(|name| name == "tcp_scan"),
             "tcp_scan 必须执行，实际：{executed_tools:?}"
@@ -670,13 +674,12 @@ mod tests {
                 .await
                 .expect("count reflections");
         assert!(reflections >= 1, "每个动作必须产生反思记录");
-        let snapshots: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pent_metacognitive_snapshots WHERE run_id=$1",
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count meta snapshots");
+        let snapshots: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pent_metacognitive_snapshots WHERE run_id=$1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count meta snapshots");
         assert!(snapshots >= 1, "元认知快照必须持久化");
 
         let report_event: bool = sqlx::query_scalar(

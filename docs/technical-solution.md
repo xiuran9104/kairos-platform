@@ -18,7 +18,6 @@ services/gateway                 # 统一 HTTP 网关
   +-- crates/modules/system-*     # 系统模块：用户、认证、权限、租户
   +-- crates/modules/infra-*      # 基础设施模块：配置、文件、任务、监控
   +-- crates/modules/ai-*         # 统一 AI 模型、聊天、知识库和媒体生成
-  +-- crates/modules/toon-*       # 内容模块：作品、剧集、场景、发布
   +-- crates/modules/media-*      # 媒体模块：素材、上传、转码、存储
 
 crates/framework/*               # 公共 starter / framework 能力
@@ -46,8 +45,6 @@ crates/
     ai-server/
     infra-api/
     infra-server/
-    toon-api/
-    toon-server/
     media-api/
     media-server/
 services/
@@ -103,7 +100,6 @@ views/
   system/
   infra/
   ai/
-  toonflow/
   media/
 ```
 
@@ -115,7 +111,6 @@ views/
 - `POST /system/auth/login`
 - `GET /system/auth/me`（Bearer Token）
 - `/ai/**`：模型、聊天、知识库、图片、音乐、工具与写作
-- `/toonflow/**`：动漫工厂完整业务接口
 - `/system/**`、`/infra/**`、`/media/**`：基础后台模块
 
 ## 本地运行
@@ -153,7 +148,7 @@ docker compose -f script/docker/docker-compose.yml up -d
 
 权限框架采用 RBAC：用户关联角色，角色关联权限，角色同时定义数据范围。权限码使用
 `模块:资源:动作` 格式，例如 `system:user:read`，并支持受控通配符
-`toon:project:*`。数据库使用 `roles`、`permissions`、`user_roles`、
+`system:user:*`。数据库使用 `roles`、`permissions`、`user_roles`、
 `role_permissions` 四张关系表，运行时将多角色权限合并为 `PermissionSet` 后进行鉴权。
 
 安全框架提供严格校验的 `SecurityConfig`、HS256 Access Token 签发与验证、

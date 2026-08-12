@@ -92,7 +92,7 @@
 
 11. **上线前检查单** ✅ 全部通过
     - `PENTA_APPROVAL_MODE=auto`（默认免审批 + 审计），生产设 `policy` 恢复人工
-    - `PENTA_REQUIRE_IMAGE_DIGEST` 生产默认 true（process.rs 已强制）
+    - 主动检测工具走宿主机本地二进制；上线前确认工具路径、版本、权限和 `prlimit` 可用
     - MinIO 凭据不入快照，`pent_http_traffic` 排除，`pent_skills` 种子保留
     - 冒烟容器仅本地验证，不进部署文档
 

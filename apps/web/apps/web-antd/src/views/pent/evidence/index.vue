@@ -7,7 +7,7 @@ async function load(run:any){selectedRun.value=run; try{evidence.value=(await ge
 onMounted(fetch);
 </script>
 <template>
-  <div style="padding:24px;min-height:100%">
+  <div style="padding:24px;min-height:100%;background-color: var(--ant-color-bg-layout)">
     <a-page-header title="证据管理" sub-title="审计追踪 · 内容哈希可验证"><template #extra><a-button @click="fetch">刷新</a-button></template></a-page-header>
     <a-row :gutter="16">
       <a-col :span="6">

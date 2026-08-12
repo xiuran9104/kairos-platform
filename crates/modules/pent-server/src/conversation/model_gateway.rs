@@ -1,7 +1,7 @@
 //! LLM-03: ModelGateway using AiModelFactory (ai-server).
 use crate::conversation::ports::{ConversationModelGateway, ModelToolCall, ModelTurnOutput};
 use async_trait::async_trait;
-use kairos_platform_ai_api::ChatMessage;
+use kairos_platform_ai_api::{ChatMessage, ChatRequest};
 use kairos_platform_ai_server::AiModelFactory;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::{ConversationContext, ConversationIntent, ModelUsage};
@@ -26,41 +26,42 @@ impl AiModelGateway {
         }
     }
 
-    pub(crate) async fn resolve_model(&self, session_id: &str) -> anyhow::Result<(i64, Option<f64>, u32)> {
-        let (tenant_id, project_id): (i64, Option<String>) =
-            sqlx::query_as("SELECT tenant_id, project_id FROM pent_agent_sessions WHERE id = $1")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Agent Session 不存在"))?;
-        let binding: Option<(i64, Option<f32>, Option<i32>)> = sqlx::query_as(
-            "SELECT model_config_id, temperature, max_output_tokens
-             FROM pent_model_role_bindings
-             WHERE tenant_id = $1 AND model_role = 'conversation' AND enabled = true
-               AND project_id IN ($2, '')
-             ORDER BY CASE WHEN project_id = $2 THEN 0 ELSE 1 END
-             LIMIT 1",
+    pub(crate) async fn resolve_model(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(i64, Option<f64>, u32)> {
+        let selected: Option<i64> = sqlx::query_scalar(
+            "SELECT m.id
+             FROM pent_agent_sessions s
+             JOIN ai.model_configs m
+               ON m.id=NULLIF(s.constraints->>'model_id','')::bigint
+              AND m.type='chat' AND m.status=0
+             WHERE s.id=$1",
         )
-        .bind(tenant_id)
-        .bind(project_id.unwrap_or_default())
+        .bind(session_id)
         .fetch_optional(&self.pool)
         .await?;
-        if let Some((id, temperature, max_tokens)) = binding {
-            let configured_max = max_tokens.unwrap_or(2000).clamp(1, 16_000) as u32;
-            return Ok((
-                id,
-                temperature.map(f64::from),
-                conversation_output_token_limit(configured_max),
-            ));
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pent_agent_sessions WHERE id=$1)",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            return Err(anyhow::anyhow!("Agent Session 不存在"));
         }
-        let id: i64 = sqlx::query_scalar(
+        let id = if let Some(id) = selected {
+            id
+        } else {
+            sqlx::query_scalar(
             "SELECT id FROM ai.model_configs
              WHERE type = 'chat' AND status = 0
              ORDER BY id LIMIT 1",
         )
         .fetch_optional(&self.pool)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?;
+        .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?
+        };
         Ok((id, Some(0.3), conversation_output_token_limit(2000)))
     }
 }
@@ -125,7 +126,7 @@ impl ConversationModelGateway for AiModelGateway {
         let context_token_budget = std::env::var("PENTA_CONTEXT_TOKEN_BUDGET")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
+            .unwrap_or_else(|| context.policy_snapshot.pointer("/multi_agent/context_budget_tokens").and_then(Value::as_u64).unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET))
             .clamp(2_000, 128_000);
         let model_context = context;
         let memory_context = if model_context.run_summary.trim().is_empty() {
@@ -156,22 +157,20 @@ impl ConversationModelGateway for AiModelGateway {
         );
         let started = std::time::Instant::now();
 
-        let tools = match super::tool_catalog::load_routed_tool_definitions(
-            &self.pool,
-            &routing_intent(context),
-            routing_max_risk(context),
-            super::tool_catalog::tool_schema_top_k(),
-        )
-        .await
-        {
-            Ok(definitions) => definitions,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "tool routing failed; falling back to full conversation catalog"
-                );
-                super::tool_catalog::load_conversation_tool_definitions(&self.pool).await?
-            }
+        let finalizing_budget = context
+            .recent_messages
+            .last()
+            .is_some_and(|message| message.message_id == "runtime_budget_finalization");
+        let tools = if finalizing_budget {
+            Vec::new()
+        } else {
+            // Full catalog: all active tools, no routing truncation.
+            // The LLM is best positioned to select tools for each task.
+            super::tool_catalog::load_tools_for_intent(
+                &self.pool,
+                &routing_intent(context),
+                context.policy_snapshot.get("multi_agent").unwrap_or(&Value::Null),
+            ).await?
         };
         // Filter out tools that have exceeded their consecutive failure limit.
         let tools: Vec<Value> = {
@@ -179,10 +178,8 @@ impl ConversationModelGateway for AiModelGateway {
                 .exhausted_tools
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if exhausted.is_empty() {
-                tools
-            } else {
-                tools
+            let sub_agent = context.policy_snapshot.get("_agent_role").and_then(Value::as_str) == Some("sub");
+            tools
                     .into_iter()
                     .filter(|t| {
                         let name = t
@@ -190,9 +187,9 @@ impl ConversationModelGateway for AiModelGateway {
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         !exhausted.contains(name)
+                            && !(sub_agent && matches!(name, "agent_spawn" | "plan_create" | "plan_get" | "plan_update"))
                     })
                     .collect()
-            }
         };
         let mut api_messages: Vec<Value> =
             messages.iter().map(|m| format_message_for_api(m)).collect();
@@ -200,6 +197,20 @@ impl ConversationModelGateway for AiModelGateway {
         // Context trimming or an interrupted turn can leave either side of the
         // tool protocol without its pair. Validate every group by tool_call_id.
         sanitize_tool_message_groups(&mut api_messages);
+        if let Some(compaction) = super::context_compaction::prepare(&api_messages, context_token_budget) {
+            let fallback = super::context_compaction::fallback_summary(&compaction.older);
+            let transcript = serde_json::to_string(&compaction.older).unwrap_or_default();
+            let summary = self.factory.chat(model_id, ChatRequest {
+                model: String::new(),
+                messages: vec![
+                    ChatMessage { role: "system".into(), content: "压缩 Agent 历史上下文。必须保留目标、授权范围、已执行动作、Evidence ID、发现、失败原因、未完成步骤和用户约束；不得虚构。只输出摘要。".into() },
+                    ChatMessage { role: "user".into(), content: transcript.chars().take(160_000).collect() },
+                ],
+                temperature: Some(0.0), max_tokens: Some(4000),
+            }).await.ok().map(|response| response.content).filter(|v| !v.trim().is_empty()).unwrap_or(fallback);
+            api_messages = super::context_compaction::merge(summary, compaction);
+            sanitize_tool_message_groups(&mut api_messages);
+        }
         trim_api_messages_preserving_tool_groups(&mut api_messages, context_token_budget);
         let response = self
             .factory
@@ -211,7 +222,22 @@ impl ConversationModelGateway for AiModelGateway {
         let (content, tool_calls) = parse_chat_tools_response(&response);
 
         if content.trim().is_empty() && tool_calls.is_empty() {
-            anyhow::bail!("模型返回了空内容");
+            tracing::warn!(
+                model_id,
+                finish_reason = response
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("missing"),
+                choices = response
+                    .get("choices")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, Vec::len),
+                has_reasoning = response
+                    .pointer("/choices/0/message/reasoning_content")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "model returned no content or valid tool calls"
+            );
         }
         let input_tokens = response
             .get("usage")
@@ -275,13 +301,38 @@ fn format_message_for_api(m: &kairos_platform_ai_api::ChatMessage) -> Value {
     serde_json::json!({"role": m.role, "content": m.content})
 }
 
-/// Keep only complete `assistant.tool_calls` + consecutive `tool` response
-/// groups. This removes orphan results anywhere in history, not just at the
-/// beginning, and also removes interrupted assistant groups.
+/// Keep complete `assistant.tool_calls` + `tool` response groups.
+///
+/// The runtime may insert RMOS injections, diagnostics, and other system/user
+/// messages between an assistant tool_calls message and its tool results.
+/// This function skips up to `MAX_INTERLEAVED_MESSAGES` non-tool messages
+/// when looking for the matching tool results before giving up.
+///
+/// Truly orphan tool results (no preceding assistant *anywhere* in the
+/// retained window) are still removed.
 fn sanitize_tool_message_groups(api_messages: &mut Vec<Value>) {
+    /// Maximum number of interleaved non-tool messages allowed between an
+    /// assistant tool_calls and its tool results before the group is
+    /// considered split.
+    const MAX_INTERLEAVED_MESSAGES: usize = 5;
+
     let source = std::mem::take(api_messages);
     let mut sanitized = Vec::with_capacity(source.len());
     let mut index = 0;
+
+    // Collect the set of all tool_call_ids that appear in assistant tool_calls
+    // messages so we can tell which tool results are truly orphan.
+    let all_expected_ids: std::collections::HashSet<String> = source
+        .iter()
+        .filter_map(|m| {
+            if m.get("role").and_then(Value::as_str) != Some("assistant") {
+                return None;
+            }
+            m.get("tool_calls")?.as_array()
+        })
+        .flatten()
+        .filter_map(|call| call.get("id").and_then(Value::as_str).map(String::from))
+        .collect();
 
     while index < source.len() {
         let message = &source[index];
@@ -294,27 +345,79 @@ fn sanitize_tool_message_groups(api_messages: &mut Vec<Value>) {
                 .flatten()
                 .filter_map(|call| call.get("id").and_then(Value::as_str))
                 .collect();
+            // Scan forward to collect matching tool results. Up to
+            // MAX_INTERLEAVED_MESSAGES non-tool messages are tolerated
+            // BEFORE the first tool result (RMOS injections, diagnostics).
+            // Once we've seen a tool result, the very next non-tool message
+            // terminates the group.
             let mut group_end = index + 1;
-            while group_end < source.len()
-                && source[group_end].get("role").and_then(Value::as_str) == Some("tool")
-            {
-                group_end += 1;
+            let mut skipped = 0usize;
+            let mut tool_indices: Vec<usize> = Vec::new();
+            let mut interleaved_before: Vec<usize> = Vec::new();
+            let mut found_first_tool = false;
+            while group_end < source.len() {
+                let next_role = source[group_end].get("role").and_then(Value::as_str);
+                if next_role == Some("tool") {
+                    tool_indices.push(group_end);
+                    group_end += 1;
+                    skipped = 0;
+                    found_first_tool = true;
+                } else if !found_first_tool
+                    && skipped < MAX_INTERLEAVED_MESSAGES
+                    && next_role.is_some_and(|r| r == "system" || r == "user")
+                {
+                    interleaved_before.push(group_end);
+                    skipped += 1;
+                    group_end += 1;
+                } else {
+                    break;
+                }
             }
-            let actual: Vec<&str> = source[index + 1..group_end]
+            // Collect actual tool_call_ids from the tool messages we found.
+            let actual: Vec<&str> = tool_indices
                 .iter()
-                .filter_map(|result| result.get("tool_call_id").and_then(Value::as_str))
+                .filter_map(|&i| {
+                    source[i]
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                })
                 .collect();
             let actual_set: std::collections::HashSet<&str> = actual.iter().copied().collect();
             let complete =
                 !expected.is_empty() && actual.len() == expected.len() && actual_set == expected;
 
-            if complete {
-                sanitized.extend(source[index..group_end].iter().cloned());
-            } else {
+            // Emit assistant → matching tool results → then interleaved
+            // non-tool messages. This keeps assistant + tools consecutive so
+            // trim_api_messages_preserving_tool_groups treats them as one
+            // indivisible unit, preventing orphan tool results after context
+            // trimming. The reordering is semantic-neutral because the model
+            // reads the full context before generating.
+            sanitized.push(source[index].clone());
+            // Matching tool results first (keeps them consecutive with
+            // the assistant).
+            for &ti in &tool_indices {
+                if complete || {
+                    let id = source[ti]
+                        .get("tool_call_id")
+                        .and_then(Value::as_str);
+                    id.is_some_and(|id| expected.contains(id))
+                } {
+                    sanitized.push(source[ti].clone());
+                }
+            }
+            // Then interleaved non-tool messages that appeared before the
+            // first tool result (RMOS injections, diagnostics, etc.).
+            for &bi in &interleaved_before {
+                sanitized.push(source[bi].clone());
+            }
+            if expected.is_empty() {
+                tracing::debug!("assistant tool_calls with no call ids — kept as-is");
+            } else if actual_set != expected {
                 tracing::warn!(
                     expected = expected.len(),
                     actual = actual.len(),
-                    "removed incomplete tool message group from model context"
+                    interleaved = group_end - index - 1 - tool_indices.len(),
+                    "incomplete tool message group — kept assistant + matching results"
                 );
             }
             index = group_end;
@@ -322,7 +425,19 @@ fn sanitize_tool_message_groups(api_messages: &mut Vec<Value>) {
         }
 
         if role == Some("tool") {
-            tracing::warn!("removed orphan tool result from model context");
+            let tool_call_id = message.get("tool_call_id").and_then(Value::as_str);
+            let is_orphan = tool_call_id.is_none_or(|id| !all_expected_ids.contains(id));
+            if is_orphan {
+                tracing::debug!(
+                    tool_call_id = tool_call_id.unwrap_or("<missing>"),
+                    "removed orphan tool result from model context"
+                );
+                index += 1;
+                continue;
+            }
+            // Tool result whose parent assistant was trimmed away — keep it
+            // as it pairs with a known assistant elsewhere in context.
+            sanitized.push(message.clone());
             index += 1;
             continue;
         }
@@ -512,6 +627,9 @@ mod tests {
 
     #[test]
     fn removes_mismatched_or_incomplete_group() {
+        // Assistant has call-1 but the tool result has other-call.
+        // New behavior: keep the assistant (model still sees what it tried)
+        // and remove the mismatched tool result (which is orphan).
         let mut messages = vec![
             json!({"role": "system", "content": "s"}),
             call("call-1"),
@@ -519,8 +637,44 @@ mod tests {
             json!({"role": "user", "content": "continue"}),
         ];
         sanitize_tool_message_groups(&mut messages);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages.len(), 3, "system + assistant kept + user kept; mismatched tool removed");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "user");
+    }
+
+    #[test]
+    fn tolerates_interleaved_system_messages_between_tool_calls_and_results() {
+        // RMOS injections and diagnostics are inserted between assistant
+        // tool_calls and the tool results. The sanitizer should skip them.
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            call("call-1"),
+            json!({"role": "system", "content": "rmos injection"}),
+            json!({"role": "user", "content": "diagnostic feedback"}),
+            result("call-1"),
+        ];
+        sanitize_tool_message_groups(&mut messages);
+        assert_eq!(messages.len(), 5, "all five messages preserved — group complete with interleaved system/user");
+    }
+
+    #[test]
+    fn removes_tool_result_with_no_matching_assistant_anywhere() {
+        // call-1's group is complete (call + result). "orphan" has no
+        // assistant anywhere and comes after the complete group — it is
+        // removed.
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "question"}),
+            call("call-1"),
+            result("call-1"),  // matches call-1 → group complete
+            result("orphan"),   // no assistant has this id → removed
+            json!({"role": "user", "content": "latest"}),
+        ];
+        sanitize_tool_message_groups(&mut messages);
+        assert_eq!(messages.len(), 5, "orphan result after complete group removed, others kept");
+        assert!(!messages.iter().any(|m| {
+            m.get("tool_call_id").and_then(Value::as_str) == Some("orphan")
+        }));
     }
 
     #[test]

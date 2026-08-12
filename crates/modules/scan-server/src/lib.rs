@@ -4,20 +4,27 @@
 //! scanner configuration, and scan task management.
 
 mod asset;
+mod asset_inventory;
 mod business_application;
 mod business_resource;
+mod cabinet;
 mod cloud_adapter;
 mod cloud_apsara;
 mod cloud_hcs;
 mod cloud_openstack;
 mod cloud_platform;
 mod cloud_provider_config;
+mod cloud_provisioning;
 mod cloud_service_asset;
 mod cloud_tstack;
 mod dashboard;
+mod infrastructure_device;
 mod machine_room;
+mod physical_resource;
 mod port_detail;
 mod resource_ticket;
+mod resource_ticket_approval;
+mod resource_ticket_validation;
 mod risk;
 mod scanner;
 mod security_product;
@@ -39,11 +46,13 @@ use kairos_platform_framework_web::AppError;
 use kairos_platform_scan_api::{
     Asset, BusinessResource, CloudPlatform, CloudProviderConfig, CloudSecurityGroup, CloudZone,
     CreateScannerRequest, CreateTaskRequest, MachineRoom, NetworkZone, PortDetail, PortInfo,
-    QuickScanResult, ResourceTicket, Risk, ScanCapability, ScanRequest, ScanTask, ScannerConfig,
-    SecurityProduct, ServiceProvider, UpdateScannerRequest, ZoneConfig,
+    QuickScanResult, RegisterScannerAgentRequest, ResourceTicket, Risk, ScanCapability,
+    ScanRequest, ScanTask, ScannerConfig, ScannerHeartbeatRequest, SecurityProduct,
+    ServiceProvider, UpdateScannerRequest, ZoneConfig,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 // ── App state ────────────────────────────────────────────────────────────
@@ -132,6 +141,14 @@ pub fn routes(state: ScanState) -> Router {
             "/asset-ops/scanners/{id}",
             put(scanner_update).delete(scanner_delete),
         )
+        .route(
+            "/asset-ops/scanner-agents/register",
+            post(scanner_agent_register),
+        )
+        .route(
+            "/asset-ops/scanner-agents/heartbeat",
+            post(scanner_agent_heartbeat),
+        )
         // Zones
         .route("/asset-ops/zones", get(zone_list).post(zone_create))
         .route(
@@ -172,6 +189,26 @@ pub fn routes(state: ScanState) -> Router {
         )
         // Service providers
         .route(
+            "/asset-ops/cabinet-rows",
+            get(cabinet::row_list).post(cabinet::row_create),
+        )
+        .route(
+            "/asset-ops/cabinet-rows/{id}",
+            put(cabinet::row_update).delete(cabinet::row_delete),
+        )
+        .route(
+            "/asset-ops/cabinets",
+            get(cabinet::list).post(cabinet::create),
+        )
+        .route(
+            "/asset-ops/cabinets/configure-room",
+            post(cabinet::configure_room),
+        )
+        .route(
+            "/asset-ops/cabinets/{id}",
+            put(cabinet::update).delete(cabinet::delete_one),
+        )
+        .route(
             "/asset-ops/service-providers",
             get(service_provider::list).post(service_provider::create),
         )
@@ -191,6 +228,15 @@ pub fn routes(state: ScanState) -> Router {
             get(security_product::get_one)
                 .put(security_product::update)
                 .delete(security_product::delete_one),
+        )
+        // Network and storage infrastructure devices
+        .route(
+            "/asset-ops/infrastructure-devices",
+            get(infrastructure_device::list).post(infrastructure_device::create),
+        )
+        .route(
+            "/asset-ops/infrastructure-devices/{id}",
+            put(infrastructure_device::update).delete(infrastructure_device::delete_one),
         )
         // Cloud zones & platforms
         .route(
@@ -227,6 +273,10 @@ pub fn routes(state: ScanState) -> Router {
         .route(
             "/asset-ops/resource-tickets/{id}/approve",
             post(resource_ticket::approve),
+        )
+        .route(
+            "/asset-ops/resource-tickets/{id}/approvals",
+            get(resource_ticket::approval_history),
         )
         .route(
             "/asset-ops/resource-tickets/{id}/provision",
@@ -378,6 +428,8 @@ async fn health(State(s): State<ScanState>) -> Json<ApiResponse<Value>> {
 async fn scanner_list(
     State(s): State<ScanState>,
 ) -> Result<Json<ApiResponse<Vec<ScannerConfig>>>, AppError> {
+    sqlx::query("UPDATE scan_scanners SET agent_status='offline' WHERE agent_status='online' AND last_heartbeat < now()-interval '90 seconds'")
+        .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT to_jsonb(t) FROM scan_scanners t WHERE deleted=0 ORDER BY id",
     )
@@ -395,19 +447,61 @@ async fn scanner_create(
     Json(req): Json<CreateScannerRequest>,
 ) -> Result<Json<ApiResponse<ScannerConfig>>, AppError> {
     let id = Uuid::new_v4().to_string();
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query("INSERT INTO scan_scanners(id,name,scanner_type,enabled,config,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
-        .bind(&id).bind(&req.name).bind(&req.scanner_type).bind(req.enabled.unwrap_or(true)).bind(&req.config).bind(&now).bind(&now)
+    sqlx::query("INSERT INTO scan_scanners(id,name,scanner_type,enabled,config,registration_token_hash,token_expires_at,agent_status,created_at,updated_at) VALUES($1,$2,'rustscan',$3,$4,$5,now()+interval '24 hours','pending',now(),now())")
+        .bind(&id).bind(&req.name).bind(req.enabled.unwrap_or(true)).bind(&req.config).bind(&token_hash)
         .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(ScannerConfig {
         id,
         name: req.name,
-        scanner_type: req.scanner_type,
+        scanner_type: "rustscan".into(),
         enabled: req.enabled.unwrap_or(true),
         config: req.config,
         created_at: Some(now.clone()),
         updated_at: Some(now),
+        agent_status: Some("pending".into()),
+        agent_version: None,
+        agent_hostname: None,
+        agent_ip: None,
+        capabilities: vec!["host_discovery".into(), "port_scan".into()],
+        registered_at: None,
+        last_heartbeat: None,
+        registration_token: Some(token),
     })))
+}
+
+async fn scanner_agent_register(
+    State(s): State<ScanState>,
+    Json(req): Json<RegisterScannerAgentRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let token_hash = format!("{:x}", Sha256::digest(req.token.as_bytes()));
+    let capabilities = if req.capabilities.is_empty() {
+        json!(["host_discovery", "port_scan"])
+    } else {
+        json!(req.capabilities)
+    };
+    let id = sqlx::query_scalar::<_, String>("UPDATE scan_scanners SET agent_status='online',agent_version=$2,agent_hostname=$3,agent_ip=$4,capabilities=$5,registered_at=COALESCE(registered_at,now()),last_heartbeat=now(),updated_at=now() WHERE registration_token_hash=$1 AND deleted=0 AND enabled=true AND (registered_at IS NOT NULL OR token_expires_at>now()) RETURNING id")
+        .bind(token_hash).bind(req.agent_version).bind(req.hostname).bind(req.ip_address).bind(capabilities)
+        .fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
+        .ok_or_else(|| AppError::bad_request("注册令牌无效、已过期或节点已禁用"))?;
+    Ok(Json(ApiResponse::new(
+        json!({"node_id":id,"heartbeat_interval_seconds":30}),
+    )))
+}
+
+async fn scanner_agent_heartbeat(
+    State(s): State<ScanState>,
+    Json(req): Json<ScannerHeartbeatRequest>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let token_hash = format!("{:x}", Sha256::digest(req.token.as_bytes()));
+    let updated = sqlx::query("UPDATE scan_scanners SET agent_status='online',last_heartbeat=now(),updated_at=now() WHERE id=$1 AND registration_token_hash=$2 AND registered_at IS NOT NULL AND enabled=true AND deleted=0")
+        .bind(req.node_id).bind(token_hash).execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::bad_request("节点凭证无效或节点已禁用"));
+    }
+    Ok(Json(ApiResponse::new(json!({"status":"online"}))))
 }
 async fn scanner_update(
     State(s): State<ScanState>,
@@ -586,12 +680,7 @@ async fn asset_list(
     State(s): State<ScanState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM scan_assets t WHERE deleted=0 ORDER BY id DESC",
-    )
-    .fetch_all(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
+    let rows = asset_inventory::list(&s.pool).await?;
     // Apply keyword filter
     if let Some(keyword) = params.get("keyword").filter(|k| !k.is_empty()) {
         let kw = keyword.to_lowercase();
@@ -735,12 +824,23 @@ async fn task_create(
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<Json<ApiResponse<ScanTask>>, AppError> {
     task::validate_task_target(&req.target).map_err(|e| AppError::internal(e))?;
+    let scanner_enabled: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM scan_scanners WHERE id=$1 AND enabled=true AND agent_status='online' AND last_heartbeat>now()-interval '90 seconds' AND deleted=0)",
+    )
+    .bind(&req.scanner_id)
+    .fetch_one(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    if !scanner_enabled {
+        return Err(AppError::bad_request("请选择一个已启用的扫描节点"));
+    }
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO scan_tasks(id,name,target,port_policy,service_detection,domain_brute,os_detection,site_identify) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
-        .bind(&id).bind(&req.name).bind(&req.target).bind(&req.port_policy).bind(req.service_detection).bind(req.domain_brute).bind(req.os_detection).bind(req.site_identify)
+    sqlx::query("INSERT INTO scan_tasks(id,scanner_id,name,target,port_policy,service_detection,domain_brute,os_detection,site_identify) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+        .bind(&id).bind(&req.scanner_id).bind(&req.name).bind(&req.target).bind(&req.port_policy).bind(req.service_detection).bind(req.domain_brute).bind(req.os_detection).bind(req.site_identify)
         .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(ScanTask {
         id,
+        scanner_id: Some(req.scanner_id),
         name: req.name,
         target: req.target,
         status: kairos_platform_scan_api::TaskStatus::Pending,

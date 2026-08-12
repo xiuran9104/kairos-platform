@@ -129,16 +129,6 @@ impl ConversationRepository for PgConversationRepository {
             tx.commit().await?;
             return Ok(Some(run_id));
         }
-        let authorized = session
-            .3
-            .get("targets")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|targets| !targets.is_empty());
-        if !authorized {
-            tx.commit().await?;
-            return Ok(None);
-        }
-
         let task_id = uuid::Uuid::new_v4().to_string();
         let run_id = uuid::Uuid::new_v4().to_string();
         let task_name = task_display_name(&session.2, &session.3);
@@ -291,7 +281,10 @@ impl ConversationRepository for PgConversationRepository {
         // Reset session to ready, clear active_run_id, and close stale runs
         sqlx::query(
             "WITH s AS (
-                SELECT session_id, active_run_id FROM pent_conversation_turns WHERE id=$1
+                SELECT s2.id AS session_id, s2.active_run_id
+                FROM pent_conversation_turns t
+                JOIN pent_agent_sessions s2 ON s2.id = t.session_id
+                WHERE t.id = $1
              ), closed AS (
                 UPDATE pent_runs SET status='completed', completed_at=now()
                 FROM s WHERE pent_runs.id = s.active_run_id AND pent_runs.status='running'
@@ -368,7 +361,7 @@ impl ConversationRepository for PgConversationRepository {
         } else if matches!(tool_name, "js_analyze" | "knowledge_search") {
             "builtin"
         } else {
-            "docker"
+            "host"
         };
         let hash = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
         let mut tx = self.pool.begin().await?;
@@ -472,9 +465,8 @@ impl ConversationRepository for PgConversationRepository {
                 evidence_ids.push(evidence_id);
             }
             tool_calls.push(HistoricalToolCall {
-                semantic_fingerprint: semantic_fingerprint.or_else(|| {
-                    content_hash.map(|hash| format!("{tool_name}:{hash}"))
-                }),
+                semantic_fingerprint: semantic_fingerprint
+                    .or_else(|| content_hash.map(|hash| format!("{tool_name}:{hash}"))),
                 tool_name,
                 arguments,
                 success: exit_code == Some(0),
@@ -871,7 +863,8 @@ impl ConversationRepository for PgConversationRepository {
                 let summary: Vec<serde_json::Value> = hosts
                     .into_iter()
                     .map(|(host, paths)| {
-                        let total: i64 = paths.iter()
+                        let total: i64 = paths
+                            .iter()
                             .filter_map(|p| p["request_count"].as_i64())
                             .sum();
                         serde_json::json!({
@@ -938,7 +931,11 @@ impl ConversationRepository for PgConversationRepository {
                 let body = response_body.unwrap_or_default();
                 let redacted = sanitize_evidence_text(&body);
                 let total_chars = redacted.chars().count();
-                let content = redacted.chars().skip(offset).take(limit).collect::<String>();
+                let content = redacted
+                    .chars()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<String>();
                 let next_offset = offset.saturating_add(content.chars().count());
                 Ok(serde_json::json!({
                     "traffic_id": traffic_id,
@@ -1016,10 +1013,7 @@ impl ConversationRepository for PgConversationRepository {
         run_id: &str,
         traffic_id: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        let row = sqlx::query_as::<
-            _,
-            (String, String, serde_json::Value, Option<String>),
-        >(
+        let row = sqlx::query_as::<_, (String, String, serde_json::Value, Option<String>)>(
             "SELECT method, url, request_headers, request_body
              FROM pent_http_traffic
              WHERE run_id=$1 AND id=$2",
@@ -1305,8 +1299,7 @@ mod traffic_tests {
             .expect("traffic_view");
         assert_eq!(view["request"]["method"], "POST");
         assert_eq!(
-            view["request"]["headers"]["Authorization"],
-            "[REDACTED]",
+            view["request"]["headers"]["Authorization"], "[REDACTED]",
             "请求头必须脱敏"
         );
         assert_eq!(view["response"]["status"], 200);
@@ -1327,15 +1320,21 @@ mod traffic_tests {
         })
         .to_string();
         let ids_b = repository
-            .record_http_traffic(run_id, "tc-2", "http_request", &arguments, &content_b, Some(&ids[0]))
+            .record_http_traffic(
+                run_id,
+                "tc-2",
+                "http_request",
+                &arguments,
+                &content_b,
+                Some(&ids[0]),
+            )
             .await
             .expect("record replay traffic");
         let diff = repository
             .execute_traffic_tool(
                 run_id,
                 "traffic_diff",
-                &serde_json::json!({"traffic_id_a": ids[0], "traffic_id_b": ids_b[0]})
-                    .to_string(),
+                &serde_json::json!({"traffic_id_a": ids[0], "traffic_id_b": ids_b[0]}).to_string(),
             )
             .await
             .expect("traffic_diff");

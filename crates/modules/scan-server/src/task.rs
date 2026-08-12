@@ -55,6 +55,7 @@ mod tests {
     fn test_task_lifecycle() {
         let mut task = ScanTask {
             id: "test-1".into(),
+            scanner_id: Some("scanner-1".into()),
             name: "Test".into(),
             target: "127.0.0.1".into(),
             status: TaskStatus::Pending,

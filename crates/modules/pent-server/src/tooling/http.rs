@@ -7,6 +7,8 @@ use axum::{
 };
 use kairos_platform_framework_web::AppError;
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use uuid::Uuid;
 
 pub fn routes() -> Router<PentState> {
@@ -136,40 +138,24 @@ async fn health_check(
     );
     let (healthy, detail) = match prepared {
         Ok(prepared) => {
-            let image = prepared.container_image;
-            let image_check = tokio::process::Command::new("/usr/bin/docker")
-                .args([
-                    "image",
-                    "inspect",
-                    "--format",
-                    "{{json .RepoDigests}}",
-                    &image,
-                ])
-                .output()
-                .await;
-            let network = std::env::var("PENTA_DOCKER_TARGET_NETWORK").ok();
-            let network_healthy = if let Some(network) = &network {
-                tokio::process::Command::new("/usr/bin/docker")
-                    .args(["network", "inspect", network])
-                    .output()
-                    .await
-                    .is_ok_and(|output| output.status.success())
-            } else {
-                false
+            let metadata = tokio::fs::metadata(prepared.program).await;
+            let (program_present, executable) = match metadata {
+                Ok(metadata) => {
+                    #[cfg(unix)]
+                    let executable = metadata.permissions().mode() & 0o111 != 0;
+                    #[cfg(not(unix))]
+                    let executable = metadata.is_file();
+                    (metadata.is_file(), executable)
+                }
+                Err(_) => (false, false),
             };
-            let image_digest_pinned = image.contains("@sha256:");
-            let image_healthy = image_check
-                .as_ref()
-                .is_ok_and(|output| output.status.success());
             (
-                image_healthy && network_healthy && image_digest_pinned,
+                program_present && executable,
                 json!({
-                    "backend": "docker",
-                    "image": image,
-                    "image_present": image_healthy,
-                    "image_digest_pinned": image_digest_pinned,
-                    "target_network": network,
-                    "target_network_present": network_healthy
+                    "backend": "host",
+                    "program": prepared.program,
+                    "program_present": program_present,
+                    "executable": executable
                 }),
             )
         }

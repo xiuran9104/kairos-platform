@@ -45,7 +45,7 @@ pub async fn create(
     State(s): State<ScanState>,
     Json(req): Json<CreateServiceProviderRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let id: i32 = sqlx::query_scalar("INSERT INTO scan_service_providers(provider_name,provider_code,short_name,logo_url,contact_person,contact_phone,contact_email,headquarters,service_area,business_license,remarks,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id")
+    let id: i64 = sqlx::query_scalar("INSERT INTO scan_service_providers(provider_name,provider_code,short_name,logo_url,contact_person,contact_phone,contact_email,headquarters,service_area,business_license,remarks,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id")
         .bind(&req.provider_name).bind(&req.provider_code).bind(&req.short_name).bind(&req.logo_url)
         .bind(&req.contact_person).bind(&req.contact_phone).bind(&req.contact_email).bind(&req.headquarters)
         .bind(&req.service_area).bind(&req.business_license).bind(&req.remarks)

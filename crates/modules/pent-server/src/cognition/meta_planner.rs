@@ -5,7 +5,7 @@ use chrono::Utc;
 use kairos_platform_ai_server::AiModelFactory;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::cognition::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// System prompt for the LLM meta-planner. Describes the TCG format, available
 /// capabilities, and the planning rules the model must follow.
@@ -196,7 +196,10 @@ impl MetaPlanner {
                     error = %error,
                     "LLM meta-planner failed; falling back to deterministic template"
                 );
-                (Self::fallback_template(run_id, target), "deterministic-template")
+                (
+                    Self::fallback_template(run_id, target),
+                    "deterministic-template",
+                )
             }
         }
     }
@@ -228,7 +231,13 @@ impl MetaPlanner {
         ];
 
         let response = factory
-            .chat_tools(model_id, messages, tools, Some(temperature), Some(max_tokens))
+            .chat_tools(
+                model_id,
+                messages,
+                tools,
+                Some(temperature),
+                Some(max_tokens),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("LLM planner call failed: {e:#?}"))?;
 
@@ -307,7 +316,9 @@ impl MetaPlanner {
                 calls.iter().find_map(|tc| {
                     let name = tc.pointer("/function/name")?.as_str()?;
                     if name == "emit_plan" {
-                        tc.pointer("/function/arguments")?.as_str().map(String::from)
+                        tc.pointer("/function/arguments")?
+                            .as_str()
+                            .map(String::from)
                     } else {
                         None
                     }
@@ -315,8 +326,9 @@ impl MetaPlanner {
             })
             .ok_or_else(|| anyhow::anyhow!("LLM did not call emit_plan tool"))?;
 
-        let plan: LlmPlanOutput = serde_json::from_str(&plan_args)
-            .map_err(|e| anyhow::anyhow!("Failed to parse TCG JSON from LLM: {e}. Raw: {plan_args}"))?;
+        let plan: LlmPlanOutput = serde_json::from_str(&plan_args).map_err(|e| {
+            anyhow::anyhow!("Failed to parse TCG JSON from LLM: {e}. Raw: {plan_args}")
+        })?;
 
         if plan.stages.is_empty() {
             anyhow::bail!("LLM plan has no stages");
@@ -334,11 +346,7 @@ impl MetaPlanner {
         // Validate all edge references exist
         for edge in &plan.edges {
             if !ids.contains(&edge.from) || !ids.contains(&edge.to) {
-                anyhow::bail!(
-                    "Edge references missing node: {} -> {}",
-                    edge.from,
-                    edge.to
-                );
+                anyhow::bail!("Edge references missing node: {} -> {}", edge.from, edge.to);
             }
         }
 
@@ -387,7 +395,7 @@ impl MetaPlanner {
         Ok(TaskCoordinationGraph {
             plan_id: String::new(), // filled in by caller
             run_id: String::new(),  // filled in by caller
-            version: 0,            // filled in by caller
+            version: 0,             // filled in by caller
             objective: plan.objective,
             nodes,
             edges,
@@ -397,31 +405,11 @@ impl MetaPlanner {
         })
     }
 
-    /// Resolve the planner model binding from `pent_model_role_bindings`,
-    /// falling back to any enabled chat model when no explicit planner role
-    /// is configured.
+    /// Resolve the default enabled chat model configured in the AI console.
     async fn resolve_planner_model(
         pool: &PgPool,
-        tenant_id: i64,
+        _tenant_id: i64,
     ) -> anyhow::Result<(i64, f64, u32)> {
-        let binding: Option<(i64, Option<f32>, Option<i32>)> = sqlx::query_as(
-            "SELECT model_config_id, temperature, max_output_tokens
-             FROM pent_model_role_bindings
-             WHERE tenant_id = $1 AND model_role = 'planner' AND enabled = true
-             ORDER BY CASE WHEN project_id = '0' THEN 0 ELSE 1 END
-             LIMIT 1",
-        )
-        .bind(tenant_id)
-        .fetch_optional(pool)
-        .await?;
-
-        if let Some((id, temperature, max_tokens)) = binding {
-            let temp = temperature.map(f64::from).unwrap_or(0.7);
-            let max = max_tokens.unwrap_or(4096).clamp(256, 16_000) as u32;
-            return Ok((id, temp, max));
-        }
-
-        // Fallback to any enabled chat model
         let id: i64 = sqlx::query_scalar(
             "SELECT id FROM ai.model_configs
              WHERE type = 'chat' AND status = 0
@@ -429,7 +417,7 @@ impl MetaPlanner {
         )
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("未配置可用的规划模型（planner role 或 chat model）"))?;
+        .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?;
         Ok((id, 0.7, 4096))
     }
 }
@@ -468,7 +456,11 @@ mod tests {
         assert_eq!(schema["function"]["name"], "emit_plan");
         let params = &schema["function"]["parameters"];
         assert_eq!(params["type"], "object");
-        assert!(params["required"].as_array().is_some_and(|r| r.contains(&json!("stages"))));
+        assert!(
+            params["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&json!("stages")))
+        );
     }
 
     #[test]
@@ -488,7 +480,10 @@ mod tests {
         let err = MetaPlanner::parse_tcg_from_response(&response, "target")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no stages"), "should reject empty stages: {err}");
+        assert!(
+            err.contains("no stages"),
+            "should reject empty stages: {err}"
+        );
     }
 
     #[test]
@@ -540,7 +535,10 @@ mod tests {
         let err = MetaPlanner::parse_tcg_from_response(&response, "target")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("missing node"), "should reject dangling edge: {err}");
+        assert!(
+            err.contains("missing node"),
+            "should reject dangling edge: {err}"
+        );
     }
 
     #[test]

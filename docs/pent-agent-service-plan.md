@@ -326,35 +326,25 @@ artifact.created
 `pent-core` 清洗器移除控制字符、限制长度并脱敏凭据，再把结果交给规划层。规划层不得
 直接解析异构工具 stdout；原始大输出只保存对象存储引用。
 
-基础执行器采用显式允许列表和绝对程序路径，不经过 Shell。每次调用校验目标必须等于
-Scope Snapshot 中的授权目标，并设置超时终止、空环境和输出上限。默认执行后端为
-Docker；目标网络必须通过 `PENTA_DOCKER_TARGET_NETWORK` 指向由部署方配置了出口策略的
-专用网络，未配置时网络工具失败关闭。生产构建不支持宿主机 `prlimit` 直连后端；
-`PENTA_TOOL_EXECUTOR=host` 仅供 Rust 单元测试使用，部署配置不得依赖该模式。
+基础执行器采用显式允许列表和绝对程序路径，不经过 Shell。主动检测工具统一在网关
+宿主机本地执行，通过 `/usr/bin/prlimit -- <tool>` 设置 CPU、内存、超时、空环境和输出
+上限。工具调用不再依赖 Docker 工具镜像、Docker 网络或容器执行器。
 
-生产环境应配置 `PENTA_EGRESS_POLICY_COMMAND` 为出口策略控制器的绝对路径。Worker 会以
-`prepare <run_id> <target>` 调用它，并要求返回
-`{"network_name":"...","policy_id":"..."}`；Run 结束或中断后以
-`release <policy_id>` 清理策略。控制器负责创建只允许访问该目标的 Docker 网络和出口
-ACL。未配置控制器时仅允许使用预先配置的静态 `PENTA_DOCKER_TARGET_NETWORK`。
+`TargetOnly` 策略不再按任务授权范围拦截目标；执行器只保留目标格式安全检查，拒绝空目标、
+`-` 开头、控制字符、link-local、广播和部分基础设施地址。授权范围仍用于任务展示、报告
+和上层流程，不作为本地工具执行器的硬拦截条件。
 
-工具镜像不得使用 `latest`。生产默认要求 digest，通过
-`PENTA_TOOL_IMAGE_TCP_SCAN`、`PENTA_TOOL_IMAGE_HTTP_PROBE`、
-`PENTA_TOOL_IMAGE_HTTP_REQUEST`、
-`PENTA_TOOL_IMAGE_NUCLEI`、`PENTA_TOOL_IMAGE_AFROG`、
-`PENTA_TOOL_IMAGE_DNS_LOOKUP`、`PENTA_TOOL_IMAGE_SSH_EXEC` 和
-`PENTA_TOOL_IMAGE_SQL_QUERY` 配置 `name@sha256:...`。仅本地开发可以设置
-`PENTA_REQUIRE_IMAGE_DIGEST=false` 使用固定版本标签。
+网关启动时检查 `nmap`、`nuclei`、`sqlmap`、`ffuf`、`gobuster`、`whatweb`、`nikto`、
+`subfinder`、`amass`、`wfuzz`、`dirsearch`、`feroxbuster`、`dalfox` 等宿主机工具。
+自动安装失败不会阻止服务启动，但对应工具调用会不可用。生产环境应通过系统包管理器、
+Go/Cargo/Pip 或内部软件源预安装并锁定版本。
 
-对话 HTTP 工具同样通过 Docker 隔离执行器运行；其他尚未容器化的对话网络工具不会进入
-模型工具目录。HTTP Cookie Jar 与 CSRF 状态保存在 `PENTA_TOOL_STATE_ROOT` 下的会话
-隔离目录，并只读写挂载到对应工具容器。需要完整网络访问时还必须显式设置
-`PENTA_ALLOW_FULL_NETWORK=true` 和 `PENTA_DOCKER_FULL_NETWORK`。
+HTTP Cookie Jar 与 CSRF 状态保存在 `PENTA_TOOL_STATE_ROOT` 下，默认根目录为
+`/tmp/kairos-pent-tool-state`。该目录由网关在本地创建，不再挂载进工具容器。
 
-`PENTA_ENV=development` 时可设置 `PENTA_ALLOW_DIRECT_NETWORK_TOOLS=true`，允许对
-本机隔离靶场进行直连开发测试。需要跳过中高风险审批时，还可设置
-`PENTA_AUTO_APPROVE_ALL_TOOLS=true`；每次自动批准仍写入 Run 事件审计。生产部署必须将
-`PENTA_ENV` 设为 `production`（或不设置），此时上述两个开发开关均无效。
+`PENTA_ENV=development` 会放宽部分对话模型输出预算，便于本地调试。需要跳过中高风险
+审批时，可设置 `PENTA_APPROVAL_MODE=auto`；每次自动批准仍写入 Run 事件审计。
+生产部署应设置 `PENTA_APPROVAL_MODE=policy` 恢复人工审批策略。
 
 首批解析器覆盖 Nmap/TCP 扫描、Nuclei、Afrog 和 FFUF。标准结果随后生成
 `planner.feedback`，其中包含 `continue`、`replan` 或 `stop` 指令、原因与建议动作。

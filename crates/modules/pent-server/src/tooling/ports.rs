@@ -5,10 +5,8 @@ use kairos_platform_pent_api::{
 
 #[async_trait]
 pub trait ToolCatalog: Send + Sync {
-    async fn active_tools(
-        &self,
-        request: &ToolRouteRequest,
-    ) -> anyhow::Result<Vec<ToolDescriptor>>;
+    async fn active_tools(&self, request: &ToolRouteRequest)
+    -> anyhow::Result<Vec<ToolDescriptor>>;
     async fn get(&self, tool_id: &str, version: &str) -> anyhow::Result<Option<ToolDescriptor>>;
     async fn registry_revision(&self) -> anyhow::Result<i64>;
 }

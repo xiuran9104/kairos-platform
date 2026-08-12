@@ -31,7 +31,7 @@ const columns = [
 <template>
   <Page auto-content-height>
     <div style="padding:16px">
-      <a-space style="margin-bottom:16px">
+      <a-space :size="24" style="margin-bottom:20px">
         <a-input-search v-model:value="searchText" placeholder="搜索名称/CIDR" style="width:220px" allow-clear />
         <a-button type="primary" @click="openCreate">新建区域</a-button>
         <a-button @click="fetchData">刷新</a-button>

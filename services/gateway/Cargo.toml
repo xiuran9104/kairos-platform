@@ -18,7 +18,6 @@ kairos-platform-infra-server.workspace = true
 kairos-platform-ai-server.workspace = true
 kairos-platform-media-server.workspace = true
 kairos-platform-system-server.workspace = true
-kairos-platform-toon-server.workspace = true
 kairos-platform-scan-server.workspace = true
 kairos-platform-pent-server.workspace = true
 serde.workspace = true

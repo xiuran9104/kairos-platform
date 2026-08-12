@@ -68,10 +68,9 @@ pub fn apply_plan_delta(
                     node.objective = objective.into();
                 }
                 if let Some(status) = patch.get("status").and_then(|value| value.as_str()) {
-                    let status: PlanNodeStatus = serde_json::from_value(
-                        serde_json::Value::String(status.to_string()),
-                    )
-                    .map_err(|_| vec![format!("invalid_status_patch:{status}")])?;
+                    let status: PlanNodeStatus =
+                        serde_json::from_value(serde_json::Value::String(status.to_string()))
+                            .map_err(|_| vec![format!("invalid_status_patch:{status}")])?;
                     node.status = status;
                 }
                 if let Some(attempt) = patch.get("attempt").and_then(|value| value.as_u64()) {

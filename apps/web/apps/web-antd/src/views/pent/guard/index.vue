@@ -38,36 +38,12 @@ onMounted(fetchAll);
 </script>
 
 <template>
-  <div class="p-4">
+  <div style="padding:16px;background:var(--ant-color-bg-layout);min-height:100%">
     <a-page-header title="拦截中心" sub-title="双引擎护栏：静态规则 + LLM 语义审计">
       <template #extra>
         <a-button @click="fetchAll" :loading="loading">刷新</a-button>
       </template>
     </a-page-header>
-
-    <!-- Stats -->
-    <a-row :gutter="[16, 16]" class="mb-4">
-      <a-col :xs="12" :md="6">
-        <a-card size="small">
-          <a-statistic title="静态规则" :value="rules.filter((r: any) => r.rule_type === 'static').length" value-style="color: var(--ant-color-primary)" />
-        </a-card>
-      </a-col>
-      <a-col :xs="12" :md="6">
-        <a-card size="small">
-          <a-statistic title="语义规则" :value="rules.filter((r: any) => r.rule_type === 'semantic').length" value-style="color: #722ed1" />
-        </a-card>
-      </a-col>
-      <a-col :xs="12" :md="6">
-        <a-card size="small">
-          <a-statistic title="今日拦截" :value="interceptions.length" value-style="color: var(--ant-color-error)" />
-        </a-card>
-      </a-col>
-      <a-col :xs="12" :md="6">
-        <a-card size="small">
-          <a-statistic title="启用规则" :value="rules.filter((r: any) => r.enabled).length" value-style="color: var(--ant-color-success)" />
-        </a-card>
-      </a-col>
-    </a-row>
 
     <a-tabs v-model:activeKey="activeTab">
       <!-- 规则管理 -->

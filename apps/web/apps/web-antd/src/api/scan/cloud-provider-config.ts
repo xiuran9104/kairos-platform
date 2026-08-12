@@ -2,9 +2,11 @@ import { requestClient } from '#/api/request';
 
 export namespace ScanCloudProviderConfigApi {
   export interface CloudProviderConfig {
-    id?: number; zone_id?: number; platform_id?: number; provider: string;
+    id?: number; platform_id: number; provider: string;
     region_id: string; region_name: string; available_zones: string[];
     account_name: string; access_key_id: string; access_key_secret: string;
+    auth_type: string; auth_username?: string; auth_password?: string;
+    auth_domain?: string; project_id?: string;
     status: string; remarks?: string; last_test_time?: string; last_test_result?: string;
     created_at: string; updated_at?: string;
   }

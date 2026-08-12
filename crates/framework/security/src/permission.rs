@@ -102,10 +102,10 @@ mod tests {
     #[test]
     fn exact_and_segment_wildcards_are_supported() {
         let permissions =
-            PermissionSet::new([permission("system:user:read"), permission("toon:project:*")]);
+            PermissionSet::new([permission("system:user:read"), permission("media:asset:*")]);
 
         assert!(permissions.allows(&permission("system:user:read")));
-        assert!(permissions.allows(&permission("toon:project:update")));
+        assert!(permissions.allows(&permission("media:asset:update")));
         assert!(!permissions.allows(&permission("system:role:read")));
     }
 

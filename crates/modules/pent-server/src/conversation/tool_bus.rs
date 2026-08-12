@@ -7,7 +7,7 @@
 //!
 //! When NATS is unavailable, falls back to synchronous in-process execution.
 
-use crate::infrastructure::process::{ContainerLimits, NetworkPolicy};
+use crate::infrastructure::process::{NetworkPolicy, ToolExecutionLimits};
 use crate::infrastructure::tool_registry;
 use crate::transport::mq::{NatsHandle, NatsSubscription};
 use serde::{Deserialize, Serialize};
@@ -70,11 +70,7 @@ impl ConversationToolBus {
 
     /// Publish tool tasks to NATS and spawn local workers to execute them.
     /// Returns immediately; results must be collected via `collect_results`.
-    pub async fn dispatch(
-        &self,
-        turn_id: &str,
-        tasks: &[ToolTask],
-    ) -> anyhow::Result<()> {
+    pub async fn dispatch(&self, turn_id: &str, tasks: &[ToolTask]) -> anyhow::Result<()> {
         if self.sync_fallback {
             return Ok(());
         }
@@ -112,30 +108,32 @@ impl ConversationToolBus {
             }
         };
 
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let mut results = Vec::with_capacity(expected_count);
 
         while results.len() < expected_count {
             match tokio::time::timeout_at(deadline, sub.next()).await {
-                Ok(Some(payload)) => {
-                    match serde_json::from_slice::<ToolResult>(&payload) {
-                        Ok(result) => {
-                            debug!(
-                                tool = %result.tool_name,
-                                success = result.success,
-                                "received tool result"
-                            );
-                            results.push(result);
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "failed to parse tool result");
-                        }
+                Ok(Some(payload)) => match serde_json::from_slice::<ToolResult>(&payload) {
+                    Ok(result) => {
+                        debug!(
+                            tool = %result.tool_name,
+                            success = result.success,
+                            "received tool result"
+                        );
+                        results.push(result);
                     }
-                }
+                    Err(e) => {
+                        warn!(error = %e, "failed to parse tool result");
+                    }
+                },
                 Ok(None) => break, // subscription closed
                 Err(_) => {
-                    debug!(turn_id, received = results.len(), expected = expected_count, "result collection timed out");
+                    debug!(
+                        turn_id,
+                        received = results.len(),
+                        expected = expected_count,
+                        "result collection timed out"
+                    );
                     break;
                 }
             }
@@ -147,13 +145,13 @@ impl ConversationToolBus {
         // Directly use async_nats subscriber since NatsEventBus doesn't expose subscribe
         // via NatsHandle. We create our own subscription via the raw client.
         // For now, return an empty subscription — the caller falls back to sync.
-        Err(anyhow::anyhow!("direct NATS subscribe not available via handle"))
+        Err(anyhow::anyhow!(
+            "direct NATS subscribe not available via handle"
+        ))
     }
 
     /// Synchronous fallback: execute tools in-process with per-tool timeout.
-    pub async fn execute_sync(
-        tasks: &[ToolTask],
-    ) -> Vec<ToolResult> {
+    pub async fn execute_sync(tasks: &[ToolTask]) -> Vec<ToolResult> {
         let mut results = Vec::with_capacity(tasks.len());
         for task in tasks {
             let result = Self::execute_one(task).await;
@@ -166,20 +164,20 @@ impl ConversationToolBus {
         let start = std::time::Instant::now();
         let policy = match task.network_policy.as_str() {
             "full" => NetworkPolicy::Full,
-            "none" => NetworkPolicy::None,
-            _ => NetworkPolicy::TargetOnly(task.arguments.last().cloned().unwrap_or_default()),
+            "none" => NetworkPolicy::Full,
+            _ => NetworkPolicy::Full,
         };
-        let limits = ContainerLimits {
-            cpu_cores: 1.0,
-            memory_mb: 256,
+        let limits = ToolExecutionLimits {
             timeout_seconds: DEFAULT_TOOL_TIMEOUT_SECS,
             network_access: policy,
-            network_name: None,
-            allowed_paths: vec![],
-            backend: crate::infrastructure::process::ExecutionBackend::Docker,
+            ..Default::default()
         };
 
-        let prepared = match tool_registry::prepare_tool(&task.tool_name, &task.arguments, &limits.network_access) {
+        let prepared = match tool_registry::prepare_tool(
+            &task.tool_name,
+            &task.arguments,
+            &limits.network_access,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 return ToolResult {
@@ -194,11 +192,7 @@ impl ConversationToolBus {
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS),
-            crate::infrastructure::process::execute_tool(
-                &task.tool_name,
-                &task.arguments,
-                &limits,
-            ),
+            crate::infrastructure::process::execute_tool(&task.tool_name, &task.arguments, &limits),
         )
         .await;
 
@@ -230,10 +224,7 @@ impl ConversationToolBus {
 
     /// Spawn a local worker that subscribes to NATS tool tasks and executes
     /// them, publishing results back. Runs until the subscription closes.
-    pub async fn spawn_local_worker(
-        nats: NatsHandle,
-        turn_id: String,
-    ) -> anyhow::Result<()> {
+    pub async fn spawn_local_worker(nats: NatsHandle, turn_id: String) -> anyhow::Result<()> {
         let tasks_subject = format!("penta.conversation.tools.{}", turn_id);
         let results_subject = format!("penta.conversation.results.{}", turn_id);
 

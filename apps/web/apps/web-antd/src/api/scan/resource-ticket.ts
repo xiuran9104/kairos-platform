@@ -24,5 +24,6 @@ export function createResourceTicket(data: any) { return requestClient.post('/as
 export function updateResourceTicket(id: number, data: any) { return requestClient.put(`/asset-ops/resource-tickets/${id}`, data); }
 export function deleteResourceTicket(id: number) { return requestClient.delete(`/asset-ops/resource-tickets/${id}`); }
 export function approveTicket(id: number, data: { approved: boolean; comment?: string }) { return requestClient.post(`/asset-ops/resource-tickets/${id}/approve`, data); }
-export function provisionTicket(id: number, data: { details?: string }) { return requestClient.post(`/asset-ops/resource-tickets/${id}/provision`, data); }
+export function getTicketApprovalHistory(id: number) { return requestClient.get<any[]>(`/asset-ops/resource-tickets/${id}/approvals`); }
+export function provisionTicket(id: number, data: { details?: string; config_id?: number; image_id?: string; flavor?: string }) { return requestClient.post(`/asset-ops/resource-tickets/${id}/provision`, data); }
 export function deliverTicket(id: number, data: { comment?: string }) { return requestClient.post(`/asset-ops/resource-tickets/${id}/deliver`, data); }

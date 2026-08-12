@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { ref, onMounted } from 'vue';
+import { computed, ref, onMounted } from 'vue';
 import { Page } from '@vben/common-ui';
 import { message } from 'ant-design-vue';
 import {
@@ -10,23 +10,30 @@ import {
 } from '#/api/scan/scanner';
 import type { ScanScannerApi } from '#/api/scan/scanner';
 import { executeScan, getScanResults } from '#/api/scan/task';
+import { useLocalTableSearch } from '../composables/useLocalTableSearch';
 
 type Scanner = ScanScannerApi.ScannerConfig;
 const data = ref<Scanner[]>([]);
+const { filteredRows, searchText } = useLocalTableSearch(data, ['name', 'scanner_type']);
 const results = ref<any[]>([]);
 const loading = ref(false);
 const scanning = ref(false);
 const scanVisible = ref(false);
 const configVisible = ref(false);
 const editingId = ref<string>();
-const form = ref<Scanner>({ id:'',name:'',scanner_type:'basic_tcp',enabled:true,config:{} });
+const form = ref<Scanner>({ id:'',name:'',scanner_type:'rustscan',enabled:true,config:{} });
+const registrationVisible = ref(false);
+const registeredNode = ref<Scanner>();
+const registrationCommand = computed(()=>registeredNode.value?.registration_token ? `kairos-scan-agent register --server ${window.location.origin}/api --token ${registeredNode.value.registration_token} --name ${registeredNode.value.name}` : '');
 const scanForm = ref({ target_ip:'', ports:[22,80,443,3306,3389,8080,8443] });
 
 const columns = [
   { title:'名称', dataIndex:'name', key:'name' },
-  { title:'扫描引擎', dataIndex:'scanner_type', key:'scanner_type', width:120 },
-  { title:'状态', dataIndex:'enabled', key:'enabled', width:80 },
-  { title:'更新时间', dataIndex:'updated_at', key:'updated_at', width:180 },
+  { title:'引擎', dataIndex:'scanner_type', key:'scanner_type', width:100 },
+  { title:'注册状态', key:'agent_status', width:100 },
+  { title:'Agent / 地址', key:'agent', width:180 },
+  { title:'最后心跳', dataIndex:'last_heartbeat', key:'last_heartbeat', width:180 },
+  { title:'启用', dataIndex:'enabled', key:'enabled', width:70 },
   { title:'操作', key:'actions', width:140 },
 ];
 
@@ -35,12 +42,12 @@ onMounted(fetchData);
 
 function openConfig(edit?:Scanner) {
   editingId.value = edit?.id;
-  form.value = edit ? {...edit} : { id:'',name:'',scanner_type:'basic_tcp',enabled:true,config:{} };
+  form.value = edit ? {...edit} : { id:'',name:'',scanner_type:'rustscan',enabled:true,config:{} };
   configVisible.value = true;
 }
 async function handleConfig() {
   if (editingId.value) { await updateScanner(editingId.value,form.value as any); message.success('更新成功'); }
-  else { await createScanner(form.value as any); message.success('创建成功'); }
+  else { registeredNode.value=await createScanner(form.value as any) as any; registrationVisible.value=true; message.success('注册凭证已生成'); }
   configVisible.value=false; fetchData();
 }
 
@@ -56,20 +63,16 @@ const typeLabel:Record<string,string> = { basic_tcp:'TCP 连接', rustscan:'Rust
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
-      <a-page-header title="扫描器管理" sub-title="配置扫描引擎 · 执行端口扫描 · 查看结果" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
-        <template #extra>
-          <a-space>
-            <a-button @click="scanVisible=true" type="primary" ghost><Icon icon="lucide:scan-search" /> 执行扫描</a-button>
-            <a-button type="primary" @click="openConfig()"><Icon icon="lucide:plus" /> 新建扫描器</a-button>
-          </a-space>
-        </template>
-      </a-page-header>
+    <div style="padding:16px">
+      <a-page-header title="扫描节点" sub-title="维护执行扫描任务的节点与扫描引擎" style="margin-bottom:16px;padding:0" />
+      <a-space :size="20" style="margin-bottom:20px" wrap><a-button type="primary" @click="openConfig()"><Icon icon="lucide:plus" /> 创建扫描节点</a-button><a-button @click="scanVisible=true" type="primary" ghost><Icon icon="lucide:scan-search" /> 快速扫描</a-button><a-input-search v-model:value="searchText" allow-clear placeholder="搜索节点名称或引擎" style="width:260px" /><a-button :loading="loading" @click="fetchData"><Icon icon="lucide:refresh-cw" /> 刷新</a-button></a-space>
 
-      <a-card title="扫描器配置" size="small" style="border-radius:8px;margin-bottom:16px">
-        <a-table :columns="columns" :data-source="data" :loading="loading" row-key="id" size="middle" :pagination="false">
+      <a-card title="扫描节点列表" size="small" style="border-radius:8px;margin-bottom:16px">
+        <a-table :columns="columns" :data-source="filteredRows" :loading="loading" row-key="id" size="middle" :pagination="false">
           <template #bodyCell="{ column, record }">
             <template v-if="column.key==='scanner_type'"><a-tag>{{ typeLabel[record.scanner_type]||record.scanner_type }}</a-tag></template>
+            <template v-if="column.key==='agent_status'"><a-badge :status="record.agent_status==='online'?'success':record.agent_status==='pending'?'processing':'default'" :text="record.agent_status==='online'?'在线':record.agent_status==='pending'?'待注册':'离线'" /></template>
+            <template v-if="column.key==='agent'"><div>{{record.agent_hostname||'-'}}</div><div style="font-size:12px;color:var(--ant-color-text-secondary)">{{record.agent_version||'未注册'}}<span v-if="record.agent_ip"> / {{record.agent_ip}}</span></div></template>
             <template v-if="column.key==='enabled'"><a-badge :status="record.enabled?'success':'default'" :text="record.enabled?'启用':'禁用'" /></template>
             <template v-if="column.key==='actions'">
               <a-space>
@@ -106,13 +109,21 @@ const typeLabel:Record<string,string> = { basic_tcp:'TCP 连接', rustscan:'Rust
       </a-modal>
 
       <!-- Config Modal -->
-      <a-modal v-model:open="configVisible" :title="editingId?'编辑扫描器':'新建扫描器'" @ok="handleConfig" width="500px">
+      <a-modal v-model:open="configVisible" :title="editingId?'编辑扫描节点':'创建扫描节点'" @ok="handleConfig" width="500px">
         <a-form layout="vertical">
           <a-form-item label="名称" required><a-input v-model:value="form.name" placeholder="例如：生产环境扫描器" /></a-form-item>
-          <a-form-item label="扫描引擎"><a-select v-model:value="form.scanner_type"><a-select-option value="basic_tcp">TCP 连接扫描</a-select-option><a-select-option value="rustscan">RustScan 高速扫描</a-select-option><a-select-option value="nmap">Nmap 深度扫描</a-select-option><a-select-option value="hybrid">混合引擎</a-select-option></a-select></a-form-item>
+          <a-form-item label="扫描引擎"><a-input value="RustScan（IP 存活与端口发现）" disabled /></a-form-item>
           <a-form-item label="启用"><a-switch v-model:checked="form.enabled" /></a-form-item>
         </a-form>
+      </a-modal>
+      <a-modal v-model:open="registrationVisible" title="部署并注册扫描 Agent" :footer="null" width="680px">
+        <a-alert type="warning" show-icon message="注册令牌只在本次创建后展示，有效期 24 小时，请立即复制到目标网络执行。" style="margin-bottom:16px" />
+        <a-typography-title :level="5">注册命令</a-typography-title>
+        <a-typography-paragraph copyable><pre class="registration-command">{{registrationCommand}}</pre></a-typography-paragraph>
+        <a-steps direction="vertical" size="small" :current="0" :items="[{title:'安装 Agent 与 RustScan',description:'在能够访问目标网段的 Linux 主机上安装'},{title:'执行注册命令',description:'Agent 主动连接平台并完成注册'},{title:'等待节点上线',description:'节点每 30 秒发送一次心跳'}]" />
       </a-modal>
     </div>
   </Page>
 </template>
+
+<style scoped>.registration-command{padding:12px;white-space:pre-wrap;word-break:break-all;background:var(--ant-color-fill-tertiary);border-radius:6px}</style>

@@ -78,6 +78,7 @@ pub enum TaskStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScanTask {
     pub id: String,
+    pub scanner_id: Option<String>,
     pub name: String,
     pub target: String,
     pub status: TaskStatus,
@@ -94,6 +95,7 @@ pub struct ScanTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskRequest {
+    pub scanner_id: String,
     pub name: String,
     pub target: String,
     pub port_policy: String,
@@ -120,6 +122,22 @@ pub struct ScannerConfig {
     pub config: serde_json::Value,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    #[serde(default)]
+    pub agent_status: Option<String>,
+    #[serde(default)]
+    pub agent_version: Option<String>,
+    #[serde(default)]
+    pub agent_hostname: Option<String>,
+    #[serde(default)]
+    pub agent_ip: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub registered_at: Option<String>,
+    #[serde(default)]
+    pub last_heartbeat: Option<String>,
+    #[serde(default)]
+    pub registration_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +154,22 @@ pub struct UpdateScannerRequest {
     pub scanner_type: Option<String>,
     pub enabled: Option<bool>,
     pub config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterScannerAgentRequest {
+    pub token: String,
+    pub agent_version: String,
+    pub hostname: String,
+    pub ip_address: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannerHeartbeatRequest {
+    pub node_id: String,
+    pub token: String,
 }
 
 // ── Risk ──────────────────────────────────────────────────────────────────
@@ -355,7 +389,7 @@ pub struct MachineRoom {
     pub room_code: String,
     pub facility_type: String,
     pub address: String,
-    pub provider_id: i32,
+    pub platform_id: i32,
     pub room_type: String,
     pub contact_person: String,
     pub contact_phone: String,
@@ -374,7 +408,7 @@ pub struct CreateMachineRoomRequest {
     pub room_code: String,
     pub facility_type: String,
     pub address: String,
-    pub provider_id: i32,
+    pub platform_id: i32,
     pub room_type: String,
     pub contact_person: String,
     pub contact_phone: String,
@@ -391,7 +425,7 @@ pub struct UpdateMachineRoomRequest {
     pub room_code: Option<String>,
     pub facility_type: Option<String>,
     pub address: Option<String>,
-    pub provider_id: Option<i32>,
+    pub platform_id: Option<i32>,
     pub room_type: Option<String>,
     pub contact_person: Option<String>,
     pub contact_phone: Option<String>,
@@ -400,6 +434,58 @@ pub struct UpdateMachineRoomRequest {
     pub area_size: Option<String>,
     pub remarks: Option<String>,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CabinetRow {
+    pub id: i32,
+    pub machine_room_id: i32,
+    pub row_name: String,
+    pub row_code: String,
+    pub sort: i32,
+    pub status: String,
+    pub remarks: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cabinet {
+    pub id: i32,
+    pub row_id: i32,
+    pub cabinet_name: String,
+    pub cabinet_code: String,
+    pub total_u: i32,
+    pub power_capacity_kw: Option<f64>,
+    pub status: String,
+    pub remarks: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCabinetRowRequest {
+    pub machine_room_id: i32,
+    pub row_name: String,
+    pub row_code: String,
+    pub sort: Option<i32>,
+    pub status: Option<String>,
+    pub remarks: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCabinetRequest {
+    pub row_id: i32,
+    pub cabinet_name: String,
+    pub cabinet_code: String,
+    pub total_u: i32,
+    pub power_capacity_kw: Option<f64>,
+    pub status: Option<String>,
+    pub remarks: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigureMachineRoomCabinetsRequest {
+    pub machine_room_id: i32,
+    pub row_count: i32,
+    pub cabinets_per_row: i32,
+    pub cabinet_total_u: i32,
 }
 
 // ── Service provider ──────────────────────────────────────────────────────
@@ -458,6 +544,48 @@ pub struct UpdateServiceProviderRequest {
 // ── Security product ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfrastructureDevice {
+    pub id: i32,
+    pub device_type: String,
+    pub name: String,
+    pub category: String,
+    pub vendor: String,
+    pub model: String,
+    pub serial_number: Option<String>,
+    pub management_ip: Option<String>,
+    pub business_ip: Option<String>,
+    pub machine_room_id: Option<i32>,
+    pub rack_position: Option<String>,
+    pub status: String,
+    pub specification: Option<String>,
+    pub capacity: Option<String>,
+    pub contact_person: Option<String>,
+    pub contact_phone: Option<String>,
+    pub remarks: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInfrastructureDeviceRequest {
+    pub device_type: String,
+    pub name: String,
+    pub category: String,
+    pub vendor: String,
+    pub model: String,
+    pub serial_number: Option<String>,
+    pub management_ip: Option<String>,
+    pub business_ip: Option<String>,
+    pub machine_room_id: Option<i32>,
+    pub rack_position: Option<String>,
+    pub status: Option<String>,
+    pub specification: Option<String>,
+    pub capacity: Option<String>,
+    pub contact_person: Option<String>,
+    pub contact_phone: Option<String>,
+    pub remarks: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityProduct {
     pub id: i32,
     pub name: String,
@@ -472,7 +600,7 @@ pub struct SecurityProduct {
     pub deployment_mode: String,
     pub cloud_platform_id: Option<i32>,
     pub machine_room_id: Option<i32>,
-    pub provider_id: Option<i32>,
+    pub provider_id: i32,
     pub status: String,
     pub features: Option<String>,
     pub throughput: Option<String>,
@@ -535,6 +663,8 @@ pub struct CloudZone {
     pub id: Option<i32>,
     pub zone_name: String,
     pub zone_code: String,
+    pub zone_type: String,
+    pub provider_id: i32,
     pub description: Option<String>,
     pub created_at: String,
 }
@@ -543,6 +673,8 @@ pub struct CloudZone {
 pub struct CreateCloudZoneRequest {
     pub zone_name: String,
     pub zone_code: String,
+    pub zone_type: String,
+    pub provider_id: i32,
     pub description: Option<String>,
 }
 
@@ -550,6 +682,8 @@ pub struct CreateCloudZoneRequest {
 pub struct UpdateCloudZoneRequest {
     pub zone_name: Option<String>,
     pub zone_code: Option<String>,
+    pub zone_type: Option<String>,
+    pub provider_id: Option<i32>,
     pub description: Option<String>,
 }
 
@@ -589,6 +723,14 @@ pub enum CloudProviderVendor {
     Tencent,
     #[serde(rename = "huawei")]
     Huawei,
+    #[serde(rename = "hcs")]
+    Hcs,
+    #[serde(rename = "apsara")]
+    Apsara,
+    #[serde(rename = "tstack")]
+    TStack,
+    #[serde(rename = "openstack")]
+    OpenStack,
     #[serde(rename = "aws")]
     Aws,
     #[serde(rename = "azure")]
@@ -614,8 +756,7 @@ pub enum CloudProviderConfigStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudProviderConfig {
     pub id: Option<i32>,
-    pub zone_id: Option<i32>,
-    pub platform_id: Option<i32>,
+    pub platform_id: i32,
     pub provider: CloudProviderVendor,
     pub region_id: String,
     pub region_name: String,
@@ -623,6 +764,11 @@ pub struct CloudProviderConfig {
     pub account_name: String,
     pub access_key_id: String,
     pub access_key_secret: String,
+    pub auth_type: String,
+    pub auth_username: Option<String>,
+    pub auth_password: Option<String>,
+    pub auth_domain: Option<String>,
+    pub project_id: Option<String>,
     pub status: CloudProviderConfigStatus,
     pub remarks: Option<String>,
     pub last_test_time: Option<String>,
@@ -633,25 +779,37 @@ pub struct CloudProviderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateCloudProviderConfigRequest {
-    pub zone_id: Option<i32>,
-    pub platform_id: Option<i32>,
+    pub platform_id: i32,
     pub provider: CloudProviderVendor,
     pub region_id: String,
     pub region_name: String,
-    pub available_zones: Vec<String>,
+    pub available_zones: Option<Vec<String>>,
     pub account_name: String,
     pub access_key_id: String,
     pub access_key_secret: String,
+    pub auth_type: Option<String>,
+    pub auth_username: Option<String>,
+    pub auth_password: Option<String>,
+    pub auth_domain: Option<String>,
+    pub project_id: Option<String>,
     pub remarks: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCloudProviderConfigRequest {
+    pub platform_id: Option<i32>,
+    pub provider: Option<CloudProviderVendor>,
+    pub region_id: Option<String>,
     pub region_name: Option<String>,
     pub available_zones: Option<Vec<String>>,
     pub account_name: Option<String>,
     pub access_key_id: Option<String>,
     pub access_key_secret: Option<String>,
+    pub auth_type: Option<String>,
+    pub auth_username: Option<String>,
+    pub auth_password: Option<String>,
+    pub auth_domain: Option<String>,
+    pub project_id: Option<String>,
     pub status: Option<CloudProviderConfigStatus>,
     pub remarks: Option<String>,
 }
@@ -689,6 +847,18 @@ impl TicketStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceTicket {
     pub id: Option<i32>,
+    pub ticket_type: String,
+    pub risk_level: String,
+    pub target_resource_id: Option<i32>,
+    pub target_config: Option<String>,
+    pub maintenance_window: Option<String>,
+    pub allow_interruption: bool,
+    pub backup_confirmed: bool,
+    pub rollback_plan: Option<String>,
+    pub retention_until: Option<String>,
+    pub approval_stage: i32,
+    pub approval_total: i32,
+    pub current_approval_role: Option<String>,
     pub resource_type: String,
     pub ecs_name: String,
     pub ticket_status: TicketStatus,
@@ -741,6 +911,14 @@ pub struct ResourceTicket {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateResourceTicketRequest {
+    pub ticket_type: Option<String>,
+    pub target_resource_id: Option<i32>,
+    pub target_config: Option<String>,
+    pub maintenance_window: Option<String>,
+    pub allow_interruption: Option<bool>,
+    pub backup_confirmed: Option<bool>,
+    pub rollback_plan: Option<String>,
+    pub retention_until: Option<String>,
     pub resource_type: String,
     pub ecs_name: String,
     pub provider_id: Option<i32>,
@@ -808,6 +986,9 @@ pub struct ApproveTicketRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionTicketRequest {
     pub details: Option<String>,
+    pub config_id: Option<i32>,
+    pub image_id: Option<String>,
+    pub flavor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -851,12 +1032,17 @@ pub struct CreateBusinessApplicationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudServiceAsset {
     pub id: String,
+    pub provider_config_id: i32,
+    pub provider: String,
+    pub account_name: String,
     pub asset_type: String,
     pub source_type: String,
     pub name: String,
     pub instance_id: String,
     pub status: String,
     pub region: Option<String>,
+    pub region_id: Option<String>,
+    pub availability_zone: Option<String>,
     pub cloud_platform: String,
     pub cloud_zone: String,
     pub instance_type: String,
@@ -919,6 +1105,23 @@ pub struct BusinessResource {
     pub cloud_region: String,
     pub cloud_category: String,
     pub cloud_provider_config_id: Option<i32>,
+    pub machine_room_id: Option<i32>,
+    pub cabinet_id: Option<i32>,
+    pub cabinet_name: Option<String>,
+    pub chassis_name: Option<String>,
+    pub chassis_slot: Option<String>,
+    pub rack_start_u: Option<i32>,
+    pub rack_end_u: Option<i32>,
+    pub deployment_type: String,
+    pub management_ip: Option<String>,
+    pub business_ip: Option<String>,
+    pub network_cidr: Option<String>,
+    pub gateway: Option<String>,
+    pub vlan_id: Option<String>,
+    pub dns_servers: Option<String>,
+    pub mac_address: Option<String>,
+    pub switch_name: Option<String>,
+    pub switch_port: Option<String>,
     pub zone_name: Option<String>,
     pub platform_name: Option<String>,
     pub county_city: Option<String>,
@@ -988,6 +1191,23 @@ pub struct CreateBusinessResourceRequest {
     pub cloud_region: String,
     pub cloud_category: String,
     pub cloud_provider_config_id: Option<i32>,
+    pub machine_room_id: Option<i32>,
+    pub cabinet_id: Option<i32>,
+    pub cabinet_name: Option<String>,
+    pub chassis_name: Option<String>,
+    pub chassis_slot: Option<String>,
+    pub rack_start_u: Option<i32>,
+    pub rack_end_u: Option<i32>,
+    pub deployment_type: Option<String>,
+    pub management_ip: Option<String>,
+    pub business_ip: Option<String>,
+    pub network_cidr: Option<String>,
+    pub gateway: Option<String>,
+    pub vlan_id: Option<String>,
+    pub dns_servers: Option<String>,
+    pub mac_address: Option<String>,
+    pub switch_name: Option<String>,
+    pub switch_port: Option<String>,
     pub zone_name: Option<String>,
     pub platform_name: Option<String>,
     pub county_city: Option<String>,
@@ -1053,6 +1273,23 @@ pub struct UpdateBusinessResourceRequest {
     pub cloud_region: Option<String>,
     pub cloud_category: Option<String>,
     pub cloud_provider_config_id: Option<i32>,
+    pub machine_room_id: Option<i32>,
+    pub cabinet_id: Option<i32>,
+    pub cabinet_name: Option<String>,
+    pub chassis_name: Option<String>,
+    pub chassis_slot: Option<String>,
+    pub rack_start_u: Option<i32>,
+    pub rack_end_u: Option<i32>,
+    pub deployment_type: Option<String>,
+    pub management_ip: Option<String>,
+    pub business_ip: Option<String>,
+    pub network_cidr: Option<String>,
+    pub gateway: Option<String>,
+    pub vlan_id: Option<String>,
+    pub dns_servers: Option<String>,
+    pub mac_address: Option<String>,
+    pub switch_name: Option<String>,
+    pub switch_port: Option<String>,
     pub zone_name: Option<String>,
     pub platform_name: Option<String>,
     pub county_city: Option<String>,

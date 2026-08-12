@@ -21,6 +21,7 @@ pub(crate) fn routes() -> Router<PentState> {
             "/pent/sessions/{id}",
             get(get_session).delete(delete_session),
         )
+        .route("/pent/sessions/{id}/model", axum::routing::put(update_session_model))
         .route(
             "/pent/sessions/{id}/messages",
             get(list_messages).post(create_message),
@@ -36,7 +37,18 @@ async fn list_sessions(
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(s)
+        "SELECT to_jsonb(s) || jsonb_build_object(
+             'active_run_id',
+             CASE WHEN EXISTS(
+                 SELECT 1 FROM pent_runs r
+                 WHERE r.id=s.active_run_id AND r.status IN ('queued','running')
+             ) THEN s.active_run_id ELSE NULL END,
+             'run_status', COALESCE(
+                 (SELECT r.status FROM pent_runs r
+                  WHERE r.session_id=s.id ORDER BY r.created_at DESC LIMIT 1),
+                 s.status
+             )
+         )
          FROM pent_agent_sessions s
          WHERE tenant_id=$1 AND ($2 OR created_by=$3)
          ORDER BY created_at DESC
@@ -58,7 +70,18 @@ async fn get_session(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let session = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(s) FROM pent_agent_sessions s
+        "SELECT to_jsonb(s) || jsonb_build_object(
+             'active_run_id',
+             CASE WHEN EXISTS(
+                 SELECT 1 FROM pent_runs r
+                 WHERE r.id=s.active_run_id AND r.status IN ('queued','running')
+             ) THEN s.active_run_id ELSE NULL END,
+             'run_status', COALESCE(
+                 (SELECT r.status FROM pent_runs r
+                  WHERE r.session_id=s.id ORDER BY r.created_at DESC LIMIT 1),
+                 s.status
+             )
+         ) FROM pent_agent_sessions s
          WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4)",
     )
     .bind(id)
@@ -109,6 +132,44 @@ async fn delete_session(
     Ok(Json(ApiResponse::new(json!({"deleted": id}))))
 }
 
+async fn update_session_model(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+    Json(request): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    crate::security::ensure_session_access(&state.pool, &id, &user).await?;
+    let model_id = request
+        .get("model_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::bad_request("请选择模型"))?;
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ai.model_configs WHERE id=$1 AND type='chat' AND status=0)",
+    )
+    .bind(model_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(internal)?;
+    if !valid {
+        return Err(AppError::bad_request("模型不存在、未启用或不是聊天模型"));
+    }
+    let affected = sqlx::query(
+        "UPDATE pent_agent_sessions
+         SET constraints=jsonb_set(constraints,'{model_id}',to_jsonb($2::bigint),true),updated_at=now()
+         WHERE id=$1 AND active_run_id IS NULL",
+    )
+    .bind(&id)
+    .bind(model_id)
+    .execute(&state.pool)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::bad_request("会话运行中，暂时不能切换模型"));
+    }
+    Ok(Json(ApiResponse::new(json!({"model_id": model_id}))))
+}
+
 async fn create_session(
     State(state): State<PentState>,
     user: CurrentUser,
@@ -124,11 +185,14 @@ async fn create_session(
     }
 
     let session_id = Uuid::new_v4().to_string();
+    let confirmed_at = chrono::Utc::now();
     let proposal = json!({
         "targets": request.targets,
         "constraints": request.constraints,
         "source": "user_input",
-        "confirmed": false
+        "confirmed": true,
+        "confirmed_at": confirmed_at,
+        "confirmed_by": user.user_id
     });
     let message_id = Uuid::new_v4().to_string();
     let assistant_message_id = Uuid::new_v4().to_string();
@@ -155,8 +219,8 @@ async fn create_session(
     sqlx::query(
         "INSERT INTO pent_agent_sessions(
              id, tenant_id, project_id, objective, constraints, budget,
-             scope_proposal, status, created_by
-         ) VALUES($1, $2, $3, $4, $5, $6, $7, 'draft', $8)",
+             scope_proposal, confirmed_scope_snapshot, status, created_by
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, $7, 'ready', $8)",
     )
     .bind(&session_id)
     .bind(tenant_id)
@@ -191,7 +255,7 @@ async fn create_session(
     )
     .bind(assistant_message_id)
     .bind(&session_id)
-    .bind("已生成候选测试范围。确认授权范围后即可启动 Agent。")
+    .bind("请输入渗透测试目标。")
     .bind(json!({"scope_proposal": proposal}))
     .execute(&mut *tx)
     .await
@@ -200,7 +264,7 @@ async fn create_session(
     tx.commit().await.map_err(internal)?;
     Ok(Json(ApiResponse::new(json!({
         "id": session_id,
-        "status": "draft",
+        "status": "ready",
         "scope_proposal": proposal
     }))))
 }
@@ -323,9 +387,7 @@ async fn create_session_run(
         "SELECT project_id, objective, confirmed_scope_snapshot, constraints, budget
          FROM pent_agent_sessions
          WHERE id=$1 AND tenant_id=$2 AND status='ready'
-           AND ($3 OR created_by=$4)
-           AND confirmed_scope_snapshot IS NOT NULL
-           AND jsonb_array_length(confirmed_scope_snapshot->'targets') > 0",
+           AND ($3 OR created_by=$4)",
     )
     .bind(&id)
     .bind(tenant_id)
@@ -335,7 +397,7 @@ async fn create_session_run(
     .await
     .map_err(internal)?;
     let (project_id, objective, scope, constraints, budget) =
-        row.ok_or_else(|| AppError::bad_request("请先确认授权范围"))?;
+        row.ok_or_else(|| AppError::bad_request("会话不存在或状态不可用"))?;
 
     let task_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();

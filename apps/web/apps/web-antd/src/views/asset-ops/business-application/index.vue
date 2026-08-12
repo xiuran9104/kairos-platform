@@ -3,8 +3,10 @@ import { ref, onMounted } from 'vue';
 import { Page } from '@vben/common-ui';
 import { message } from 'ant-design-vue';
 import { getBusinessApplicationList, createBusinessApplication, updateBusinessApplication, deleteBusinessApplication, getApplicationEndpoints, addApplicationEndpoint } from '#/api/scan/business-application';
+import { useLocalTableSearch } from '../composables/useLocalTableSearch';
 interface App { id?: number; name: string; description?: string; }
 const data = ref<App[]>([]); const loading = ref(false); const modalVisible = ref(false); const editingId = ref<number | undefined>();
+const { filteredRows, searchText } = useLocalTableSearch(data, ['name', 'description']);
 const form = ref<App>({ name: '', description: '' });
 const epVisible = ref(false); const epAppId = ref(0); const endpoints = ref<any[]>([]); const epForm = ref({ protocol: 'TCP', dest_ip: '', nat_ip: '', dest_port: '', domain: '' });
 const columns = [{ title: '名称', dataIndex: 'name' }, { title: '描述', dataIndex: 'description' }, { title: '操作', key: 'actions', width: 280 }];
@@ -19,11 +21,11 @@ async function addEp() { await addApplicationEndpoint(epAppId.value, epForm.valu
 <template>
   <Page auto-content-height>
     <div style="padding:16px">
-      <a-space style="margin-bottom:16px"><a-button type="primary" @click="openCreate">新建应用</a-button><a-button @click="fetchData">刷新</a-button></a-space>
-      <a-table :columns="columns" :data-source="data" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:20}">
+      <a-space :size="24" style="margin-bottom:20px"><a-button type="primary" @click="openCreate">新建应用</a-button><a-input-search v-model:value="searchText" allow-clear placeholder="搜索应用名称或描述" style="width:260px" /><a-button @click="fetchData">刷新</a-button></a-space>
+      <a-table :columns="columns" :data-source="filteredRows" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:20}">
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'actions'">
-            <a-space>
+            <a-space :size="12">
               <a-button size="small" @click="openEndpoints(record)">接口</a-button>
               <a-button size="small" @click="openEdit(record)">编辑</a-button>
               <a-popconfirm title="确认删除?" @confirm="deleteBusinessApplication(record.id!).then(fetchData)"><a-button size="small" danger>删除</a-button></a-popconfirm>

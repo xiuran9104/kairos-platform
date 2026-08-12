@@ -48,44 +48,46 @@ pub trait CloudApi: Send + Sync {
     async fn list_regions(&self, creds: &CloudCredentials) -> Result<Vec<CloudRegion>, String>;
 }
 
-/// Resolve credentials from config store.
+/// Resolve persisted credentials for all cloud automation operations.
 pub async fn resolve_creds_inner(
     state: &ScanState,
     config_id: i32,
 ) -> Result<CloudCredentials, AppError> {
-    let configs = state.cloud_provider_configs.lock().await;
-    let cfg = configs
-        .iter()
-        .find(|c| c.id == Some(config_id))
-        .ok_or_else(|| AppError::not_found("cloud provider config not found"))?;
+    let cfg: (String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT provider,region_id,region_name,account_name,access_key_id,access_key_secret,auth_type,auth_username,auth_password,auth_domain,project_id
+         FROM scan_cloud_provider_configs
+         WHERE id=$1 AND deleted=0 AND status='active'",
+    )
+    .bind(config_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .ok_or_else(|| AppError::not_found("active cloud provider config not found"))?;
 
-    let kind = match cfg.provider {
-        kairos_platform_scan_api::CloudProviderVendor::Aliyun => CloudPlatformKind::Apsara,
-        kairos_platform_scan_api::CloudProviderVendor::Huawei => CloudPlatformKind::Hcs,
-        kairos_platform_scan_api::CloudProviderVendor::Tencent => CloudPlatformKind::TStack,
-        ref other => {
-            let s = format!("{:?}", other).to_lowercase();
-            match s.as_str() {
-                "openstack" => CloudPlatformKind::OpenStack,
-                "hcs" => CloudPlatformKind::Hcs,
-                "apsara" => CloudPlatformKind::Apsara,
-                "tstack" => CloudPlatformKind::TStack,
-                _ => CloudPlatformKind::Custom(s),
-            }
-        }
+    let kind = match cfg.6.as_str() {
+        "application_credential" | "keystone_password" => CloudPlatformKind::OpenStack,
+        "iam_password" => CloudPlatformKind::Hcs,
+        _ => match cfg.0.as_str() {
+            "aliyun" | "apsara" => CloudPlatformKind::Apsara,
+            "huawei" | "hcs" => CloudPlatformKind::Hcs,
+            "tencent" | "tstack" => CloudPlatformKind::TStack,
+            "openstack" => CloudPlatformKind::OpenStack,
+            other => CloudPlatformKind::Custom(other.to_string()),
+        },
     };
 
+    let uses_account_token = matches!(cfg.6.as_str(), "iam_password" | "keystone_password");
     Ok(CloudCredentials {
         kind,
-        endpoint: cfg.region_id.clone(),
-        username: Some(cfg.account_name.clone()),
-        password: None,
-        domain: None,
-        project_name: None,
-        project_id: None,
-        access_key: Some(cfg.access_key_id.clone()),
-        secret_key: Some(cfg.access_key_secret.clone()),
-        region: Some(cfg.region_name.clone()),
+        endpoint: cfg.1,
+        username: uses_account_token.then(|| cfg.7.unwrap_or(cfg.3)),
+        password: uses_account_token.then(|| cfg.8).flatten(),
+        domain: uses_account_token.then(|| cfg.9).flatten(),
+        project_name: uses_account_token.then(|| cfg.10.clone()).flatten(),
+        project_id: uses_account_token.then(|| cfg.10).flatten(),
+        access_key: (!uses_account_token).then_some(cfg.4),
+        secret_key: (!uses_account_token).then_some(cfg.5),
+        region: Some(cfg.2),
         token: None,
     })
 }
@@ -230,80 +232,39 @@ pub async fn sync(
     match adapter.list_instances(&creds).await {
         Ok(instances) => {
             instances_synced = instances.len() as u32;
-            // Store synced instances as cloud service assets
-            let mut assets = state.business_resources.lock().await;
+            let mut tx = state
+                .pool
+                .begin()
+                .await
+                .map_err(|e| AppError::internal(e.to_string()))?;
+            let instance_ids: Vec<String> = instances
+                .iter()
+                .map(|instance| instance.instance_id.clone())
+                .collect();
             for inst in &instances {
-                use kairos_platform_scan_api::BusinessResource;
-                let next_id = assets.len() as i32 + 1;
-                assets.push(BusinessResource {
-                    id: Some(next_id),
-                    resource_type: "cloud".into(),
-                    ecs_name: inst.name.clone(),
-                    ecs_status: inst.status.clone(),
-                    resource_id: inst.instance_id.clone(),
-                    cloud_region: creds.region.clone().unwrap_or_default(),
-                    cloud_category: format!("{:?}", creds.kind),
-                    cloud_provider_config_id: Some(config_id),
-                    zone_name: inst.zone.clone(),
-                    platform_name: None,
-                    county_city: None,
-                    vdc_name: None,
-                    customer_name: "sync".into(),
-                    application_name: None,
-                    contract_name: None,
-                    instance_id: inst.instance_id.clone(),
-                    ecs_type: inst.flavor.clone(),
-                    ecs_os: inst.os_type.clone(),
-                    cpu_cores: inst.cpu_cores,
-                    memory_gb: inst.memory_mb / 1024,
-                    system_disk: "cloud_ssd".into(),
-                    system_disk_size_gb: inst.system_disk_gb,
-                    data_disk: None,
-                    completion_time: None,
-                    release_time: None,
-                    has_security_product: false,
-                    ip_address: inst.private_ip.first().cloned().unwrap_or_default(),
-                    ecs_login_method: None,
-                    ecs_login_username: None,
-                    ecs_initial_password: None,
-                    bastion_address: None,
-                    bastion_admin_account: None,
-                    bastion_initial_password: None,
-                    physical_machine_info: None,
-                    cloud_vm_info: None,
-                    remarks: Some("synced from cloud platform".into()),
-                    created_at: Some(chrono::Utc::now()),
-                    updated_at: Some(chrono::Utc::now()),
-                    created_by: Some("cloud-sync".into()),
-                    updated_by: Some("cloud-sync".into()),
-                    applicant: None,
-                    department: None,
-                    approver: None,
-                    approval_time: None,
-                    approval_remarks: None,
-                    rejection_reason: None,
-                    bandwidth_mbps: None,
-                    bandwidth_type: None,
-                    public_ip_count: None,
-                    network_type: None,
-                    project_name: None,
-                    project_code: None,
-                    business_owner: None,
-                    tech_owner: None,
-                    contact_phone: None,
-                    billing_method: None,
-                    purchase_duration: None,
-                    cost_center: None,
-                    security_level: None,
-                    data_sensitivity: None,
-                    purpose: None,
-                    expected_delivery_time: None,
-                    application_status: Some("已同步".into()),
-                    delivery_status: Some("已交付".into()),
-                    delivery_confirmed_at: None,
-                    delivery_confirmed_by: None,
-                });
+                let updated = sqlx::query("UPDATE scan_business_resources SET ecs_name=$3,ecs_status=$4,resource_id=$2,cloud_region=$5,cloud_category=$6,ecs_type=$7,ecs_os=$8,cpu_cores=$9,memory_gb=$10,system_disk_size_gb=$11,ip_address=$12,deleted=0,updated_at=now() WHERE cloud_provider_config_id=$1 AND instance_id=$2")
+                    .bind(config_id).bind(&inst.instance_id).bind(&inst.name).bind(&inst.status)
+                    .bind(creds.region.as_deref().unwrap_or_default()).bind(format!("{:?}", creds.kind))
+                    .bind(&inst.flavor).bind(&inst.os_type).bind(inst.cpu_cores as i32)
+                    .bind((inst.memory_mb / 1024) as i32).bind(inst.system_disk_gb as i32)
+                    .bind(inst.private_ip.first().map(String::as_str).unwrap_or_default())
+                    .execute(&mut *tx).await.map_err(|e| AppError::internal(e.to_string()))?;
+                if updated.rows_affected() == 0 {
+                    sqlx::query("INSERT INTO scan_business_resources(resource_type,ecs_name,ecs_status,resource_id,cloud_region,cloud_category,customer_name,instance_id,ecs_type,ecs_os,cpu_cores,memory_gb,system_disk,system_disk_size_gb,ip_address,application_status,delivery_status,remarks,cloud_provider_config_id) VALUES('cloud',$1,$2,$3,$4,$5,'云平台同步',$3,$6,$7,$8,$9,'cloud_ssd',$10,$11,'已同步','已交付','synced from cloud platform',$12)")
+                        .bind(&inst.name).bind(&inst.status).bind(&inst.instance_id)
+                        .bind(creds.region.as_deref().unwrap_or_default()).bind(format!("{:?}", creds.kind))
+                        .bind(&inst.flavor).bind(&inst.os_type).bind(inst.cpu_cores as i32)
+                        .bind((inst.memory_mb / 1024) as i32).bind(inst.system_disk_gb as i32)
+                        .bind(inst.private_ip.first().map(String::as_str).unwrap_or_default()).bind(config_id)
+                        .execute(&mut *tx).await.map_err(|e| AppError::internal(e.to_string()))?;
+                }
             }
+            sqlx::query("UPDATE scan_business_resources SET deleted=1,ecs_status='云端已删除',updated_at=now() WHERE cloud_provider_config_id=$1 AND deleted=0 AND NOT (instance_id = ANY($2))")
+                .bind(config_id).bind(&instance_ids)
+                .execute(&mut *tx).await.map_err(|e| AppError::internal(e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| AppError::internal(e.to_string()))?;
         }
         Err(e) => errors.push(format!("instances: {e}")),
     }

@@ -1,7 +1,7 @@
 import { requestClient } from '#/api/request';
 
 export namespace ScanCloudZoneApi {
-  export interface CloudZone { id?: number; zone_name: string; zone_code: string; description?: string; created_at: string; }
+  export interface CloudZone { id?: number; provider_id: number; zone_name: string; zone_code: string; zone_type: 'private_cloud' | 'public_cloud'; description?: string; created_at: string; }
 }
 export namespace ScanCloudPlatformApi {
   export interface CloudPlatform { id?: number; zone_id: number; platform_name: string; platform_code: string; description?: string; created_at: string; }

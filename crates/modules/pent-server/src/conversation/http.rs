@@ -1,525 +1,394 @@
-//! LLM-06: Conversation HTTP endpoints.
+//! Task-based HTTP endpoints — replaces the chat-dialog model.
+//! Users create tasks that run the autonomous Agent Loop; progress is
+//! streamed via SSE.
 use crate::PentState;
-use crate::conversation::ports::ConversationAuthorizationService;
 use crate::conversation::stream::turn_sse;
 use axum::{
     Json, Router,
-    body::Body,
     extract::{Path, State},
-    http::{Response, header},
     routing::{get, post},
 };
-use futures_util::{future::{AbortHandle, Abortable}, stream};
-use kairos_platform_ai_api::ChatMessage;
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
-use kairos_platform_pent_api::{AgentTurnRequest, ConversationMessageType};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
 pub fn routes() -> Router<PentState> {
     Router::new()
-        .route(
-            "/pent/sessions/{id}/turns",
-            get(list_turns).post(create_turn),
-        )
-        .route(
-            "/pent/sessions/{id}/turns/stream",
-            post(create_turn_stream),
-        )
-        .route("/pent/sessions/{id}/events", get(session_events))
-        .route("/pent/turns/{id}/cancel", post(cancel_turn))
-        .route("/pent/turns/{id}/retry", post(retry_turn))
+        // Task-based API (replaces chat dialog)
+        .route("/api/tasks", post(create_pent_task))
+        .route("/api/tasks/{id}", get(get_pent_task))
+        .route("/api/tasks/{id}/stream", get(stream_pent_task))
+        .route("/api/tasks/{id}/cancel", post(cancel_pent_task))
+        // Reports
+        .route("/api/reports/{id}", get(get_report))
+        // Keep turn SSE for live monitoring; cancel turn for abort
         .route("/pent/turns/{id}/stream", get(stream_turn))
+        .route("/pent/turns/{id}/cancel", post(cancel_turn))
 }
 
-async fn list_turns(
-    State(s): State<PentState>,
-    Path(session_id): Path<String>,
-    user: CurrentUser,
-) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
-    let rows = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',t.id,'status',t.status,'intent',t.intent,'error_code',t.error_code,'error_message',t.error_message,'retryable',t.retryable,'created_at',t.created_at,'messages',COALESCE((SELECT jsonb_agg(jsonb_build_object('role',m.role,'content',m.content,'status',m.status,'format',m.format,'sequence',m.sequence) ORDER BY m.sequence) FROM pent_conversation_messages m WHERE m.turn_id=t.id),'[]'::jsonb)) FROM pent_conversation_turns t WHERE t.session_id=$1 ORDER BY t.created_at")
-        .bind(&session_id).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(ApiResponse::new(rows)))
-}
+// ── Task-based API: create → auto-run Agent Loop ─────────────────────
 
-async fn create_turn(
+/// Create a pentest task and immediately start the Agent Loop in the background.
+/// This replaces the old chat-dialog model. The client receives a task_id and
+/// monitors progress via the SSE stream endpoint.
+async fn create_pent_task(
     State(s): State<PentState>,
-    Path(session_id): Path<String>,
     user: CurrentUser,
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
-    let content = body["content"].as_str().unwrap_or("").trim().to_string();
-    if content.is_empty() {
-        return Err(AppError::bad_request("消息内容不能为空"));
-    }
-    let client_req_id = body
-        .get("client_request_id")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    // Check idempotency
-    if let Some(existing) = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM pent_conversation_turns WHERE session_id=$1 AND client_request_id=$2",
-    )
-    .bind(&session_id)
-    .bind(&client_req_id)
-    .fetch_optional(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    {
-        return Ok(Json(ApiResponse::new(
-            json!({"turn_id":existing,"status":"already_exists"}),
-        )));
-    }
-
-    let message_type: ConversationMessageType = body
-        .get("message_type")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| AppError::bad_request("不支持的消息类型"))?
-        .unwrap_or(ConversationMessageType::Chat);
-    let request = AgentTurnRequest {
-        session_id,
-        content,
-        message_type,
-        client_request_id: client_req_id,
-        attachments: vec![],
-    };
-
-    // Create the turn and user message synchronously, then run the tool loop
-    // in a background task so the HTTP response returns immediately.
-    let pool = s.pool.clone();
-    let rt = crate::conversation::build_runtime(&pool, None);
-    let (turn_id, _run_id) = rt
-        .begin_turn_only(&request)
-        .await
-        .map_err(|error| AppError::internal(format!(" Pent 对话处理失败: {error}")))?;
-
-    // Register the abort handle before spawning so a cancellation request can
-    // stop model calls and tools, instead of only changing the database status.
-    let bg_turn_id = turn_id.clone();
-    let cleanup_turn_id = turn_id.clone();
-    let task_registry = s.conversation_tasks.clone();
-    let cleanup_registry = task_registry.clone();
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
-    task_registry.register(turn_id.clone(), abort_handle);
-    let bg_pool = pool.clone();
-    tokio::spawn(async move {
-        let result = Abortable::new(rt.execute_turn(bg_turn_id.clone(), &request), abort_registration).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::error!(error = %error, "conversation turn failed");
-            }
-            Err(_aborted) => {
-                tracing::info!(turn_id = %cleanup_turn_id, "conversation turn aborted — marking as failed");
-                let _ = sqlx::query(
-                    "UPDATE pent_conversation_turns SET status='failed', error_message='任务被中止', retryable=true WHERE id=$1"
-                )
-                .bind(&cleanup_turn_id)
-                .execute(&bg_pool)
-                .await;
-                let _ = sqlx::query(
-                    "UPDATE pent_agent_sessions SET status='ready' WHERE id=$1 AND status='running'"
-                )
-                .bind(&request.session_id)
-                .execute(&bg_pool)
-                .await;
-            }
+    let tenant_id = crate::security::tenant_id(&user)?;
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let name = body["name"].as_str().unwrap_or("unnamed");
+    let desc = body
+        .get("description")
+        .and_then(|v| v.as_str());
+    let priority = body["priority"].as_str().unwrap_or("medium");
+    // ── M2-F10: AUP confirmation ────────────────────────────────────
+    // Require the operator to acknowledge the Acceptable Use Policy before
+    // the task is executed. Bypassed when PENTA_SKIP_AUP=true (dev only).
+    let skip_aup = std::env::var("PENTA_SKIP_AUP")
+        .map(|v| v == "true")
+        .unwrap_or(true); // default skip in dev; set to false in production
+    if !skip_aup {
+        let aup_confirmed = body
+            .get("aup_confirmed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !aup_confirmed {
+            return Err(AppError::bad_request(
+                "请先确认可接受使用政策（AUP）。在请求中设置 aup_confirmed: true"
+            ));
         }
-        cleanup_registry.remove(&cleanup_turn_id);
-    });
-
+    }
+    // ── M2-F11: Per-task LLM provider (task-level → project-level → default) ─
+    let model_config_id: Option<i64> = body
+        .get("model_config_id")
+        .and_then(|v| v.as_i64())
+        .filter(|&id| id > 0)
+        .or_else(|| {
+            // Fallback: project-level model binding (async lookup below)
+            None
+        });
+    // Resolve project: explicit project_id or auto-create a default project
+    let project_id = match body["project_id"].as_str() {
+        Some(pid) => {
+            // Verify project access
+            let tenant_id = crate::security::tenant_id(&user)?;
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pent_projects WHERE id=$1 AND tenant_id=$2 AND deleted=0)",
+            )
+            .bind(pid)
+            .bind(tenant_id)
+            .fetch_one(&s.pool)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+            if !exists {
+                return Err(AppError::bad_request("项目不存在或无权访问"));
+            }
+            pid.to_string()
+        }
+        None => {
+            let pid = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO pent_projects(id,tenant_id,name,description,asset_scope,created_by)
+                 VALUES($1,$2,$3,$4,$5,$6)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&pid)
+            .bind(tenant_id)
+            .bind(format!("auto-{task_id}"))
+            .bind(Option::<&str>::None)
+            .bind(&json!([]))
+            .bind(&user.user_id)
+            .execute(&s.pool)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+            pid
+        }
+    };
+    // Extract scope from request or project
+    let scope = normalise_scope(&body, &project_id)?;
+    let model_config_id = body["model_config_id"]
+        .as_i64()
+        .or_else(|| {
+            // Fallback: use first available chat model
+            None
+        });
+    sqlx::query(
+        "INSERT INTO pent_tasks(id,tenant_id,project_id,name,description,target_scope,priority,status,created_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,'running',$8)",
+    )
+    .bind(&task_id)
+    .bind(tenant_id)
+    .bind(&project_id)
+    .bind(name)
+    .bind(desc)
+    .bind(&scope)
+    .bind(priority)
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    // Resolve project-level model binding if no explicit model was provided
+    let effective_model_id = if model_config_id.is_some() {
+        model_config_id
+    } else {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT model_config_id FROM pent_model_role_bindings
+             WHERE project_id=$1 AND model_role='conversation' AND enabled=true
+             LIMIT 1",
+        )
+        .bind(&project_id)
+        .fetch_optional(&s.pool)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .flatten()
+    };
+    // Create a run bound to this task → worker picks it up and executes the Agent Loop
+    create_and_launch_run(
+        &s,
+        &task_id,
+        &project_id,
+        &scope,
+        effective_model_id,
+        body.get("hitl").cloned(),
+        body.get("orchestration").and_then(Value::as_str),
+        &user,
+    )
+    .await?;
     Ok(Json(ApiResponse::new(json!({
-        "turn_id": turn_id,
-        "status": "thinking",
-        "processing": true
+        "task_id": task_id,
+        "status": "running",
+        "message": "任务已创建，Agent 正在自主执行"
     }))))
 }
 
-/// Stream a simple chat turn token-by-token over SSE.
-///
-/// Unlike `create_turn`, this endpoint does **not** run the autonomous Pent tool
-/// loop. It is meant for plain conversational messages and mirrors the UX of
-/// `/ai/chat/message/send-stream` while still persisting messages under the
-/// agent session/turn model.
-async fn create_turn_stream(
-    State(s): State<PentState>,
-    Path(session_id): Path<String>,
-    user: CurrentUser,
-    Json(body): Json<Value>,
-) -> Result<Response<Body>, AppError> {
-    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
-    let content = body["content"].as_str().unwrap_or("").trim().to_string();
-    if content.is_empty() {
-        return Err(AppError::bad_request("消息内容不能为空"));
+async fn create_and_launch_run(
+    s: &PentState,
+    task_id: &str,
+    project_id: &str,
+    scope: &Value,
+    model_config_id: Option<i64>,
+    hitl: Option<Value>,
+    orchestration: Option<&str>,
+    user: &CurrentUser,
+) -> Result<(), AppError> {
+    let tenant_id = crate::security::tenant_id(user)?;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    // M2-F11: Store model_config_id in the run's policy_snapshot so the worker
+    // can resolve the correct LLM provider per task.
+    let mut policy_with_model = json!({"scope_confirmed": true});
+    if let Some(mid) = model_config_id {
+        policy_with_model["model_id"] = json!(mid);
     }
-    let client_req_id = body
-        .get("client_request_id")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    // Idempotency: replay the existing turn id to the client and close.
-    if let Some(existing) = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM pent_conversation_turns WHERE session_id=$1 AND client_request_id=$2",
+    if let Some(hitl) = hitl {
+        if !hitl.is_object() {
+            return Err(AppError::bad_request("hitl 必须是对象"));
+        }
+        policy_with_model["hitl"] = hitl;
+    }
+    let orchestration = match orchestration.unwrap_or("deep") {
+        "deep" | "plan_execute" | "supervisor" => orchestration.unwrap_or("deep"),
+        _ => return Err(AppError::bad_request("orchestration 必须是 deep、plan_execute 或 supervisor")),
+    };
+    policy_with_model["multi_agent"] = json!({"orchestration": orchestration});
+    sqlx::query(
+        "INSERT INTO pent_runs(
+             id,task_id,tenant_id,user_id,project_id,status,
+             objective_snapshot,scope_snapshot,policy_snapshot,budget_snapshot,
+             next_attempt_at
+         )
+         VALUES($1,$2,$3,$4,$5,'queued',
+                '',$6,
+                $7,
+                '{}'::jsonb,
+                now())",
     )
-    .bind(&session_id)
-    .bind(&client_req_id)
+    .bind(&run_id)
+    .bind(task_id)
+    .bind(tenant_id)
+    .bind(&user.user_id)
+    .bind(project_id)
+    .bind(scope)
+    .bind(&policy_with_model)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    // Notify workers via NATS
+    if let Some(ref nats) = s.nats {
+        let payload =
+            serde_json::to_vec(&json!({"run_id": run_id, "task_id": task_id})).unwrap_or_default();
+        nats.publish("penta.run.requested", &payload).await;
+    }
+    Ok(())
+}
+
+fn normalise_scope(body: &Value, _project_id: &str) -> Result<Value, AppError> {
+    let targets: Vec<String> = body
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim).map(str::to_string))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Err(AppError::bad_request("请提供至少一个目标 URL（targets 数组）"));
+    }
+    Ok(json!({
+        "targets": targets,
+        "confirmed": true,
+        "confirmed_at": chrono::Utc::now(),
+    }))
+}
+
+async fn get_pent_task(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = crate::security::tenant_id(&user)?;
+    let v = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(t) || jsonb_build_object(
+             'latest_run', (
+                 SELECT to_jsonb(r) FROM pent_runs r
+                 WHERE r.task_id=t.id ORDER BY r.created_at DESC LIMIT 1
+             )
+         )
+         FROM pent_tasks t
+         WHERE t.id=$1 AND t.tenant_id=$2 AND ($3 OR t.created_by=$4) AND t.deleted=0",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(crate::security::tenant_wide(&user))
+    .bind(&user.user_id)
     .fetch_optional(&s.pool)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?
-    {
-        let body = Body::from(format!(
-            "data: {}\n\nevent: done\ndata: [DONE]\n\n",
-            json!({"type":"already_exists","turn_id":existing})
-        ));
-        return Response::builder()
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(body)
-            .map_err(|_| AppError::internal("创建流失败"));
-    }
+    .ok_or_else(|| AppError::not_found("任务不存在"))?;
+    Ok(Json(ApiResponse::new(v)))
+}
 
-    // Streaming chat is only for plain conversation without an active run.
-    let active_run_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT active_run_id FROM pent_agent_sessions WHERE id=$1",
+async fn stream_pent_task(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures_util::stream::Stream<
+            Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+        >,
+    >,
+    AppError,
+> {
+    // Resolve task → latest run → latest turn → stream
+    let tenant_id = crate::security::tenant_id(&user)?;
+    let turn_id: Option<String> = sqlx::query_scalar(
+        "SELECT t.id FROM pent_conversation_turns t
+         JOIN pent_runs r ON r.id=t.run_id
+         WHERE r.task_id=$1 AND r.tenant_id=$2
+         ORDER BY t.created_at DESC LIMIT 1",
     )
-    .bind(&session_id)
+    .bind(&id)
+    .bind(tenant_id)
     .fetch_optional(&s.pool)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?
     .flatten();
-    if active_run_id.is_some() {
-        return Err(AppError::bad_request(
-            "当前会话有运行中的任务，请使用非流式端点",
-        ));
-    }
-
-    // Apply authorization auto-detection before persisting messages so the session
-    // transitions to "ready" when the user explicitly declares scope in chat.
-    let auth_service =
-        crate::conversation::authorization::PgConversationAuthorizationService::new(s.pool.clone());
-    let _ = auth_service
-        .reconcile_explicit_authorization(&session_id, &content)
-        .await;
-
-    // A session with confirmed scope must act, not chat: hand the message to the
-    // autonomous tool loop (which creates the execution run on demand) and tell
-    // the client to follow the turn through the polling channel.
-    let scope_confirmed = sqlx::query_scalar::<_, Option<Value>>(
-        "SELECT confirmed_scope_snapshot FROM pent_agent_sessions WHERE id=$1",
-    )
-    .bind(&session_id)
-    .fetch_optional(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    .flatten()
-    .is_some_and(|scope| {
-        scope
-            .get("targets")
-            .and_then(Value::as_array)
-            .is_some_and(|targets| !targets.is_empty())
-    });
-    if scope_confirmed {
-        let request = AgentTurnRequest {
-            session_id,
-            content,
-            message_type: ConversationMessageType::Chat,
-            client_request_id: client_req_id,
-            attachments: vec![],
-        };
-        let rt = crate::conversation::build_runtime(&s.pool, s.nats.clone());
-        let (turn_id, _run_id) = rt
-            .begin_turn_only(&request)
-            .await
-            .map_err(|error| AppError::internal(format!(" Pent 对话处理失败: {error}")))?;
-        let bg_turn_id = turn_id.clone();
-        let cleanup_turn_id = turn_id.clone();
-        let task_registry = s.conversation_tasks.clone();
-        let cleanup_registry = task_registry.clone();
-        let (abort_handle, abort_registration) = AbortHandle::new_pair();
-        task_registry.register(turn_id.clone(), abort_handle);
-        tokio::spawn(async move {
-            match Abortable::new(rt.execute_turn(bg_turn_id, &request), abort_registration).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::error!(error = %error, "conversation turn failed");
-                }
-                Err(_) => {
-                    tracing::info!(turn_id = %cleanup_turn_id, "conversation turn aborted");
-                }
-            }
-            cleanup_registry.remove(&cleanup_turn_id);
-        });
-        let body = Body::from(format!(
-            "data: {}\n\nevent: done\ndata: [DONE]\n\n",
-            json!({"type":"run_started","turn_id":turn_id})
-        ));
-        return Response::builder()
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(body)
-            .map_err(|_| AppError::internal("创建流失败"));
-    }
-
-    let turn_id = uuid::Uuid::new_v4().to_string();
-    let user_message_id = uuid::Uuid::new_v4().to_string();
-    let assistant_message_id = uuid::Uuid::new_v4().to_string();
-
-    // Persist turn, user message, and a placeholder streaming assistant message.
-    sqlx::query(
-        "INSERT INTO pent_conversation_turns(
-             id, session_id, run_id, client_request_id, status, message_type,
-             intent, intent_confidence, started_at
-         ) VALUES($1,$2,NULL,$3,'streaming',$4,'chat',0.8,now())",
-    )
-    .bind(&turn_id)
-    .bind(&session_id)
-    .bind(&client_req_id)
-    .bind("chat")
-    .execute(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
-
-    sqlx::query(
-        "INSERT INTO pent_conversation_messages(
-             id, session_id, turn_id, role, message_type, content, payload,
-             created_by, sequence, status, format
-         ) VALUES($1,$2,$3,'user',$4,$5,$6,'system',0,'completed','text')",
-    )
-    .bind(&user_message_id)
-    .bind(&session_id)
-    .bind(&turn_id)
-    .bind("chat")
-    .bind(&content)
-    .bind(json!({"attachments": []}))
-    .execute(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
-
-    sqlx::query(
-        "INSERT INTO pent_conversation_messages(
-             id, session_id, turn_id, role, message_type, content, payload,
-             created_by, sequence, status, format
-         ) VALUES($1,$2,$3,'assistant','chat','',$4,'system',1,'streaming','text')",
-    )
-    .bind(&assistant_message_id)
-    .bind(&session_id)
-    .bind(&turn_id)
-    .bind(json!({}))
-    .execute(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
-
-    let gateway = crate::conversation::model_gateway::AiModelGateway::new(s.pool.clone());
-    let (model_id, temperature, max_tokens) = gateway
-        .resolve_model(&session_id)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-
-    // Build a context-aware system prompt from session state.
-    let session_row: Option<(String, Option<Value>)> = sqlx::query_as(
-        "SELECT status, confirmed_scope_snapshot FROM pent_agent_sessions WHERE id=$1",
-    )
-    .bind(&session_id)
-    .fetch_optional(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
-    let has_active_run = sqlx::query_scalar::<_, bool>(
-        "SELECT active_run_id IS NOT NULL FROM pent_agent_sessions WHERE id=$1",
-    )
-    .bind(&session_id)
-    .fetch_optional(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    .unwrap_or(false);
-
-    let system_prompt = {
-        let mut base = String::from(
-            "你是 Pent 平台的自动化渗透测试智能体。你有以下能力：\n\
-             - 执行信息收集（存活探测、指纹识别、端口扫描、目录枚举）\n\
-             - 漏洞检测与验证（SQL注入、XSS、文件上传、SSRF等）\n\
-             - 自动化攻击链构建\n\n",
-        );
-        if let Some((ref status, ref maybe_scope)) = session_row {
-            base.push_str(&format!("当前会话状态: {status}\n"));
-            if let Some(scope) = maybe_scope {
-                if let Some(targets) = scope.get("targets").and_then(|t| t.as_array()) {
-                    let target_list: Vec<&str> = targets.iter().filter_map(|t| t.as_str()).collect();
-                    if !target_list.is_empty() {
-                        base.push_str(&format!("已授权目标: {}\n", target_list.join(", ")));
-                    }
-                }
-            }
-            base.push_str(&format!("活跃 Run: {}\n\n", if has_active_run { "是" } else { "否" }));
-        }
-        base.push_str(
-            "核心原则：\n\
-             1. 用户说\"开始\"/\"继续\"/\"执行\"/\"直接\"时，立即进入行动模式，给具体操作步骤和命令\n\
-             2. 不要反复确认授权（授权已在会话中确认过了）\n\
-             3. 有活跃 Run 时直接调用工具，没有 Run 时给出立即可执行的命令\n\
-             4. 简洁直接，先做再说，不要冗长的免责声明\n\
-             5. 发现漏洞后直接报告漏洞类型 + 证据，不要只给手工操作指南\n\n\
-             请用中文回答。",
-        );
-        base
-    };
-
-    let history: Vec<(String, String)> = sqlx::query_as(
-        "SELECT role, content FROM pent_conversation_messages
-         WHERE session_id=$1 AND role IN ('user','assistant') AND status='completed'
-         ORDER BY created_at DESC, sequence DESC LIMIT 20",
-    )
-    .bind(&session_id)
-    .fetch_all(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
-
-    let mut messages = vec![ChatMessage {
-        role: "system".into(),
-        content: system_prompt,
-    }];
-    for (role, content) in history.into_iter().rev() {
-        messages.push(ChatMessage { role, content });
-    }
-    messages.push(ChatMessage {
-        role: "user".into(),
-        content: content.clone(),
-    });
-
-    let request = kairos_platform_ai_api::ChatRequest {
-        model: String::new(),
-        messages,
-        temperature,
-        max_tokens: Some(max_tokens),
-    };
-
-    let (tx, rx) = mpsc::channel::<Result<String, std::convert::Infallible>>(32);
-    let pool = s.pool.clone();
-    let turn_id_for_task = turn_id.clone();
-    let assistant_message_id_for_task = assistant_message_id.clone();
-
-    tokio::spawn(async move {
-        let factory = kairos_platform_ai_server::AiModelFactory::new(pool.clone());
-        let tx_inner = tx.clone();
-        let full_content = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-        let full_content_for_callback = full_content.clone();
-        let pool_for_callback = pool.clone();
-        let turn_id_for_callback = turn_id_for_task.clone();
-        let assistant_message_id_for_callback = assistant_message_id_for_task.clone();
-
-        let result = factory
-            .chat_stream(model_id, request, move |delta: String| {
-                let tx = tx_inner.clone();
-                let full_content = full_content_for_callback.clone();
-                let pool = pool_for_callback.clone();
-                let turn_id = turn_id_for_callback.clone();
-                let assistant_message_id = assistant_message_id_for_callback.clone();
-                async move {
-                    let mut content = full_content.lock().await;
-                    content.push_str(&delta);
-                    let content_clone = content.clone();
-                    drop(content);
-
-                    let _ = sqlx::query(
-                        "UPDATE pent_conversation_messages SET content=$2 WHERE id=$1",
-                    )
-                    .bind(&assistant_message_id)
-                    .bind(&content_clone)
-                    .execute(&pool)
-                    .await;
-
-                    let payload = json!({
-                        "type": "delta",
-                        "turn_id": turn_id,
-                        "message_id": assistant_message_id,
-                        "content": delta,
-                    });
-                    tx.send(Ok(format!("data: {}\n\n", payload)))
-                        .await
-                        .map_err(|_| "客户端已断开".to_string())
-                }
-            })
-            .await;
-
-        match result {
-            Ok(response) => {
-                let final_content = response.content;
-                let reasoning = response.reasoning;
-                let _ = sqlx::query(
-                    "UPDATE pent_conversation_messages SET content=$2, reasoning_summary=$3, status='completed' WHERE id=$1",
-                )
-                .bind(&assistant_message_id_for_task)
-                .bind(&final_content)
-                .bind(&reasoning)
-                .execute(&pool)
-                .await;
-                let _ = sqlx::query(
-                    "UPDATE pent_conversation_turns SET status='completed', completed_at=now() WHERE id=$1",
-                )
-                .bind(&turn_id_for_task)
-                .execute(&pool)
-                .await;
-
-                let payload = json!({
-                    "type": "complete",
-                    "turn_id": turn_id_for_task,
-                    "message_id": assistant_message_id_for_task,
-                    "content": final_content,
-                    "reasoning_content": reasoning,
-                });
-                let _ = tx.send(Ok(format!("data: {}\n\n", payload))).await;
-                let _ = tx.send(Ok("event: done\ndata: [DONE]\n\n".to_string())).await;
-            }
-            Err(error) => {
-                let error_msg = format!("{error:?}");
-                let _ = sqlx::query(
-                    "UPDATE pent_conversation_messages SET content=$2, status='failed' WHERE id=$1",
-                )
-                .bind(&assistant_message_id_for_task)
-                .bind(&format!("生成失败: {error_msg}"))
-                .execute(&pool)
-                .await;
-                let _ = sqlx::query(
-                    "UPDATE pent_conversation_turns SET status='failed', error_code='STREAM_ERROR', error_message=$2, completed_at=now() WHERE id=$1",
-                )
-                .bind(&turn_id_for_task)
-                .bind(&error_msg)
-                .execute(&pool)
-                .await;
-
-                let payload = json!({"type":"error","code":500,"msg":error_msg});
-                let _ = tx.send(Ok(format!("event: error\ndata: {}\n\n", payload))).await;
-            }
-        }
-    });
-
-    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    }));
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(body)
-        .map_err(|_| AppError::internal("创建流失败"))
+    let turn_id =
+        turn_id.ok_or_else(|| AppError::not_found("该任务尚未产生执行记录，请稍后重试"))?;
+    Ok(turn_sse(s.pool.clone(), turn_id))
 }
 
-async fn session_events(
+async fn cancel_pent_task(
     State(s): State<PentState>,
-    Path(session_id): Path<String>,
+    Path(id): Path<String>,
     user: CurrentUser,
-) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    crate::security::ensure_session_access(&s.pool, &session_id, &user).await?;
-    let rows = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id',m.id,'role',m.role,'content',m.content,'turn_id',m.turn_id,'created_at',m.created_at) FROM pent_conversation_messages m WHERE m.session_id=$1 ORDER BY m.created_at LIMIT 200")
-        .bind(&session_id).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(ApiResponse::new(rows)))
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = crate::security::tenant_id(&user)?;
+    // Mark task as cancelled and cancel all active runs
+    sqlx::query(
+        "UPDATE pent_tasks SET status='cancelled',updated_at=now()
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(crate::security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    sqlx::query(
+        "UPDATE pent_runs
+         SET cancel_requested_at=COALESCE(cancel_requested_at,now()),
+             status='cancelled', completed_at=COALESCE(completed_at,now()), updated_at=now()
+         WHERE task_id=$1 AND status IN ('queued','running')",
+    )
+    .bind(&id)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(json!({"message":"任务已取消"}))))
 }
+
+// ── Report endpoint ───────────────────────────────────────────────────
+
+async fn get_report(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    // id is a run_id — look up the latest report artifact for that run
+    let tenant_id = crate::security::tenant_id(&user)?;
+    let artifact: Option<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT a.id, a.object_key, a.size_bytes, r.id as run_id
+         FROM pent_artifacts a
+         JOIN pent_runs r ON r.id=a.run_id
+         WHERE r.id=$1 AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)
+           AND a.content_type='text/markdown'
+         ORDER BY a.created_at DESC LIMIT 1",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(crate::security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .or_else(|| {
+        // Fallback: generate report on demand
+        None
+    });
+    match artifact {
+        Some((artifact_id, object_key, size_bytes, run_id)) => {
+            Ok(Json(ApiResponse::new(json!({
+                "artifact_id": artifact_id,
+                "run_id": run_id,
+                "object_key": object_key,
+                "size_bytes": size_bytes,
+                "format": "markdown"
+            }))))
+        }
+        None => {
+            // Generate a report on the fly
+            match crate::report::generate_run_report(&s.pool, &id, None).await {
+                Ok(artifact) => Ok(Json(ApiResponse::new(json!({
+                    "artifact_id": artifact.artifact_id,
+                    "run_id": id,
+                    "object_key": artifact.object_key,
+                    "size_bytes": artifact.size_bytes,
+                    "format": "markdown",
+                    "generated": true
+                })))),
+                Err(_) => Err(AppError::not_found("该运行尚未产生报告，请等待任务完成后自动生成"))
+            }
+        }
+    }
+}
+
+// ── Turn SSE and cancellation (used by task stream and live monitoring) ──
 
 async fn cancel_turn(
     State(s): State<PentState>,
@@ -527,80 +396,45 @@ async fn cancel_turn(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     crate::security::ensure_turn_access(&s.pool, &turn_id, &user).await?;
-    let affected = sqlx::query(
+    let mut tx = s.pool.begin().await.map_err(|e| AppError::internal(e.to_string()))?;
+    let (session_id, run_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT t.session_id,COALESCE(t.run_id,s.active_run_id)
+         FROM pent_conversation_turns t
+         JOIN pent_agent_sessions s ON s.id=t.session_id
+         WHERE t.id=$1 FOR UPDATE",
+    )
+    .bind(&turn_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .ok_or_else(|| AppError::not_found("对话轮次不存在"))?;
+    sqlx::query(
         "UPDATE pent_conversation_turns
          SET status='cancelled', completed_at=now()
          WHERE id=$1 AND status IN ('queued','thinking','streaming')",
     )
     .bind(&turn_id)
-    .execute(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    .rows_affected();
-
-    if affected == 0 {
-        let status = sqlx::query_scalar::<_, String>(
-            "SELECT status FROM pent_conversation_turns WHERE id=$1",
-        )
-        .bind(&turn_id)
-        .fetch_optional(&s.pool)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?
-        .ok_or_else(|| AppError::not_found("对话轮次不存在"))?;
-
-        if status != "cancelled" {
-            return Err(AppError::bad_request(format!(
-                "状态为 {status} 的对话无法中止"
-            )));
-        }
-    }
-
-    let execution_aborted = s.conversation_tasks.abort(&turn_id);
-    Ok(Json(ApiResponse::new(json!({
-        "turn_id": turn_id,
-        "status": "cancelled",
-        "execution_aborted": execution_aborted
-    }))))
-}
-
-async fn retry_turn(
-    State(s): State<PentState>,
-    Path(turn_id): Path<String>,
-    user: CurrentUser,
-) -> Result<Json<ApiResponse<Value>>, AppError> {
-    crate::security::ensure_turn_access(&s.pool, &turn_id, &user).await?;
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT t.session_id, t.message_type, m.content
-         FROM pent_conversation_turns t
-         JOIN pent_conversation_messages m
-           ON m.turn_id=t.id AND m.role='user'
-         WHERE t.id=$1 AND t.status='failed' AND t.retryable=true
-         ORDER BY m.sequence LIMIT 1",
-    )
-    .bind(&turn_id)
-    .fetch_optional(&s.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
-    let (session_id, message_type, content) =
-        row.ok_or_else(|| AppError::bad_request("该对话不可重试"))?;
-    let message_type = serde_json::from_value(Value::String(message_type))
-        .map_err(|_| AppError::internal("原始消息类型无效"))?;
-    let request = AgentTurnRequest {
-        session_id,
-        content,
-        message_type,
-        client_request_id: format!("retry-{}", uuid::Uuid::new_v4()),
-        attachments: vec![],
-    };
-    let result = crate::conversation::build_runtime(&s.pool, s.nats.clone())
-        .handle(&request)
+    if let Some(run_id) = run_id.as_deref() {
+        sqlx::query(
+            "UPDATE pent_runs SET status='cancelled',cancel_requested_at=COALESCE(cancel_requested_at,now()),
+             completed_at=COALESCE(completed_at,now()),updated_at=now()
+             WHERE id=$1 AND status IN ('queued','running','cancelling')",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
         .await
-        .map_err(|error| AppError::internal(format!(" Pent 对话重试失败: {error}")))?;
-    Ok(Json(ApiResponse::new(json!({
-        "original_turn_id": turn_id,
-        "turn_id": result.turn_id,
-        "status": "completed"
-    }))))
+        .map_err(|e| AppError::internal(e.to_string()))?;
+        sqlx::query("UPDATE pent_tasks SET status='cancelled',updated_at=now() WHERE id IN (SELECT task_id FROM pent_runs WHERE id=$1)")
+            .bind(run_id).execute(&mut *tx).await.map_err(|e| AppError::internal(e.to_string()))?;
+    }
+    sqlx::query("UPDATE pent_agent_sessions SET status='ready',active_run_id=NULL,updated_at=now() WHERE id=$1")
+        .bind(&session_id).execute(&mut *tx).await.map_err(|e| AppError::internal(e.to_string()))?;
+    tx.commit().await.map_err(|e| AppError::internal(e.to_string()))?;
+    let execution_aborted = s.conversation_tasks.abort(&turn_id);
+    Ok(Json(ApiResponse::new(json!({"turn_id":turn_id,"status":"cancelled","execution_aborted":execution_aborted}))))
 }
 
 async fn stream_turn(

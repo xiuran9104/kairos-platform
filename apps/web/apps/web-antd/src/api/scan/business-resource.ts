@@ -4,7 +4,11 @@ export namespace ScanBusinessResourceApi {
   export interface BusinessResource {
     id?: number; resource_type: string; ecs_name: string; ecs_status: string;
     resource_id: string; cloud_region: string; cloud_category: string;
-    cloud_provider_config_id?: number; zone_name?: string; platform_name?: string;
+    cloud_provider_config_id?: number; machine_room_id?: number; zone_name?: string; platform_name?: string;
+    cabinet_id?: number; cabinet_name?: string; chassis_name?: string; chassis_slot?: string; rack_start_u?: number; rack_end_u?: number;
+    deployment_type?: 'cloud_managed' | 'datacenter_managed' | 'standalone';
+    management_ip?: string; business_ip?: string; network_cidr?: string; gateway?: string;
+    vlan_id?: string; dns_servers?: string; mac_address?: string; switch_name?: string; switch_port?: string;
     county_city?: string; vdc_name?: string; customer_name: string;
     application_name?: string; contract_name?: string; instance_id: string;
     ecs_type: string; ecs_os: string; cpu_cores: number; memory_gb: number;

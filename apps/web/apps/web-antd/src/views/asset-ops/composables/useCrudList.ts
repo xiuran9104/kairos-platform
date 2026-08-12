@@ -32,7 +32,7 @@ export function useCrudList<T extends Record<string, any>>(options: UseCrudListO
     const q = searchText.value.toLowerCase();
     return data.value.filter((item) =>
       searchKeys.some((k) => {
-        const v = item[k];
+        const v = (item as T)[k];
         return v != null && String(v).toLowerCase().includes(q);
       }),
     );
@@ -82,7 +82,7 @@ export function useCrudList<T extends Record<string, any>>(options: UseCrudListO
     }
   }
 
-  async function handleDelete(id: number) {
+  async function handleDelete(id: any) {
     try {
       if (api.del) await api.del(id);
       message.success('删除成功');

@@ -3,11 +3,11 @@ import { useRouter } from 'vue-router';
 import { useDashboard } from './composables/useDashboard';
 
 const router = useRouter();
-const { loading, error, sessions, runs, toolOverview, metrics, activity, runningCount, queuedCount, failedCount, completedCount, pendingApprovals, fetchAll } = useDashboard();
+const { loading, error, sessions, runs, toolOverview, activity, runningCount, queuedCount, failedCount, completedCount, fetchAll } = useDashboard();
 </script>
 
 <template>
-  <div style="padding:24px;min-height:100%">
+  <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
     <a-alert v-if="error" type="error" :message="error" show-icon style="margin-bottom:16px" closable />
 
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
@@ -16,21 +16,12 @@ const { loading, error, sessions, runs, toolOverview, metrics, activity, running
         <div><h2 style="margin:0">Pent AI 安全平台</h2><span style="color:var(--ant-color-text-tertiary);font-size:13px">自动化渗透测试 · {{runningCount()?'运行中':'待命中'}}</span></div>
       </div>
       <div style="display:flex;align-items:center;gap:16px">
-        <div style="text-align:center;padding:0 12px" v-for="b in [{label:'运行中',val:runningCount(),color:'var(--ant-color-success)'},{label:'排队',val:queuedCount(),color:'var(--ant-color-primary)'},{label:'待审批',val:pendingApprovals(),color:'var(--ant-color-warning)'},{label:'失败',val:failedCount(),color:'var(--ant-color-error)'}]" :key="b.label">
+        <div style="text-align:center;padding:0 12px" v-for="b in [{label:'运行中',val:runningCount(),color:'var(--ant-color-success)'},{label:'排队',val:queuedCount(),color:'var(--ant-color-primary)'},{label:'已完成',val:completedCount(),color:'var(--ant-color-success)'},{label:'失败',val:failedCount(),color:'var(--ant-color-error)'}]" :key="b.label">
           <div :style="{fontSize:'22px',fontWeight:700,color:b.color}">{{b.val}}</div><div style="font-size:11px;color:var(--ant-color-text-tertiary)">{{b.label}}</div>
         </div>
         <a-button :loading="loading" @click="fetchAll" size="small">刷新</a-button>
-        <a-button type="primary" @click="router.push('/pent/agent')">启动 Agent</a-button>
       </div>
     </div>
-
-    <a-row :gutter="[12,12]" style="margin-bottom:16px">
-      <a-col :span="4" v-for="k in [{icon:'1f916',label:'Sessions',val:sessions.length,color:'#7c5cfc'},{icon:'1f3af',label:'Tasks',val:metrics.totalTasks,color:'#13c2c2'},{icon:'1f4e6',label:'Assets',val:metrics.totalAssets,color:'#f759ab'},{icon:'2699',label:'Tool Calls',val:metrics.totalToolCalls,color:'var(--ant-color-warning)'},{icon:'26a0',label:'Findings',val:metrics.totalFindings,color:'var(--ant-color-error)'},{icon:'1f4ca',label:'Success',val:toolOverview?.success_rate||'N/A',color:'var(--ant-color-success)'}]" :key="k.label">
-        <a-card size="small" :loading="loading">
-          <a-statistic :title="k.label" :value="k.val" :value-style="{color:k.color,fontSize:'26px'}" />
-        </a-card>
-      </a-col>
-    </a-row>
 
     <a-row :gutter="[16,16]" style="margin-bottom:16px">
       <a-col :span="16">
@@ -55,8 +46,8 @@ const { loading, error, sessions, runs, toolOverview, metrics, activity, running
           </div>
         </a-card>
         <a-card title="最近会话" size="small" style="margin-top:16px">
-          <a-empty v-if="!sessions.length" description="暂无会话" :image="false"><a-button type="primary" size="small" @click="router.push('/pent/agent')">启动</a-button></a-empty>
-          <div v-else v-for="s in sessions.slice(0,5)" :key="s.id" style="display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-radius:4px;cursor:pointer;margin-bottom:4px" @click="router.push('/pent/sessions/'+s.id)">
+          <a-empty v-if="!sessions.length" description="暂无会话" :image="false" />
+          <div v-else v-for="s in sessions.slice(0,5)" :key="s.id" style="display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-radius:4px;cursor:pointer;margin-bottom:4px" @click="router.push('/pent/tasks/'+s.id)">
             <span style="font-size:13px;font-family:monospace;color:#555">{{s.id?.slice(0,12)}}</span>
             <a-tag :color="s.status==='active'?'processing':'default'" size="small">{{s.status}}</a-tag>
           </div>

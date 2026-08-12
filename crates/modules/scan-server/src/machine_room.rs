@@ -45,13 +45,13 @@ pub async fn create(
     State(s): State<ScanState>,
     Json(req): Json<CreateMachineRoomRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let id: i32 = sqlx::query_scalar(
-        "INSERT INTO scan_machine_rooms(room_name,room_code,facility_type,address,provider_id,room_type,contact_person,contact_phone,floor,cabinet_count,area_size,remarks,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id"
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO scan_machine_rooms(room_name,room_code,facility_type,address,platform_id,room_type,contact_person,contact_phone,floor,cabinet_count,area_size,remarks,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id"
     ).bind(&req.room_name).bind(&req.room_code).bind(&req.facility_type).bind(&req.address)
-     .bind(req.provider_id).bind(&req.room_type).bind(&req.contact_person).bind(&req.contact_phone)
+     .bind(req.platform_id).bind(&req.room_type).bind(&req.contact_person).bind(&req.contact_phone)
      .bind(&req.floor).bind(req.cabinet_count).bind(&req.area_size).bind(&req.remarks)
      .bind(req.status.as_deref().unwrap_or("active"))
-     .fetch_one(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+     .fetch_one(&s.pool).await.map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(ApiResponse::new(
         json!({"message": "机房创建成功", "id": id}),
     )))
@@ -62,11 +62,11 @@ pub async fn update(
     Path(id): Path<i32>,
     Json(req): Json<UpdateMachineRoomRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let rows = sqlx::query("UPDATE scan_machine_rooms SET room_name=COALESCE($2,room_name),room_code=COALESCE($3,room_code),facility_type=COALESCE($4,facility_type),address=COALESCE($5,address),provider_id=COALESCE($6,provider_id),room_type=COALESCE($7,room_type),contact_person=COALESCE($8,contact_person),contact_phone=COALESCE($9,contact_phone),floor=COALESCE($10,floor),cabinet_count=COALESCE($11,cabinet_count),area_size=COALESCE($12,area_size),remarks=COALESCE($13,remarks),status=COALESCE($14,status),updated_at=now() WHERE id=$1 AND deleted=0")
+    let rows = sqlx::query("UPDATE scan_machine_rooms SET room_name=COALESCE($2,room_name),room_code=COALESCE($3,room_code),facility_type=COALESCE($4,facility_type),address=COALESCE($5,address),platform_id=COALESCE($6,platform_id),room_type=COALESCE($7,room_type),contact_person=COALESCE($8,contact_person),contact_phone=COALESCE($9,contact_phone),floor=COALESCE($10,floor),cabinet_count=COALESCE($11,cabinet_count),area_size=COALESCE($12,area_size),remarks=COALESCE($13,remarks),status=COALESCE($14,status),updated_at=now() WHERE id=$1 AND deleted=0")
         .bind(id).bind(&req.room_name).bind(&req.room_code).bind(&req.facility_type).bind(&req.address)
-        .bind(req.provider_id).bind(&req.room_type).bind(&req.contact_person).bind(&req.contact_phone)
+        .bind(req.platform_id).bind(&req.room_type).bind(&req.contact_person).bind(&req.contact_phone)
         .bind(&req.floor).bind(req.cabinet_count).bind(&req.area_size).bind(&req.remarks).bind(&req.status)
-        .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+        .execute(&s.pool).await.map_err(|e| AppError::bad_request(e.to_string()))?;
     if rows.rows_affected() == 0 {
         return Err(AppError::not_found("not found"));
     }

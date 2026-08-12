@@ -67,10 +67,7 @@ impl NatsEventBus {
     /// Subscribe to a subject. Returns a stream of raw message payloads.
     /// When NATS is unavailable the stream never yields — callers must
     /// fall back to periodic DB polling.
-    pub async fn subscribe(
-        &self,
-        subject: &str,
-    ) -> Result<NatsSubscription, String> {
+    pub async fn subscribe(&self, subject: &str) -> Result<NatsSubscription, String> {
         let Some(client) = &self.client else {
             return Ok(NatsSubscription::empty());
         };
@@ -78,9 +75,7 @@ impl NatsEventBus {
             .subscribe(subject.to_string())
             .await
             .map_err(|e| format!("NATS subscribe failed: {e}"))?;
-        Ok(NatsSubscription {
-            inner: Some(sub),
-        })
+        Ok(NatsSubscription { inner: Some(sub) })
     }
 }
 
@@ -178,10 +173,9 @@ pub mod subjects {
 pub fn classify_tool_queue(tool_name: &str) -> &'static str {
     match tool_name {
         // Light info gathering
-        "http_probe" | "dns_lookup" | "web_crawl" | "web_fingerprint"
-        | "web_url_collect" | "js_collect" | "knowledge_search"
-        | "evidence_list" | "evidence_search" | "evidence_view"
-        | "traffic_list" | "traffic_view" | "traffic_diff" => "scan.light",
+        "http_probe" | "dns_lookup" | "web_crawl" | "web_fingerprint" | "web_url_collect"
+        | "js_collect" | "knowledge_search" | "evidence_list" | "evidence_search"
+        | "evidence_view" | "traffic_list" | "traffic_view" | "traffic_diff" => "scan.light",
         // Heavier active scanning
         "http_request" | "dir_fuzz" | "js_analyze" | "file_upload_validate" => "scan.light",
         // Heavy scanning

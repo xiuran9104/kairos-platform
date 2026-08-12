@@ -322,4 +322,26 @@ describe('generateMenus', () => {
 
     expect(converted[0]?.redirect).toBe('/pent/dashboard');
   });
+
+  it('does not cache anonymous backend page components', () => {
+    const backendMenus = [
+      {
+        children: [],
+        component: 'asset-ops/risk/index',
+        componentName: '',
+        id: 30306,
+        keepAlive: true,
+        name: '风险管理',
+        parentId: 30300,
+        path: '/asset-ops/risk',
+        sort: 5,
+        visible: true,
+      },
+    ] as any;
+
+    const [converted] =
+      convertServerMenuToRouteRecordStringComponent(backendMenus);
+
+    expect(converted?.meta?.keepAlive).toBe(false);
+  });
 });

@@ -171,7 +171,14 @@ async fn store_artifact(
         "pent/runs/{run_id}/report-{artifact_id}.{}",
         format.extension()
     );
-    store_artifact_with_key(pool, run_id, &object_key, content.as_bytes().to_vec(), format).await?;
+    store_artifact_with_key(
+        pool,
+        run_id,
+        &object_key,
+        content.as_bytes().to_vec(),
+        format,
+    )
+    .await?;
     Ok(artifact_id)
 }
 
@@ -405,7 +412,11 @@ fn render_poc_section(out: &mut String, traffic: &[&HttpTrafficRow]) {
                 if key.to_lowercase() == "host" || key.to_lowercase() == "content-length" {
                     continue;
                 }
-                curl.push_str(&format!(" \\\n  -H '{}: {}'", key, escape_shell(header_value)));
+                curl.push_str(&format!(
+                    " \\\n  -H '{}: {}'",
+                    key,
+                    escape_shell(header_value)
+                ));
             }
         }
         // Add body
@@ -590,11 +601,13 @@ fn render_markdown(
         let related_traffic: Vec<&HttpTrafficRow> = http_traffic
             .iter()
             .filter(|row| {
-                finding
-                    .evidence_ids
-                    .iter()
-                    .any(|ev_id| row.tool_call_id.as_deref() == Some(ev_id.as_str())
-                        || evidence.iter().any(|ev| ev.id == *ev_id && ev.tool_call_id.as_deref() == row.tool_call_id.as_deref()))
+                finding.evidence_ids.iter().any(|ev_id| {
+                    row.tool_call_id.as_deref() == Some(ev_id.as_str())
+                        || evidence.iter().any(|ev| {
+                            ev.id == *ev_id
+                                && ev.tool_call_id.as_deref() == row.tool_call_id.as_deref()
+                        })
+                })
             })
             .collect();
         if !related_traffic.is_empty() {
@@ -734,9 +747,11 @@ fn maturity_level(finding: &FindingRow, evidence: &[EvidenceRow]) -> (&'static s
     let claims = format!("{} {}", finding.title, finding.description);
     let assertions = crate::conversation::claim_gate::extract_assertions(&claims);
     if !assertions.is_empty()
-        && assertions
-            .iter()
-            .all(|token| related.iter().any(|item| item.source.contains(token.as_str())))
+        && assertions.iter().all(|token| {
+            related
+                .iter()
+                .any(|item| item.source.contains(token.as_str()))
+        })
     {
         return ("E2", "关键断言可在证据中逐字投影");
     }
@@ -1008,10 +1023,10 @@ mod tests {
         .await
         .expect("seed evidence");
         sqlx::query(
-            "INSERT INTO pent_findings(id, run_id, title, severity, status, target,
+            "INSERT INTO pent_findings(id, run_id, project_id, title, severity, status, target,
                                        evidence_ids, description, fingerprint, confidence,
                                        false_positive_status)
-             VALUES ('report-it-f1',$1,'SQL 注入','high','open','http://192.0.2.10/login',
+             VALUES ('report-it-f1',$1, (SELECT project_id FROM pent_runs WHERE id=$1), 'SQL 注入','high','open','http://192.0.2.10/login',
                      '[\"report-it-ev1\"]'::jsonb,'登录接口存在注入','fp-it-1',0.9,'confirmed')",
         )
         .bind(run_id)
@@ -1025,13 +1040,12 @@ mod tests {
         assert_eq!(artifact.sha256.len(), 64);
         assert!(artifact.size_bytes > 0);
 
-        let stored: Option<(String, i64)> = sqlx::query_as(
-            "SELECT object_key, size_bytes FROM pent_artifacts WHERE id=$1",
-        )
-        .bind(&artifact.artifact_id)
-        .fetch_optional(&pool)
-        .await
-        .expect("query artifact row");
+        let stored: Option<(String, i64)> =
+            sqlx::query_as("SELECT object_key, size_bytes FROM pent_artifacts WHERE id=$1")
+                .bind(&artifact.artifact_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query artifact row");
         let (object_key, size) = stored.expect("artifact row persisted");
         assert_eq!(object_key, artifact.object_key);
         assert_eq!(size, artifact.size_bytes);
@@ -1048,7 +1062,12 @@ mod tests {
         assert!(markdown.contains("***REDACTED***"));
         assert!(!markdown.contains("abc123"), "敏感信息必须脱敏");
 
-        for table in ["pent_artifacts", "pent_findings", "pent_evidence", "pent_tool_calls"] {
+        for table in [
+            "pent_artifacts",
+            "pent_findings",
+            "pent_evidence",
+            "pent_tool_calls",
+        ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE run_id=$1"))
                 .bind(run_id)
                 .execute(&pool)

@@ -53,9 +53,7 @@ impl ToolExecutionBackend for McpExecutor {
                         ContentBlock::Image { mime_type, .. } => {
                             Some(format!("[image: {mime_type}]"))
                         }
-                        ContentBlock::Resource { uri, .. } => {
-                            Some(format!("[resource: {uri}]"))
-                        }
+                        ContentBlock::Resource { uri, .. } => Some(format!("[resource: {uri}]")),
                     })
                     .collect::<Vec<_>>()
                     .join("\n");

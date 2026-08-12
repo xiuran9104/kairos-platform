@@ -19,7 +19,11 @@ pub struct TrafficDraft {
 /// Build traffic drafts from a conversation tool call. `content` is the JSON
 /// result returned to the model. Returns an empty vec when the tool produced
 /// no parseable exchange (e.g. policy-blocked calls carry no request data).
-pub fn drafts_from_tool_result(tool_name: &str, arguments: &Value, content: &str) -> Vec<TrafficDraft> {
+pub fn drafts_from_tool_result(
+    tool_name: &str,
+    arguments: &Value,
+    content: &str,
+) -> Vec<TrafficDraft> {
     let Ok(result) = serde_json::from_str::<Value>(content) else {
         return Vec::new();
     };
@@ -32,7 +36,10 @@ pub fn drafts_from_tool_result(tool_name: &str, arguments: &Value, content: &str
             else {
                 return Vec::new();
             };
-            let raw = result.get("raw_response").and_then(Value::as_str).unwrap_or("");
+            let raw = result
+                .get("raw_response")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let (response_headers, response_body) = parse_raw_response(raw);
             vec![TrafficDraft {
                 method: result
@@ -70,7 +77,10 @@ pub fn drafts_from_tool_result(tool_name: &str, arguments: &Value, content: &str
                         if url.is_empty() {
                             return None;
                         }
-                        let raw = entry.get("raw_response").and_then(Value::as_str).unwrap_or("");
+                        let raw = entry
+                            .get("raw_response")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         let (response_headers, response_body) = parse_raw_response(raw);
                         Some(TrafficDraft {
                             method: "GET".into(),

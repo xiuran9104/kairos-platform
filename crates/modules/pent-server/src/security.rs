@@ -125,18 +125,20 @@ pub async fn authorize_request(request: Request, next: Next) -> Result<Response,
 }
 
 fn required_permission(method: &str, path: &str) -> &'static str {
+    if path.starts_with("/pent/agent/settings") {
+        return if method == "GET" { permission_codes::SETTINGS_READ } else { permission_codes::SETTINGS_MANAGE };
+    }
+    if path.starts_with("/pent/hitl/approvals") {
+        return if method == "GET" { permission_codes::APPROVAL_READ } else { permission_codes::APPROVAL_DECIDE };
+    }
+    if path.starts_with("/pent/hitl/settings") {
+        return if method == "GET" { permission_codes::SETTINGS_READ } else { permission_codes::SETTINGS_MANAGE };
+    }
     if path.starts_with("/pent/tools") {
         return if method == "GET" {
             permission_codes::TOOL_READ
         } else {
             permission_codes::TOOL_MANAGE
-        };
-    }
-    if path.starts_with("/pent/approvals") {
-        return if method == "GET" {
-            permission_codes::APPROVAL_READ
-        } else {
-            permission_codes::APPROVAL_DECIDE
         };
     }
     if path.starts_with("/pent/artifacts") {
@@ -151,8 +153,7 @@ fn required_permission(method: &str, path: &str) -> &'static str {
     if path.starts_with("/pent/sessions") && path.ends_with("/runs") {
         return permission_codes::RUN_EXECUTE;
     }
-    if path.starts_with("/pent/sessions") || path.starts_with("/pent/turns")
-    {
+    if path.starts_with("/pent/sessions") || path.starts_with("/pent/turns") {
         return permission_codes::AGENT_CHAT;
     }
     if path.starts_with("/pent/projects") {
@@ -207,10 +208,6 @@ mod tests {
         assert_eq!(
             required_permission("POST", "/pent/runs"),
             permission_codes::RUN_EXECUTE
-        );
-        assert_eq!(
-            required_permission("POST", "/pent/approvals/a/decision"),
-            permission_codes::APPROVAL_DECIDE
         );
         assert_eq!(
             required_permission("PUT", "/pent/tools/nmap/versions/1"),

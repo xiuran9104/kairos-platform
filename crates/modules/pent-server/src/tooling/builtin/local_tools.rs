@@ -1,4 +1,4 @@
-//! Local builtin tool implementations — read, grep, bash, web_search.
+//! Local builtin tool implementations — read, write, glob, grep, bash, web_search.
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -20,9 +20,7 @@ pub async fn execute_read(args: Value) -> anyhow::Result<Value> {
     let canonical = path.canonicalize()?;
     let allowed_roots = allowed_filesystem_roots();
     anyhow::ensure!(
-        allowed_roots
-            .iter()
-            .any(|root| canonical.starts_with(root)),
+        allowed_roots.iter().any(|root| canonical.starts_with(root)),
         "文件路径不在允许的根目录中: {file_path}"
     );
 
@@ -43,10 +41,7 @@ pub async fn execute_read(args: Value) -> anyhow::Result<Value> {
 /// Search files for a regex pattern using grep.
 pub async fn execute_grep(args: Value) -> anyhow::Result<Value> {
     let pattern = required_string(&args, "pattern")?;
-    let search_path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or(".");
+    let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
     let context_lines = args
         .get("context_lines")
         .and_then(|v| v.as_u64())
@@ -87,10 +82,7 @@ pub async fn execute_grep(args: Value) -> anyhow::Result<Value> {
 /// Execute a bash command in a sandboxed environment.
 pub async fn execute_bash(args: Value) -> anyhow::Result<Value> {
     let command = required_string(&args, "command")?;
-    let timeout_secs = args
-        .get("timeout")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60);
+    let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
 
     // Simple safety checks
     anyhow::ensure!(!command.is_empty(), "命令不能为空");
@@ -136,8 +128,14 @@ pub async fn execute_web_search(args: Value) -> anyhow::Result<Value> {
         .unwrap_or_else(|_| "https://api.duckduckgo.com/".into());
     let client = http_client()?;
 
-    let resp = client.get(&search_url)
-        .query(&[("q", query.as_str()), ("format", "json"), ("no_html", "1"), ("skip_disambig", "1")])
+    let resp = client
+        .get(&search_url)
+        .query(&[
+            ("q", query.as_str()),
+            ("format", "json"),
+            ("no_html", "1"),
+            ("skip_disambig", "1"),
+        ])
         .send()
         .await?;
     let body: Value = resp.json().await?;
@@ -148,7 +146,10 @@ pub async fn execute_web_search(args: Value) -> anyhow::Result<Value> {
     // Abstract / main answer
     if let Some(text) = body.get("AbstractText").and_then(|v| v.as_str()) {
         if !text.is_empty() {
-            let url = body.get("AbstractURL").and_then(|v| v.as_str()).unwrap_or("");
+            let url = body
+                .get("AbstractURL")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             results.push(json!({"title": text.chars().take(300).collect::<String>(), "url": url, "source": "abstract"}));
         }
     }
@@ -156,8 +157,13 @@ pub async fn execute_web_search(args: Value) -> anyhow::Result<Value> {
     // Related topics
     if let Some(items) = body.pointer("/RelatedTopics").and_then(|v| v.as_array()) {
         for item in items.iter().take(10) {
-            let title = item.get("Text").and_then(|v| v.as_str()).unwrap_or("")
-                .chars().take(200).collect::<String>();
+            let title = item
+                .get("Text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect::<String>();
             let url = item.get("FirstURL").and_then(|v| v.as_str()).unwrap_or("");
             if !title.is_empty() {
                 results.push(json!({"title": title, "url": url, "source": "related"}));
@@ -168,8 +174,13 @@ pub async fn execute_web_search(args: Value) -> anyhow::Result<Value> {
     // Results (web links)
     if let Some(items) = body.get("Results").and_then(|v| v.as_array()) {
         for item in items.iter().take(10) {
-            let title = item.get("Text").and_then(|v| v.as_str()).unwrap_or("")
-                .chars().take(200).collect::<String>();
+            let title = item
+                .get("Text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect::<String>();
             let url = item.get("FirstURL").and_then(|v| v.as_str()).unwrap_or("");
             if !title.is_empty() {
                 results.push(json!({"title": title, "url": url, "source": "web"}));
@@ -182,6 +193,104 @@ pub async fn execute_web_search(args: Value) -> anyhow::Result<Value> {
         "results": results,
         "total_results": results.len(),
         "heading": body.get("Heading").and_then(|v| v.as_str()).unwrap_or(""),
+    }))
+}
+
+/// Write content to a file. Creates parent directories if needed.
+/// Overwrites existing files.
+pub async fn execute_write(args: Value) -> anyhow::Result<Value> {
+    let file_path = required_string(&args, "file_path")?;
+    let content = required_string(&args, "content")?;
+
+    let path = Path::new(&file_path);
+    anyhow::ensure!(!path.is_dir(), "路径是目录而非文件: {file_path}");
+
+    // Security: only allow absolute paths within allowed roots
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("创建父目录失败")?;
+    }
+
+    // If file exists, canonicalize to verify it's within allowed roots
+    if path.exists() {
+        let canonical = path.canonicalize()?;
+        let allowed_roots = allowed_filesystem_roots();
+        anyhow::ensure!(
+            allowed_roots.iter().any(|root| canonical.starts_with(root)),
+            "文件路径不在允许的根目录中: {file_path}"
+        );
+        tokio::fs::write(&canonical, &content).await?;
+        Ok(
+            json!({"written": true, "file_path": canonical.to_string_lossy(), "bytes": content.len()}),
+        )
+    } else {
+        // New file: resolve against working directory
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let allowed_roots = allowed_filesystem_roots();
+        anyhow::ensure!(
+            allowed_roots.iter().any(|root| absolute.starts_with(root)),
+            "文件路径不在允许的根目录中: {file_path}"
+        );
+        tokio::fs::write(&absolute, &content).await?;
+        Ok(
+            json!({"written": true, "file_path": absolute.to_string_lossy(), "bytes": content.len()}),
+        )
+    }
+}
+
+/// Find files matching a glob pattern. Uses `find` for robust matching.
+/// Simple patterns like `*.rs` match filenames; patterns with `/` match full paths.
+pub async fn execute_glob(args: Value) -> anyhow::Result<Value> {
+    let pattern = required_string(&args, "pattern")?;
+    let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+    let path = Path::new(&search_path);
+    let canonical = path.canonicalize()?;
+    let allowed_roots = allowed_filesystem_roots();
+    anyhow::ensure!(
+        allowed_roots.iter().any(|root| canonical.starts_with(root)),
+        "搜索路径不在允许的根目录中: {search_path}"
+    );
+
+    // Build find args: use -path for patterns with /, -name for simple filenames
+    let match_arg = if pattern.contains('/') {
+        "-path"
+    } else {
+        "-name"
+    };
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("find")
+            .arg(&canonical)
+            .arg("-type")
+            .arg("f")
+            .arg(match_arg)
+            .arg(&pattern)
+            .arg("-maxdepth")
+            .arg("40")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("find 超时")?
+    .context("find 执行失败")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let matches: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).take(500).collect();
+
+    Ok(json!({
+        "pattern": pattern,
+        "path": canonical.to_string_lossy(),
+        "matches": matches,
+        "match_count": matches.len(),
+        "stderr": stderr.to_string(),
     }))
 }
 

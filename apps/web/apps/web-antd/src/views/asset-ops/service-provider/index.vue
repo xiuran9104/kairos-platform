@@ -3,11 +3,13 @@ import { ref, onMounted } from 'vue';
 import { Page } from '@vben/common-ui';
 import { message } from 'ant-design-vue';
 import { getServiceProviderList, createServiceProvider, updateServiceProvider, deleteServiceProvider } from '#/api/scan/service-provider';
+import { useLocalTableSearch } from '../composables/useLocalTableSearch';
 interface Provider { id?: number; provider_name: string; provider_code: string; short_name: string; contact_person: string; contact_phone: string; contact_email: string; headquarters: string; service_area: string; business_license: string; status: string; }
 const data = ref<Provider[]>([]); const loading = ref(false); const modalVisible = ref(false); const editingId = ref<number | undefined>();
+const { filteredRows, searchText } = useLocalTableSearch(data, ['provider_name','provider_code','short_name','headquarters','service_area']);
 const form = ref<Provider>({ provider_name: '', provider_code: '', short_name: '', contact_person: '', contact_phone: '', contact_email: '', headquarters: '', service_area: '', business_license: '', status: 'active' });
 const columns = [{ title: '服务商名称', dataIndex: 'provider_name' }, { title: '编码', dataIndex: 'provider_code' }, { title: '简称', dataIndex: 'short_name' }, { title: '总部', dataIndex: 'headquarters' }, { title: '服务区域', dataIndex: 'service_area' }, { title: '状态', dataIndex: 'status' }, { title: '操作', key: 'actions', width: 200 }];
-async function fetchData() { loading.value = true; try { data.value = (await getServiceProviderList()) as any; } catch { message.error('加载失败'); } finally { loading.value = false; } }
+async function fetchData() { loading.value = true; try { data.value = await getServiceProviderList() as any; } catch { message.error('加载失败'); } finally { loading.value = false; } }
 onMounted(fetchData);
 function openCreate() { editingId.value = undefined; form.value = { provider_name: '', provider_code: '', short_name: '', contact_person: '', contact_phone: '', contact_email: '', headquarters: '', service_area: '', business_license: '', status: 'active' }; modalVisible.value = true; }
 function openEdit(r: Provider) { editingId.value = r.id; form.value = { ...r }; modalVisible.value = true; }
@@ -16,8 +18,8 @@ async function handleSubmit() { if (editingId.value) { await updateServiceProvid
 <template>
   <Page auto-content-height>
     <div style="padding:16px">
-      <a-space style="margin-bottom:16px"><a-button type="primary" @click="openCreate">新建服务商</a-button><a-button @click="fetchData">刷新</a-button></a-space>
-      <a-table :columns="columns" :data-source="data" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:20}">
+      <a-space :size="24" style="margin-bottom:20px"><a-button type="primary" @click="openCreate">新建服务商</a-button><a-input-search v-model:value="searchText" placeholder="搜索服务商" allow-clear style="width:260px" /><a-button @click="fetchData">刷新</a-button></a-space>
+      <a-table :columns="columns" :data-source="filteredRows" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:20}">
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'status'"><a-tag :color="record.status === 'active' ? 'green' : 'red'">{{ record.status }}</a-tag></template>
           <template v-if="column.key === 'actions'">

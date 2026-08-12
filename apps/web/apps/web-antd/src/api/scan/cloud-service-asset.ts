@@ -2,8 +2,10 @@ import { requestClient } from '#/api/request';
 
 export namespace ScanCloudServiceAssetApi {
   export interface CloudServiceAsset {
-    id: string; asset_type: string; source_type: string; name: string;
-    instance_id: string; status: string; region?: string; cloud_platform: string;
+    id: string; provider_config_id: number; provider: string; account_name: string;
+    asset_type: string; source_type: string; name: string;
+    instance_id: string; status: string; region?: string; region_id?: string;
+    availability_zone?: string; cloud_platform: string;
     cloud_zone: string; instance_type: string; cpu_cores: number; memory_gb: number;
     system_disk_type: string; system_disk_size_gb: number; os_type: string; os_name: string;
     ip_address: string; public_ip?: string; customer_name: string; department?: string;

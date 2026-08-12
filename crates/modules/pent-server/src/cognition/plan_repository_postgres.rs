@@ -94,7 +94,12 @@ impl PlanRepository for PgPlanRepository {
         .bind(&next.run_id)
         .bind(delta.base_version)
         .bind(next.version)
-        .bind(serde_json::to_value(&delta.replan_level)?.as_str().unwrap_or("parameter").to_string())
+        .bind(
+            serde_json::to_value(&delta.replan_level)?
+                .as_str()
+                .unwrap_or("parameter")
+                .to_string(),
+        )
         .bind(serde_json::to_value(&delta.reason_codes)?)
         .bind(serde_json::to_value(&delta.operations)?)
         .bind(if delta.proposed_by.is_empty() {

@@ -1,0 +1,20 @@
+# 本地渗透靶场 — Kairos Pent Agent 多目标并发测试
+# docker compose -f docker-compose.targets.yml up -d
+
+services:
+  # ── OWASP Juice Shop — Node.js SPA 100+ 漏洞 ──
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: target-juice-shop
+    ports:
+      - "13000:3000"
+    restart: unless-stopped
+
+  # ── WebGoat — Java Web 靶场 ──
+  webgoat:
+    image: webgoat/goatandwolf
+    container_name: target-webgoat
+    ports:
+      - "18080:8080"
+      - "19090:9090"
+    restart: unless-stopped

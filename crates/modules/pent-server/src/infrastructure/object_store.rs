@@ -55,7 +55,9 @@ impl ObjectStore {
 
     /// Returns `(content_type, bytes)`.
     pub async fn get_object(&self, key: &str) -> Result<(String, Vec<u8>), String> {
-        let response = self.signed_request(Method::GET, Some(key), Vec::new(), None).await?;
+        let response = self
+            .signed_request(Method::GET, Some(key), Vec::new(), None)
+            .await?;
         if !response.status().is_success() {
             return Err(format!("读取 MinIO 产物失败：HTTP {}", response.status()));
         }

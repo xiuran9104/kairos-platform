@@ -20,6 +20,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Local security scanning/runtime artifacts
+.nuclei-cache/
+.nuclei-config/
+/nuclei/
+/apps/web/nuclei/
+nikto_*.json
+reports/
+.workbuddy/
+
 # Editor / OS
 .DS_Store
 .idea

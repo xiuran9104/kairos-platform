@@ -31,6 +31,9 @@ cargo build --release -p kairos-platform-gateway
 新服务器首次部署建议流程：
 
 1. 安装 Rust stable、Docker Compose、Node.js `22.18+` 或 `24.x`，并通过 Corepack 使用 pnpm `11+`。
+   如需使用 Pent 主动检测，另需在网关宿主机安装 `nmap`、`nuclei`、`sqlmap`、`ffuf`、
+   `gobuster`、`whatweb`、`nikto`、`subfinder`、`amass`、`wfuzz`、`dirsearch`、
+   `feroxbuster`、`dalfox` 等本地工具。
 2. 克隆代码到固定目录，例如 `/opt/kairos-platform`。
 3. 启动基础设施：`docker compose -f script/docker/docker-compose.yml up -d`。使用托管 PostgreSQL/Redis 时，改为在环境变量中指向托管地址。
 4. 创建 `/etc/kairos-platform/gateway.env`，写入 `DATABASE_URL`、`REDIS_URL`、强随机 `JWT_SECRET`、`GATEWAY_HOST`、`GATEWAY_PORT`、`RUST_LOG` 和首次管理员变量。
@@ -161,6 +164,22 @@ export BOOTSTRAP_ADMIN_PASSWORD='替换为高强度密码'
 - 请求自动生成或透传 `x-request-id`
 - 使用 `RUST_LOG=info` 或模块级过滤规则控制 tracing 输出
 
+Pent 相关运行检查：
+
+```bash
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:9222/json/version
+curl -fsS -X PUT 'http://127.0.0.1:9222/json/new?http%3A%2F%2F127.0.0.1%3A5666%2F'
+for tool in nmap nuclei sqlmap ffuf gobuster whatweb nikto subfinder amass wfuzz dirsearch feroxbuster dalfox; do
+  command -v "$tool" >/dev/null && echo "ok $tool" || echo "missing $tool"
+done
+/usr/bin/nmap -sT -Pn --reason -- 127.0.0.1
+```
+
+Pent 主动检测工具由网关宿主机直接执行。不要为渗透工具配置 Docker 工具镜像；Compose 中的
+Docker 服务只承担数据库、缓存、消息队列、对象存储、图数据库、headless Chrome 和代理等
+基础设施职责。
+
 ## 测试和发布检查
 
 ```bash
@@ -168,6 +187,8 @@ cargo fmt --all -- --check
 cargo test --workspace
 bash script/test-database-migrations.sh
 bash script/test-ai-e2e.sh
+curl -fsS http://127.0.0.1:9222/json/version
+/usr/bin/nmap -sT -Pn --reason -- 127.0.0.1
 pnpm --dir apps/web --filter @vben/web-antd run typecheck
 pnpm --dir apps/web --filter @vben/web-antd run build
 ```
@@ -182,3 +203,6 @@ pnpm --dir apps/web --filter @vben/web-antd run build
 - SSE 到前端后一次性出现：关闭 Nginx/Ingress 的响应缓冲并增加读取超时。
 - AI 任务一直处理中：检查模型配置的任务查询路径、鉴权头和供应商任务 ID；可调用 `/poll` 接口立即同步。
 - 前端请求 404：确认 Vben API 基址或 Nginx `/api/` 转发是否去掉了正确的前缀。
+- Pent 工具调用提示命令不存在：在网关宿主机安装对应二进制，并确认 `command -v <tool>` 可找到。
+- `mcp_navigate_page` 提示 MCP 不可用：先检查 `http://127.0.0.1:9222/json/version`。
+  Chrome DevTools 可用时，网关会使用 HTTP fallback 打开页面。

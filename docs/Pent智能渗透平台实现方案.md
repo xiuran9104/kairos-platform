@@ -346,14 +346,14 @@ Skill Manifest 至少包含 `id`、`version`、`summary`、`tags`、`applicable_
 相关 Skill 的索引；读取正文必须通过 `knowledge_search` 或后续
 `load_skill_reference`，并记录命中、引用和版本。
 
-MCP、容器工具、内置 Rust Handler 和检测插件最终都映射为统一 `ToolDescriptor`。
+MCP、本地宿主机工具、内置 Rust Handler、HTTP 后端和检测插件最终都映射为统一 `ToolDescriptor`。
 来源不同不改变 Scope、风险、审批、超时、资源、健康检查、输入输出 Schema 和审计要求。
 任何外部 MCP 服务都必须由平台管理员注册，不能接受浏览器临时传入任意启动命令。
 
 #### VulnClaw 与 Pent 的工具体系差异
 
 MCP 是工具发现与调用协议，不是安全沙箱，也不是工具能力本身。一个 Nmap 工具可以通过
-MCP、容器任务、HTTP 服务或内置适配器暴露；采用 MCP 不会自动获得租户隔离、Scope
+MCP、本地进程、HTTP 服务或内置适配器暴露；采用 MCP 不会自动获得租户隔离、Scope
 校验、审批、资源限制、证据持久化和审计。
 
 VulnClaw 实际上也不是“所有工具都是 MCP”，而是四套能力共同提供给 Agent：
@@ -370,9 +370,9 @@ Pent 当前采用“注册表优先、执行协议可插拔”：
 | Pent 类型 | 当前情况 | 与 VulnClaw 的主要区别 |
 | --- | --- | --- |
 | Builtin | `js_analyze`、`knowledge_search` 等进程内能力 | 只承载低资源、无任意执行的确定性逻辑 |
-| Container | 隔离的 HTTP 请求/探测和外部扫描器 | 强调镜像、资源、网络和 Scope 控制 |
+| HostLocal | `nmap`、`nuclei`、`ffuf`、`sqlmap` 等宿主机 allowlist 工具 | 强调绝对路径、`prlimit`、超时、输出上限和审计 |
 | HTTP | 已有执行后端契约 | 适合调用平台管理的远程扫描服务 |
-| MCP | `ToolSource::Mcp` 和执行器骨架已存在，但真实调用尚未实现 | 作为可选接入协议，而不是全部工具的基础 |
+| MCP | Chrome DevTools 等有状态交互工具；`mcp_navigate_page` 有 CDP HTTP fallback | 作为可选接入协议，而不是全部工具的基础 |
 | Wiki/Skill | 仓库保存 AboutSecurity 原始 Skill，运行时主要检索编译后的 `guide` | 原料与执行指导隔离，更保守，但缺少完整 Skill Resolver |
 
 因此 Pent 不需要把现有工具全部改造成 MCP。建议按能力选择后端：
@@ -380,8 +380,8 @@ Pent 当前采用“注册表优先、执行协议可插拔”：
 | 场景 | 推荐后端 | 原因 |
 | --- | --- | --- |
 | JSON 解析、JS 静态分析、证据检索、编码转换 | Builtin | 低延迟、确定性强、易测试 |
-| Nmap、Nuclei、FFUF、Sqlmap 等进程工具 | Container Worker | 需要文件、进程、网络和资源隔离 |
-| Chrome DevTools、Burp 等有状态交互工具 | MCP | 已有成熟 MCP Server，动态工具发现价值高 |
+| Nmap、Nuclei、FFUF、Sqlmap 等进程工具 | HostLocal | 当前实现统一在网关宿主机执行，不依赖 Docker 工具镜像 |
+| Chrome DevTools、Burp 等有状态交互工具 | MCP / CDP HTTP fallback | MCP 动态工具发现有价值；Chrome 导航可在 MCP 不可用时走 CDP HTTP |
 | 企业扫描器、云 WAF、资产平台 | HTTP | 远程服务已有稳定 API、鉴权和任务模型 |
 | 只读规则检测和结果归一化 | Plugin/Builtin | 无需引入独立服务生命周期 |
 
@@ -469,7 +469,7 @@ Skill，即使标记为已发布，也不能直接扩大 Scope、跳过审批或
 | P0 | 从活动 ToolDescriptor 动态生成模型工具清单 | 不再由系统 Prompt 手工维护可能过期的工具列表 |
 | P1 | 实现 `load_skill_reference` 和来源审计 | 正文按需分页加载，Run 保存 Skill/Reference 版本 |
 | P1 | 补齐受控 MCP Gateway | Chrome/Burp MCP 可接入且全部经过平台硬策略 |
-| P1 | 统一 Builtin/Container/HTTP/MCP 的结果归一化 | 模型和报告不依赖具体执行后端 |
+| P1 | 统一 Builtin/HostLocal/HTTP/MCP 的结果归一化 | 模型和报告不依赖具体执行后端 |
 | P2 | Skill 效果反馈与灰度发布 | 可按证据新增率、确认率和误导率调整路由 |
 
 ### 3.3 工具执行层

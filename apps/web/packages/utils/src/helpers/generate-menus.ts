@@ -228,7 +228,12 @@ function convertServerMenuToRouteRecordStringComponent(
           : undefined,
         hideInMenu: !menu.visible,
         icon: menu.icon,
-        keepAlive: menu.keepAlive,
+        // KeepAlive identifies cached component instances by their component
+        // name. Some server-managed pages do not provide componentName; those
+        // pages are async anonymous components and can make Vue's route
+        // transition traverse a stale/null vnode. Keep them uncached until the
+        // server supplies a stable name.
+        keepAlive: menu.keepAlive && !!menu.componentName,
         order: menu.sort,
         title: menu.name,
         ...(query && { query }),

@@ -8,11 +8,20 @@ import { useCrudList } from '../composables/useCrudList';
 interface Risk { id:string; asset_ip:string; port:number; severity:string; description:string; solution?:string; status:string; assigned_to?:string; }
 const { data, loading, fetchData } = useCrudList<Risk>({
   api: { list: getRiskList },
+  defaultForm: () => ({
+    id: '',
+    asset_ip: '',
+    port: 0,
+    severity: 'Medium',
+    description: '',
+    status: 'open',
+  }),
 });
 
 const detailVisible = ref(false);
 const detailRisk = ref<Risk|null>(null);
 const severityFilter = ref('');
+const searchText = ref('');
 
 const columns = [
   { title:'资产IP', dataIndex:'asset_ip', key:'asset_ip', width:140 },
@@ -28,9 +37,14 @@ const sevColor:Record<string,string>={Critical:'#f5222d',High:'#fa8c16',Medium:'
 const stColor:Record<string,string>={open:'red',verified:'orange',resolved:'green',ignored:'default',false_positive:'purple',pending_review:'blue'};
 const stLabel:Record<string,string>={open:'未处理',verified:'已确认',resolved:'已解决',ignored:'已忽略',false_positive:'误报',pending_review:'待审核'};
 
-const filtered = computed(() => severityFilter.value
-  ? data.value.filter(r => r.severity === severityFilter.value)
-  : data.value);
+const filtered = computed(() => {
+  const keyword = searchText.value.trim().toLowerCase();
+  return data.value.filter((risk) => {
+    const matchesSeverity = !severityFilter.value || risk.severity === severityFilter.value;
+    const matchesKeyword = !keyword || `${risk.asset_ip} ${risk.port} ${risk.description} ${risk.assigned_to || ''}`.toLowerCase().includes(keyword);
+    return matchesSeverity && matchesKeyword;
+  });
+});
 
 function showDetail(r:Risk) { detailRisk.value=r; detailVisible.value=true; }
 async function handleStatus(r:Risk,status:string) { await updateRisk(r.id,{status}); message.success('状态已更新'); fetchData(); }
@@ -38,26 +52,31 @@ async function handleStatus(r:Risk,status:string) { await updateRisk(r.id,{statu
 
 <template>
   <Page auto-content-height>
-    <div style="padding:24px;background:var(--ant-color-bg-layout);min-height:100%">
-      <a-page-header title="风险管理" sub-title="漏洞风险监控与处置" style="background:var(--ant-color-bg-container);border-radius:8px;margin-bottom:16px;padding:16px 24px">
-        <template #extra>
-          <a-space>
-            <a-select v-model:value="severityFilter" placeholder="严重程度筛选" allow-clear style="width:140px" @change="fetchData">
-              <a-select-option value="Critical">严重</a-select-option><a-select-option value="High">高危</a-select-option><a-select-option value="Medium">中危</a-select-option><a-select-option value="Low">低危</a-select-option>
+    <div style="padding:16px">
+      <a-page-header title="风险管理" sub-title="统一查看扫描发现的漏洞风险并跟踪处置状态" style="margin-bottom:16px;padding:0" />
+
+      <div class="risk-summary">
+        <div class="summary-title"><Icon icon="lucide:shield-alert" /><span>风险概览</span><strong>{{ data.length }}</strong></div>
+        <div class="summary-divider" />
+        <div class="summary-item critical"><span>严重</span><strong>{{ data.filter(r=>r.severity==='Critical').length }}</strong></div>
+        <div class="summary-item high"><span>高危</span><strong>{{ data.filter(r=>r.severity==='High').length }}</strong></div>
+        <div class="summary-item medium"><span>中危</span><strong>{{ data.filter(r=>r.severity==='Medium').length }}</strong></div>
+        <div class="summary-item low"><span>低危</span><strong>{{ data.filter(r=>r.severity==='Low').length }}</strong></div>
+      </div>
+
+      <a-card size="small">
+        <div class="table-toolbar">
+          <a-space :size="16" wrap>
+            <a-input-search v-model:value="searchText" placeholder="搜索资产 IP、端口、风险或负责人" allow-clear style="width:300px" />
+            <a-select v-model:value="severityFilter" placeholder="全部严重程度" allow-clear style="width:160px">
+              <a-select-option value="Critical">严重</a-select-option>
+              <a-select-option value="High">高危</a-select-option>
+              <a-select-option value="Medium">中危</a-select-option>
+              <a-select-option value="Low">低危</a-select-option>
             </a-select>
-            <a-button @click="fetchData"><Icon icon="lucide:refresh-cw" /> 刷新</a-button>
           </a-space>
-        </template>
-      </a-page-header>
-
-      <a-row :gutter="16" style="margin-bottom:16px">
-        <a-col :span="6"><a-card size="small" style="border-radius:8px;border-left:3px solid #f5222d"><a-statistic title="严重" :value="data.filter(r=>r.severity==='Critical').length" :value-style="{color:'#f5222d'}" /></a-card></a-col>
-        <a-col :span="6"><a-card size="small" style="border-radius:8px;border-left:3px solid #fa8c16"><a-statistic title="高危" :value="data.filter(r=>r.severity==='High').length" :value-style="{color:'#fa8c16'}" /></a-card></a-col>
-        <a-col :span="6"><a-card size="small" style="border-radius:8px;border-left:3px solid #faad14"><a-statistic title="中危" :value="data.filter(r=>r.severity==='Medium').length" :value-style="{color:'#faad14'}" /></a-card></a-col>
-        <a-col :span="6"><a-card size="small" style="border-radius:8px;border-left:3px solid #52c41a"><a-statistic title="低危" :value="data.filter(r=>r.severity==='Low').length" :value-style="{color:'#52c41a'}" /></a-card></a-col>
-      </a-row>
-
-      <a-card style="border-radius:8px" size="small">
+          <a-button @click="fetchData"><Icon icon="lucide:refresh-cw" /> 刷新</a-button>
+        </div>
         <a-table :columns="columns" :data-source="filtered" :loading="loading" row-key="id" size="middle" :pagination="{pageSize:20}">
           <template #bodyCell="{ column, record }">
             <template v-if="column.key==='severity'"><a-tag :color="sevColor[record.severity]||'default'">{{ record.severity }}</a-tag></template>
@@ -98,3 +117,20 @@ async function handleStatus(r:Risk,status:string) { await updateRisk(r.id,{statu
     </div>
   </Page>
 </template>
+
+<style scoped>
+.risk-summary { display:flex; align-items:center; gap:28px; min-height:72px; margin-bottom:16px; padding:0 24px; background:var(--ant-color-bg-container); border:1px solid var(--ant-color-border-secondary); border-radius:8px; }
+.summary-title,.summary-item { display:flex; align-items:center; gap:9px; white-space:nowrap; }
+.summary-title { color:var(--ant-color-text-secondary); }
+.summary-title :deep(svg) { color:var(--ant-color-primary); font-size:20px; }
+.summary-title strong { color:var(--ant-color-text); font-size:24px; }
+.summary-divider { align-self:stretch; width:1px; margin:16px 0; background:var(--ant-color-border-secondary); }
+.summary-item span { color:var(--ant-color-text-secondary); }
+.summary-item strong { font-size:20px; }
+.summary-item.critical strong { color:#cf1322; }
+.summary-item.high strong { color:#d46b08; }
+.summary-item.medium strong { color:#d48806; }
+.summary-item.low strong { color:#389e0d; }
+.table-toolbar { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-bottom:16px; }
+@media (max-width: 768px) { .risk-summary { flex-wrap:wrap; gap:12px 20px; padding:16px; } .summary-divider { display:none; } .table-toolbar { align-items:flex-start; flex-direction:column; } }
+</style>

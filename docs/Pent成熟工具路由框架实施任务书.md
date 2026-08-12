@@ -20,7 +20,7 @@ Agent / Domain Flow
   -> ToolRouteDecision（Top 1~3）
   -> ToolOrchestrator
   -> PreExecutePolicy（二次校验）
-  -> Builtin / Container / MCP / HTTP Backend
+  -> Builtin / HostLocal / MCP / HTTP Backend
   -> ToolExecutionResult
   -> Planner Feedback + Metrics + RMOS
 ```
@@ -82,10 +82,10 @@ ToolOrchestrator 只编排端口，不包含 SQL、Docker、MCP 或模型厂商�
 2. Scope、权限、风险和健康过滤发生在语义检索之前。
 3. 执行前再次校验 Scope Snapshot，不能信任旧路由结论。
 4. MCP 只是执行后端，不承担授权和沙箱职责。
-5. 高风险、第三方复杂依赖和不可信工具使用临时容器。
+5. 第三方进程工具必须使用宿主机 allowlist、绝对路径、`prlimit`、超时和输出上限。
 6. 低风险、无外部进程的能力可以使用 Rust Builtin Backend。
 7. 禁止向 Agent 暴露 unrestricted `bash -c`。
-8. 工具版本和镜像 digest 写入 ToolCall，Run 必须可重放。
+8. 工具版本、本地程序路径和执行审计写入 ToolCall，Run 必须可追溯。
 9. 原始大输出进入对象存储，事件只保存引用与标准化摘要。
 10. 全文、向量或模型失败时必须降级到确定性能力路由。
 
@@ -242,7 +242,7 @@ crates/modules/pent-server/src/tooling/feedback_repository.rs
 
 - 命名空间树和工具列表；
 - 版本、来源、风险、健康和执行后端；
-- 镜像 digest、路由质量和失败冷却；
+- 本地程序路径、路由质量和失败冷却；
 - 启停、健康检查、路由决策详情和人工反馈。
 
 UI 不得显示密钥、认证 Header 或未脱敏输出。
@@ -290,7 +290,7 @@ tool.feedback.recorded
 5. 向量库或模型不可用时可确定性降级。
 6. 所有执行前完成二次 Scope/策略检查。
 7. 不存在 unrestricted Shell。
-8. 每次执行记录版本和镜像 digest。
+8. 每次执行记录版本、本地程序路径和执行审计。
 9. 结果全部转换为 `ToolExecutionResult`。
 10. 人工反馈能够影响后续场景化路由分数。
 11. Run 可取消、恢复、重放和审计。

@@ -6,11 +6,7 @@ use super::tool_executor::has_conversation_handler;
 /// FTS search on tool `embedding_document` using PostgreSQL full-text search.
 /// Falls back to an empty result set on any error — callers must degrade
 /// gracefully to loading the full catalog.
-async fn tool_fts_search(
-    pool: &PgPool,
-    query: &str,
-    top_k: usize,
-) -> Vec<(String, f32)> {
+async fn tool_fts_search(pool: &PgPool, query: &str, top_k: usize) -> Vec<(String, f32)> {
     if query.trim().is_empty() {
         return Vec::new();
     }
@@ -46,11 +42,7 @@ async fn tool_fts_search(
 /// Hybrid retrieval: FTS → vector (if embedding available) → merge.
 /// Returns ranked tool IDs with retrieval scores. On any failure, returns
 /// an empty list — the caller degrades to the full catalog.
-async fn retrieve_tool_ids(
-    pool: &PgPool,
-    intent: &str,
-    top_k: usize,
-) -> Vec<(String, f32)> {
+async fn retrieve_tool_ids(pool: &PgPool, intent: &str, top_k: usize) -> Vec<(String, f32)> {
     let fts = tool_fts_search(pool, intent, top_k * 3).await;
     if fts.is_empty() {
         return Vec::new();
@@ -58,12 +50,10 @@ async fn retrieve_tool_ids(
     // Optional vector search: if embedding provider is configured, augment
     // with semantic similarity results.
     let vector_results = {
-        let mut embedder =
-            crate::infrastructure::embedding::EmbeddingProvider::new(pool.clone());
+        let mut embedder = crate::infrastructure::embedding::EmbeddingProvider::new(pool.clone());
         if embedder.try_configure().await.unwrap_or(false) {
             if let Some(embedding) = embedder.embed(intent).await {
-                let index =
-                    crate::infrastructure::vector::PgVectorIndex::new(pool.clone());
+                let index = crate::infrastructure::vector::PgVectorIndex::new(pool.clone());
                 match index.search(&embedding, None, top_k * 2).await {
                     Ok(results) => results
                         .into_iter()
@@ -107,7 +97,15 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
         "SELECT tool_id, description, input_schema
          FROM pent_tool_definitions
          WHERE lifecycle_status = 'active'
-         ORDER BY namespace, name",
+         ORDER BY
+           CASE risk_level
+             WHEN 'critical' THEN 1
+             WHEN 'high' THEN 2
+             WHEN 'medium' THEN 3
+             WHEN 'low' THEN 4
+             ELSE 5
+           END,
+           name",
     )
     .fetch_all(pool)
     .await?;
@@ -126,6 +124,36 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
             })
         })
         .collect::<Vec<_>>();
+
+    // DesRed-style MCP-first extension point.  Server qualification keeps two
+    // providers with the same tool name unambiguous for the model and routes
+    // the call back to the selected MCP server without a second lookup.
+    let registry = crate::tooling::mcp::registry::shared().await;
+    let mcp_tools = registry.all_tools().await;
+    let internal_recipe_names = mcp_tools
+        .iter()
+        .filter(|(server_id, _)| server_id == crate::tooling::mcp::internal::INTERNAL_SERVER_ID)
+        .map(|(_, tool)| tool.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    // Once a host tool has a local MCP recipe, do not expose its legacy direct
+    // function definition. This makes the migration opt-in per recipe while
+    // retaining compatibility for tools that have not moved yet.
+    definitions.retain(|definition| {
+        definition
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .is_none_or(|name| !internal_recipe_names.contains(name))
+    });
+    for (server_id, tool) in mcp_tools {
+        definitions.push(json!({
+            "type": "function",
+            "function": {
+                "name": format!("mcp_{server_id}__{}", tool.name),
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            }
+        }));
+    }
 
     // This guarded validator is implemented by the conversation runtime but is
     // not yet part of older database snapshots.
@@ -166,8 +194,50 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
             definitions.push(definition);
         }
     }
+    for definition in agent_tool_definitions() {
+        let name = definition.pointer("/function/name").and_then(Value::as_str);
+        if !definitions
+            .iter()
+            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
+        {
+            definitions.push(definition);
+        }
+    }
+    for definition in super::plan_board::definitions() {
+        let name = definition.pointer("/function/name").and_then(Value::as_str);
+        if !definitions.iter().any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name) {
+            definitions.push(definition);
+        }
+    }
 
     Ok(definitions)
+}
+
+/// DesRed-style dynamic tool disclosure: keep control/evidence tools visible
+/// and retrieve the remaining tools against the current user intent.
+pub async fn load_tools_for_intent(pool: &PgPool, intent: &str, config: &Value) -> anyhow::Result<Vec<Value>> {
+    let all = load_conversation_tool_definitions(pool).await?;
+    if config.get("tool_search_enabled").and_then(Value::as_bool) == Some(false) { return Ok(all); }
+    let threshold = std::env::var("PENTA_TOOL_SEARCH_MIN_TOOLS")
+        .ok().and_then(|v| v.parse::<usize>().ok()).or_else(|| config.get("tool_search_min_tools").and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(20);
+    if all.len() < threshold { return Ok(all); }
+    let top_k = std::env::var("PENTA_TOOL_SEARCH_TOP_K")
+        .ok().and_then(|v| v.parse::<usize>().ok()).or_else(|| config.get("tool_search_top_k").and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(24).clamp(8, 80);
+    let retrieved: std::collections::HashSet<String> = retrieve_tool_ids(pool, intent, top_k)
+        .await.into_iter().map(|(id, _)| id.to_ascii_lowercase()).collect();
+    if retrieved.is_empty() { return Ok(all); }
+    const ALWAYS: &[&str] = &[
+        "knowledge_search", "evidence_list", "evidence_search", "evidence_view",
+        "traffic_list", "traffic_view", "skill_list", "skill_load", "agent_spawn",
+        "agent_status", "agent_collect", "agent_list", "read_file", "glob", "grep",
+    ];
+    let selected = all.into_iter().filter(|definition| {
+        let name = definition.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
+        let lower = name.to_ascii_lowercase();
+        ALWAYS.contains(&lower.as_str()) || lower.starts_with("mcp_") || retrieved.contains(&lower)
+    }).collect::<Vec<_>>();
+    tracing::debug!(available = selected.len(), retrieved = retrieved.len(), "dynamic tool disclosure applied");
+    Ok(selected)
 }
 
 fn evidence_tool_definitions() -> Vec<Value> {
@@ -337,6 +407,67 @@ fn skill_tool_definitions() -> Vec<Value> {
     ]
 }
 
+fn agent_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "agent_spawn",
+                "description": "派生子代理并行扫描独立目标或子任务。每个子代理独立运行工具循环，完成后结果通过 agent_collect 获取。适用于多目标并行扫描或多漏洞类型并行验证。",
+                "parameters": {
+                    "type": "object",
+                    "required": ["description", "prompt"],
+                    "properties": {
+                        "description": {"type": "string", "description": "子代理简短描述，如'扫描 target1.com 的 SQL 注入'"},
+                        "prompt": {"type": "string", "description": "子代理要完成的具体任务描述，包含目标和验证方法"},
+                        "role": {"type": "string", "enum":["web-recon","vulnerability-validator","report-reviewer"], "description":"可选 Markdown 专家角色"},
+                        "target": {"type": "string", "description": "可选，子代理聚焦的单个目标 URL"}
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "agent_status",
+                "description": "查询指定子代理的当前状态（运行中/已完成/失败），用于检查并行任务进度。",
+                "parameters": {
+                    "type": "object",
+                    "required": ["agent_id"],
+                    "properties": {
+                        "agent_id": {"type": "string", "description": "agent_spawn 返回的子代理 ID"}
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "agent_collect",
+                "description": "获取子代理的最终扫描结果。如果子代理仍在运行会阻塞等待直至完成。获取到的结果应整合进最终报告。",
+                "parameters": {
+                    "type": "object",
+                    "required": ["agent_id"],
+                    "properties": {
+                        "agent_id": {"type": "string", "description": "agent_spawn 返回的子代理 ID"}
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "agent_list",
+                "description": "列出所有已派生的子代理及其状态，用于查看并行任务全景。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }),
+    ]
+}
+
 fn knowledge_search_definition() -> Value {
     json!({
         "type": "function",
@@ -462,7 +593,11 @@ mod tests {
         .expect("routed catalog loads from the seeded registry");
         let names: Vec<&str> = definitions
             .iter()
-            .filter_map(|definition| definition.pointer("/function/name").and_then(serde_json::Value::as_str))
+            .filter_map(|definition| {
+                definition
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+            })
             .collect();
 
         const REFERENCE: &[&str] = &[
@@ -509,8 +644,8 @@ mod tests {
 // ── Routed tool catalog (top-K schema injection) ─────────────────────────
 
 use kairos_platform_pent_api::{
-    ToolDescriptor, ToolExecutorSpec, ToolHealthStatus, ToolLifecycleStatus,
-    ToolQualityMetrics, ToolResourceProfile, ToolRouteRequest, ToolSource,
+    ToolDescriptor, ToolExecutorSpec, ToolHealthStatus, ToolLifecycleStatus, ToolQualityMetrics,
+    ToolResourceProfile, ToolRouteRequest, ToolSource,
 };
 
 #[derive(sqlx::FromRow)]
@@ -539,7 +674,7 @@ struct DescriptorRow {
 
 /// Default number of action-tool schemas injected per model call. Reference
 /// (evidence/traffic/knowledge) tools are always appended on top.
-const DEFAULT_TOOL_SCHEMA_TOP_K: usize = 8;
+const DEFAULT_TOOL_SCHEMA_TOP_K: usize = 0; // 0 = no truncation, give all tools to the model
 
 pub fn tool_schema_top_k() -> usize {
     std::env::var("PENTA_TOOL_SCHEMA_TOP_K")
@@ -640,7 +775,11 @@ pub async fn load_routed_tool_definitions(
         context: json!({}),
         top_k,
     };
-    let revision = descriptors.iter().map(|tool| tool.revision).max().unwrap_or(0);
+    let revision = descriptors
+        .iter()
+        .map(|tool| tool.revision)
+        .max()
+        .unwrap_or(0);
     let decision =
         kairos_platform_pent_core::tool_router::route_tools(&request, &descriptors, revision, 1);
     anyhow::ensure!(
@@ -689,6 +828,7 @@ pub async fn load_routed_tool_definitions(
         .into_iter()
         .chain(traffic_tool_definitions())
         .chain(skill_tool_definitions())
+        .chain(agent_tool_definitions())
     {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
         if !definitions

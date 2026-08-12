@@ -1,0 +1,15 @@
+# Internal MCP recipe.  The command is descriptive only: Pent resolves and
+# executes the binary through its lifecycle allow-list and process sandbox.
+name: nmap
+short_description: 对授权目标执行服务与版本识别端口扫描。
+command: /usr/bin/nmap
+args:
+  - -sV
+  - -Pn
+  - --
+  - '{{target}}'
+parameters:
+  - name: target
+    type: string
+    description: 已授权的主机名、IP 或 URL。
+    required: true

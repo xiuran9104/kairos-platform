@@ -213,7 +213,7 @@ crates/modules/pent-server/src/cognition/executor_adapter.rs
 ```
 
 只把批准后的 ActionProposal 转成 ToolOrchestrator 调用，并把结果映射回 Action Observation。
-必须记录 plan/action/tool call 关联、镜像 digest、策略决策和证据引用。
+必须记录 plan/action/tool call 关联、本地程序路径、策略决策和证据引用。
 
 ### HPM-07：动态 Replanner
 

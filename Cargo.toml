@@ -17,8 +17,6 @@ members = [
     "crates/modules/media-server",
     "crates/modules/system-api",
     "crates/modules/system-server",
-    "crates/modules/toon-api",
-    "crates/modules/toon-server",
     "crates/modules/pent-api",
     "crates/modules/pent-core",
     "crates/modules/pent-server",
@@ -26,6 +24,7 @@ members = [
     "crates/modules/scan-server",
     "services/gateway",
     "services/pent-agent",
+    "services/scan-agent",
 ]
 
 [workspace.package]
@@ -69,8 +68,6 @@ kairos-platform-media-api = { path = "crates/modules/media-api" }
 kairos-platform-media-server = { path = "crates/modules/media-server" }
 kairos-platform-system-api = { path = "crates/modules/system-api" }
 kairos-platform-system-server = { path = "crates/modules/system-server" }
-kairos-platform-toon-api = { path = "crates/modules/toon-api" }
-kairos-platform-toon-server = { path = "crates/modules/toon-server" }
 kairos-platform-pent-api = { path = "crates/modules/pent-api" }
 kairos-platform-pent-core = { path = "crates/modules/pent-core" }
 kairos-platform-pent-server = { path = "crates/modules/pent-server" }

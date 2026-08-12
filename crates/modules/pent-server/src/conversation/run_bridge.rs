@@ -9,7 +9,7 @@ pub(crate) async fn execute_session_run(
     run_id: &str,
     worker_id: &str,
 ) -> Result<bool, String> {
-    let session: Option<(String, String)> = sqlx::query_as(
+    let session: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT session_id, objective_snapshot
          FROM pent_runs
          WHERE id = $1 AND session_id IS NOT NULL",
@@ -21,6 +21,9 @@ pub(crate) async fn execute_session_run(
     let Some((session_id, objective)) = session else {
         return Ok(false);
     };
+    let objective = objective
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("安全测试运行 {run_id}"));
 
     append_event(
         pool,
@@ -66,12 +69,8 @@ pub(crate) async fn execute_session_run(
             .await
             .map_err(|error| error.to_string())?;
             tx.commit().await.map_err(|error| error.to_string())?;
-            match crate::report::generate_run_report(
-                pool,
-                run_id,
-                Some(&result.message.content),
-            )
-            .await
+            match crate::report::generate_run_report(pool, run_id, Some(&result.message.content))
+                .await
             {
                 Ok(artifact) => {
                     append_event(

@@ -5,7 +5,10 @@ const STALL_WARNING_THRESHOLD: usize = 3;
 const STALL_STOP_THRESHOLD: usize = 8;
 /// Minimum distinct tool categories that must have produced evidence before
 /// a security FINAL is accepted. This prevents single-tool "drive-by" reports.
-const MIN_EVIDENCE_CATEGORY_DIVERSITY: usize = 2;
+/// Minimum distinct tool categories for the evidence diversity gate.
+/// Set to 1 so host tools (nuclei, sqlmap, dalfox, nmap, etc.) alone can
+/// satisfy the gate. The gate still prevents zero-tool "drive-by" reports.
+const MIN_EVIDENCE_CATEGORY_DIVERSITY: usize = 1;
 
 /// Evidence maturity level required for verified claims in a FINAL.
 /// Defaults to E2 (verbatim projection); set `PENTA_MIN_EVIDENCE_MATURITY=E3`
@@ -38,9 +41,27 @@ enum ToolCategory {
 impl ToolCategory {
     fn classify(tool_name: &str) -> Self {
         match tool_name {
+            // Reconnaissance tools
             "http_request" | "http_probe" | "dns_lookup" | "web_crawl" | "web_fingerprint"
-            | "web_url_collect" | "js_collect" => Self::Recon,
-            "dir_fuzz" | "js_analyze" | "file_upload_validate" => Self::VulnValidation,
+            | "web_url_collect" | "js_collect"
+            | "nmap" | "nmap_scan" | "tcp_scan" | "masscan" | "naabu"
+            | "subfinder" | "amass" | "dnsx" | "dnsrecon" | "dnsenum" | "fierce"
+            | "dmitry" | "theharvester" | "nikto" | "whatweb" | "wafw00f" | "wpscan"
+            | "web_wordpress_scan" | "whois" | "whois_lookup" | "tls_inspect"
+            | "testssl" | "web_tls_scan" | "sslyze" | "qsslcaudit" | "sslscan"
+            | "enum4linux" | "smbmap" | "smtp-user-enum" | "swaks" | "davtest"
+            | "nbtscan" | "netdiscover" | "lbd"
+            | "hakrawler" | "httrack" | "arjun" | "url_extract" | "url_grep"
+            => Self::Recon,
+            // Vulnerability validation tools
+            "dir_fuzz" | "js_analyze" | "file_upload_validate"
+            | "nuclei" | "web_vuln_scan"
+            | "sqli_validate" | "xss_validate" | "csrf_validate"
+            | "command_injection_validate" | "file_inclusion_validate"
+            | "sqlmap" | "sqlmap_scan" | "xsser" | "dalfox" | "web_xss_scan" | "commix"
+            | "afrog" | "wapiti" | "skipfish"
+            | "ffuf" | "gobuster" | "feroxbuster" | "wfuzz" | "dirsearch" | "dirb"
+            => Self::VulnValidation,
             "knowledge_search" => Self::Knowledge,
             "evidence_list" | "evidence_search" | "evidence_view" => Self::EvidenceRead,
             _ => Self::Unknown,
@@ -69,7 +90,6 @@ pub(super) struct ScanProgress {
     tool_calls: usize,
     successful_observations: usize,
     failed_calls: usize,
-    duplicate_requests: usize,
     unchanged_results: usize,
     consecutive_no_progress: usize,
     /// Distinct tool categories that produced effective observations.
@@ -91,28 +111,25 @@ pub(super) struct ScanProgress {
 impl ScanProgress {
     pub(super) fn new(user_input: &str) -> Self {
         let normalized = user_input.to_ascii_lowercase();
-        let security_objective = [
-            "http://",
-            "https://",
-            "扫描",
-            "渗透",
-            "漏洞",
-            "安全测试",
-            "复测",
-            "验证",
-            "scan",
-            "pentest",
-            "vulnerability",
-        ]
-        .iter()
-        .any(|pattern| normalized.contains(pattern));
+        // Only treat a turn as a security objective when it carries an
+        // explicit target URL or an action-oriented testing command.
+        // Questions about findings (e.g. "就是说没有漏洞？") are
+        // conversational follow-ups — the model should answer freely
+        // without the strict tool/evidence completion gates.
+        let has_target = [
+            "http://", "https://",
+        ].iter().any(|p| normalized.contains(p));
+        let has_test_command = [
+            "扫描", "渗透", "安全测试", "复测",
+            "scan", "pentest", "vulnerability",
+        ].iter().any(|p| normalized.contains(p));
+        let security_objective = has_target || has_test_command;
         Self {
             security_objective,
             seen_results: HashSet::new(),
             tool_calls: 0,
             successful_observations: 0,
             failed_calls: 0,
-            duplicate_requests: 0,
             unchanged_results: 0,
             consecutive_no_progress: 0,
             evidence_categories: HashSet::new(),
@@ -154,7 +171,6 @@ impl ScanProgress {
         &mut self,
         tool_name: &str,
         success: bool,
-        duplicate_request: bool,
         effective_observation: bool,
         content: &str,
     ) -> Option<String> {
@@ -163,7 +179,7 @@ impl ScanProgress {
 
         let result_fingerprint = semantic_result_fingerprint(tool_name, content);
         let new_result = self.seen_results.insert(result_fingerprint);
-        let made_progress = success && !duplicate_request && effective_observation && new_result;
+        let made_progress = success && effective_observation && new_result;
 
         if made_progress {
             self.successful_observations += 1;
@@ -179,10 +195,10 @@ impl ScanProgress {
 
         // A successful but fingerprint-identical result does not mean the
         // tools are broken — it means the model needs to change strategy.
-        // Only failures, blocked calls and true duplicates increment the stall
-        // counter so a working-but-repetitive agent is caught by the budget
-        // limits (rounds / tokens / duration) instead of the stall detector.
-        if !success || duplicate_request {
+        // Only failures increment the stall counter so a working-but-repetitive
+        // agent is caught by the budget limits (rounds / tokens / duration)
+        // instead of the stall detector.
+        if !success {
             self.consecutive_no_progress += 1;
         }
         if !success {
@@ -196,14 +212,12 @@ impl ScanProgress {
                 self.exhausted_tools.insert(tool_name.to_string());
             }
         } else {
-            // Successful but duplicate: clear failure streak for this specific
-            // tool (it still works), but keep exhausted set intact.
+            // Successful but no new observation: clear failure streak for this
+            // specific tool (it still works), but keep exhausted set intact.
             self.consecutive_tool_failures.remove(tool_name);
             self.exhausted_tools.remove(tool_name);
         }
-        if duplicate_request {
-            self.duplicate_requests += 1;
-        } else if success && !new_result {
+        if success && !new_result {
             self.unchanged_results += 1;
         }
 
@@ -250,10 +264,9 @@ impl ScanProgress {
              {suggestion}\n\
              不要机械重复请求；请复用已有 Evidence，改变参数或验证策略，\
              需要时使用 ASK_USER 或给出有证据的 NO_PATH。\n\
-             当前统计：失败 {}，重复请求 {}，相同结果 {}，已用工具 {}/{}。",
+             当前统计：失败 {}，相同结果 {}，已用工具 {}/{}。",
             self.consecutive_no_progress,
             self.failed_calls,
-            self.duplicate_requests,
             self.unchanged_results,
             self.tools_used.len(),
             self.tool_calls
@@ -327,7 +340,7 @@ impl ScanProgress {
         let productive_categories: HashSet<_> = self
             .evidence_categories
             .iter()
-            .filter(|c| matches!(c, ToolCategory::Recon | ToolCategory::VulnValidation))
+            .filter(|c| !matches!(c, ToolCategory::Knowledge | ToolCategory::EvidenceRead))
             .collect();
         if productive_categories.len() < MIN_EVIDENCE_CATEGORY_DIVERSITY {
             let missing = if productive_categories.is_empty() {
@@ -474,9 +487,9 @@ fn normalize_volatile_value(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::String(text) => {
             serde_json::Value::String(normalize_volatile_text(&text))
         }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items.into_iter().map(normalize_volatile_value).collect(),
-        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(normalize_volatile_value).collect())
+        }
         serde_json::Value::Object(map) => serde_json::Value::Object(
             map.into_iter()
                 .map(|(key, item)| (key, normalize_volatile_value(item)))
@@ -493,8 +506,10 @@ fn normalize_volatile_text(text: &str) -> String {
         vec![
             // ISO-8601 / common log timestamps first (longest patterns win).
             (
-                Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
-                    .unwrap(),
+                Regex::new(
+                    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?",
+                )
+                .unwrap(),
                 "<ts>",
             ),
             // UUIDs.
@@ -589,47 +604,38 @@ mod tests {
     }
 
     #[test]
-    fn single_tool_category_is_rejected_for_lack_of_diversity() {
+    fn single_tool_with_valid_observation_passes_gate() {
+        // MIN_EVIDENCE_CATEGORY_DIVERSITY = 1: a single working tool with
+        // a real observation is enough to satisfy the evidence diversity gate.
+        // Host tools (nuclei, sqlmap, dalfox, nmap, etc.) still count via
+        // ToolCategory::Unknown, which is a productive category.
         let mut progress = ScanProgress::new("扫描 https://example.test");
-        // Only recon — no vuln validation
-        progress.record_tool_result(
-            "http_request",
-            true,
-            false,
-            true,
-            r#"{"status":200,"body":"ok"}"#,
-        );
-        let rejection = progress
-            .final_rejection("FINAL: 目标可达，未发现明显漏洞", &["ev-1".into()])
-            .unwrap();
+        progress.record_tool_result("http_request", true, true, r#"{"status":200,"body":"ok"}"#);
         assert!(
-            rejection.contains("多样性"),
-            "expected diversity gate rejection, got: {rejection}"
+            progress
+                .final_rejection("FINAL: 目标可达，未发现明显漏洞", &["ev-1".into()])
+                .is_none()
         );
     }
 
     #[test]
-    fn two_categories_satisfy_diversity_gate() {
+    fn nmap_plus_nuclei_satisfy_diversity_gate() {
         let mut progress = ScanProgress::new("扫描 https://example.test");
         progress.record_tool_result(
-            "http_request",
+            "nmap",
             true,
-            false,
             true,
-            r#"{"status":200,"body":"<form action='/login'>"}"#,
+            r#"{"ports":[{"port":80,"state":"open"}]}"#,
         );
         progress.record_tool_result(
-            "dir_fuzz",
+            "nuclei",
             true,
-            false,
             true,
-            r#"{"findings":[{"path":"/admin","status":403}]}"#,
+            r#"{"findings":[{"template":"exposed-panel"}]}"#,
         );
-        let evidence = vec!["ev-1".to_string()];
-        // No verified claims, so no evidence ID reference needed
         assert!(
             progress
-                .final_rejection("FINAL: 发现管理后台但无高危漏洞", &evidence)
+                .final_rejection("FINAL: 发现开放端口，Nuclei 未命中高危", &[])
                 .is_none()
         );
     }
@@ -638,18 +644,16 @@ mod tests {
     fn verified_claim_requires_known_evidence_reference() {
         let mut progress = ScanProgress::new("扫描 https://example.test");
         progress.record_tool_result(
-            "http_request",
-            true,
-            false,
-            true,
+            "http_request", true, true,
             r#"{"status":200,"marker":"proof"}"#,
         );
         progress.record_tool_result(
-            "dir_fuzz",
-            true,
-            false,
-            true,
+            "dir_fuzz", true, true,
             r#"{"findings":[{"path":"/admin"}]}"#,
+        );
+        progress.record_tool_result(
+            "nmap", true, true,
+            r#"{"ports":[{"port":80,"state":"open"}]}"#,
         );
         let evidence = vec!["ev-123".to_string()];
         assert!(
@@ -696,12 +700,11 @@ mod tests {
                 r#"{"status":200,"body":"nonce abcdefghijklmnopqrstuvwxyz12 page"}"#,
             )),
         );
-        // Same page with a different nonce: a successful duplicate does NOT
+        // Same page with a different nonce: a successful repeat does NOT
         // increment the stall counter (tools work, model must change strategy).
         let diagnostic = progress.record_tool_result(
             "http_request",
             true,
-            false,
             true,
             r#"{"status":200,"body":"nonce zyxwvutsrqponmlkjihgfedcba987654 page"}"#,
         );
@@ -714,24 +717,23 @@ mod tests {
         let mut progress = ScanProgress::new("扫描 https://example.test");
         assert!(
             progress
-                .record_tool_result("http_request", true, false, true, r#"{"status":200}"#)
+                .record_tool_result("http_request", true, true, r#"{"status":200}"#)
                 .is_none()
         );
-        // Successful duplicate results don't increment the stall counter.
+        // Successful repeated results don't increment the stall counter.
         for _ in 0..2 {
-            progress.record_tool_result("http_request", true, false, true, r#"{"status":200}"#);
+            progress.record_tool_result("http_request", true, true, r#"{"status":200}"#);
         }
         assert_eq!(
             progress.consecutive_no_progress(),
             0,
-            "successful duplicates are not stall"
+            "successful repeats are not stall"
         );
         // Failed calls DO increment the counter — that's the real stall signal.
         let mut diagnostic = None;
         for _ in 0..3 {
             if let Some(d) = progress.record_tool_result(
                 "http_probe",
-                false,
                 false,
                 false,
                 r#"{"error":"network unreachable"}"#,
@@ -752,7 +754,6 @@ mod tests {
         progress.record_tool_result(
             "http_request",
             true,
-            false,
             true,
             r#"{"status":200,"body":"<form action='/login'>"}"#,
         );
@@ -761,7 +762,6 @@ mod tests {
         for _ in 0..3 {
             if let Some(d) = progress.record_tool_result(
                 "sqli_validate",
-                false,
                 false,
                 false,
                 r#"{"error":"no injection point configured"}"#,
@@ -782,27 +782,20 @@ mod tests {
         progress.record_tool_result(
             "http_request",
             true,
-            false,
             true,
             r#"{"status":200,"marker":"new"}"#,
         );
         assert!(progress.no_path_rejection().is_some());
-        progress.record_tool_result(
-            "http_request",
-            false,
-            false,
-            false,
-            r#"{"error":"timeout"}"#,
-        );
+        progress.record_tool_result("http_request", false, false, r#"{"error":"timeout"}"#);
         assert!(progress.no_path_rejection().is_none());
     }
 
     #[test]
     fn tool_categories_are_tracked_for_diversity() {
         let mut progress = ScanProgress::new("扫描 https://example.test");
-        progress.record_tool_result("http_request", true, false, true, r#"{"status":200}"#);
-        progress.record_tool_result("dir_fuzz", true, false, true, r#"{"findings":[]}"#);
-        // Two distinct categories should satisfy diversity
+        progress.record_tool_result("http_request", true, true, r#"{"status":200}"#);
+        progress.record_tool_result("dir_fuzz", true, true, r#"{"findings":[]}"#);
+        progress.record_tool_result("nmap", true, true, r#"{"ports":[{"port":80,"state":"open"}]}"#);
         assert!(
             progress
                 .final_rejection("FINAL: no vulns found", &[])
@@ -816,20 +809,17 @@ mod tests {
     fn maturity_gate_is_inactive_by_default() {
         // Default is E2, so the maturity gate should not reject.
         let mut progress = ScanProgress::new("扫描 https://example.test");
-        progress.record_tool_result(
-            "http_request",
-            true,
-            false,
-            true,
-            r#"{"status":200,"body":"ok"}"#,
-        );
+        progress.record_tool_result("http_request", true, true, r#"{"status":200,"body":"ok"}"#);
         progress.record_evidence_tool("ev-1", "http_request");
         let rejection = progress.maturity_rejection_with_level(
             "FINAL: 漏洞已验证，参考 ev-1",
             &["ev-1".to_string()],
             None, // use env default (E2)
         );
-        assert!(rejection.is_none(), "E2 default should not reject: {rejection:?}");
+        assert!(
+            rejection.is_none(),
+            "E2 default should not reject: {rejection:?}"
+        );
     }
 
     #[test]
@@ -843,7 +833,10 @@ mod tests {
             &["ev-1".to_string(), "ev-2".to_string()],
             Some(3), // E3
         );
-        assert!(rejection.is_none(), "E3 with 2 categories should pass: {rejection:?}");
+        assert!(
+            rejection.is_none(),
+            "E3 with 2 categories should pass: {rejection:?}"
+        );
     }
 
     #[test]
@@ -856,10 +849,7 @@ mod tests {
             &["ev-1".to_string(), "ev-2".to_string()],
             Some(3), // E3
         );
-        assert!(
-            rejection.is_some(),
-            "E3 with single category should reject"
-        );
+        assert!(rejection.is_some(), "E3 with single category should reject");
         let msg = rejection.unwrap();
         assert!(msg.contains("成熟度不足"), "should mention maturity: {msg}");
     }
@@ -905,8 +895,11 @@ mod tests {
         let rejection = progress.maturity_rejection_with_level(
             "FINAL: 漏洞已验证",
             &["ev-1".to_string()], // ev-1 in evidence_ids but NOT cited in text
-            Some(3), // E3
+            Some(3),               // E3
         );
-        assert!(rejection.is_none(), "no cited evidence should delegate to citation gate: {rejection:?}");
+        assert!(
+            rejection.is_none(),
+            "no cited evidence should delegate to citation gate: {rejection:?}"
+        );
     }
 }

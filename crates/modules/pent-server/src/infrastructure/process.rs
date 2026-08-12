@@ -13,30 +13,12 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Resource limits for tool execution.
 #[derive(Debug, Clone)]
-pub struct ContainerLimits {
+pub struct ToolExecutionLimits {
     pub cpu_cores: f64,
     pub memory_mb: u64,
     pub timeout_seconds: u64,
     pub network_access: NetworkPolicy,
-    pub network_name: Option<String>,
     pub allowed_paths: Vec<String>,
-    pub backend: ExecutionBackend,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionBackend {
-    Host,
-    Docker,
-}
-
-impl ExecutionBackend {
-    pub fn from_env() -> Self {
-        if cfg!(test) && std::env::var("PENTA_TOOL_EXECUTOR").as_deref() == Ok("host") {
-            Self::Host
-        } else {
-            Self::Docker
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,25 +41,20 @@ impl NetworkPolicy {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolExecutionAudit {
     pub backend: &'static str,
-    pub container_image: Option<String>,
-    pub image_digest_pinned: bool,
     pub network_policy: &'static str,
-    pub network_name: Option<String>,
     pub cpu_cores: f64,
     pub memory_mb: u64,
     pub timeout_seconds: u64,
 }
 
-impl Default for ContainerLimits {
+impl Default for ToolExecutionLimits {
     fn default() -> Self {
         Self {
             cpu_cores: 0.5,
             memory_mb: 256,
             timeout_seconds: 300,
-            network_access: NetworkPolicy::TargetOnly("".into()),
-            network_name: None,
+            network_access: NetworkPolicy::Full,
             allowed_paths: vec![],
-            backend: ExecutionBackend::Docker,
         }
     }
 }
@@ -90,9 +67,60 @@ impl Default for ContainerLimits {
 pub(crate) async fn execute_tool_direct(
     tool_name: &str,
     command: &[String],
-    limits: &ContainerLimits,
+    limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
     let prepared = prepare_tool(tool_name, command, &limits.network_access)?;
+
+    // ── Pre-flight: ensure the binary exists ──────────────────────────
+    if !path_is_executable(prepared.program) {
+        if auto_install_enabled() {
+            if let Some(lifecycle) =
+                super::tool_lifecycle::find(tool_name)
+            {
+                tracing::warn!(
+                    tool = tool_name,
+                    path = prepared.program,
+                    "tool binary missing; attempting auto-install"
+                );
+                if let Err(error) = lifecycle.ensure_available().await {
+                    return Err(format!(
+                        "工具 '{tool_name}' 未安装且自动安装失败: {error}\n\
+                         手动安装: {}",
+                        lifecycle
+                            .install_methods
+                            .iter()
+                            .map(|m| format!("[{}] {}", m.label, m.command))
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    ));
+                }
+                tracing::info!(tool = tool_name, "auto-installed successfully");
+            } else {
+                return Err(format!(
+                    "工具 '{tool_name}' 二进制文件不存在: {}\n\
+                     请手动安装此工具后重试。",
+                    prepared.program
+                ));
+            }
+        } else {
+            let hint = super::tool_lifecycle::find(tool_name)
+                .map(|lc| {
+                    lc.install_methods
+                        .iter()
+                        .map(|m| format!("[{}] {}", m.label, m.command))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .unwrap_or_default();
+            return Err(format!(
+                "工具 '{tool_name}' 二进制文件不存在: {}\n\
+                 安装提示: {hint}\n\
+                 或设置 PENTA_AUTO_INSTALL_TOOLS=true 启用自动安装。",
+                prepared.program
+            ));
+        }
+    }
+
     let started = Instant::now();
     tracing::info!(
         tool = tool_name,
@@ -102,17 +130,63 @@ pub(crate) async fn execute_tool_direct(
 
     let audit = execution_audit(&prepared, limits)?;
     let (runner, args) = build_runner(&prepared, limits)?;
+    ensure_host_state_dir()?;
 
-    let mut child = Command::new(runner)
-        .args(args)
-        .env_clear()
-        .env("LANG", "C.UTF-8")
+    let capture = std::env::var("PENTA_TRAFFIC_CAPTURE")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let proxy_addr = std::env::var("PENTA_TRAFFIC_PROXY")
+        .unwrap_or_else(|_| "http://127.0.0.1:8085".into());
+    // ── M3: Low-privilege user execution ──────────────────────────
+    // When PENTA_TOOL_USER is set, run the tool via sudo/runuser to drop
+    // privileges. Default: run as current user (for dev environments).
+    let tool_user = std::env::var("PENTA_TOOL_USER").unwrap_or_default();
+    let mut cmd = if tool_user.is_empty() {
+        Command::new(runner)
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("-u").arg(&tool_user).arg(runner);
+        c
+    };
+    cmd.args(args).env_clear().env("LANG", "C.UTF-8");
+    // ── M2-F13: mitmproxy traffic capture ──────────────────────────
+    if capture {
+        cmd.env("http_proxy", &proxy_addr)
+           .env("https_proxy", &proxy_addr)
+           .env("HTTP_PROXY", &proxy_addr)
+           .env("HTTPS_PROXY", &proxy_addr)
+           .env("no_proxy", "127.0.0.1,localhost,.local")
+           .env("NO_PROXY", "127.0.0.1,localhost,.local");
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("无法启动工具 {tool_name}: {error}"))?;
+
+    // ── M3: cgroup v2 isolation ────────────────────────────────────
+    // Attach the spawned process to a per-task cgroup so the kernel
+    // enforces CPU, memory, PID, and IO limits at the cgroup level.
+    // The cgroup is auto-cleaned when the guard drops.
+    let _cgroup_guard = {
+        let limits = crate::infrastructure::cgroup::CgroupLimits {
+            cpu_quota_us: Some((limits.cpu_cores * 100_000.0) as u64),
+            memory_max_bytes: Some(limits.memory_mb.saturating_mul(1024 * 1024)),
+            pids_max: Some(64),
+        };
+        let guard = crate::infrastructure::cgroup::CgroupGuard::create(
+            &format!("kairos-tool-{}", std::process::id()),
+            &limits,
+        );
+        if let Some(ref g) = guard {
+            if let Some(pid) = child.id() {
+                g.attach(pid);
+            }
+        }
+        guard
+    };
 
     let stdout = child.stdout.take().ok_or("无法捕获工具标准输出")?;
     let stderr = child.stderr.take().ok_or("无法捕获工具错误输出")?;
@@ -172,171 +246,57 @@ pub async fn execute_tool(
 }
 
 fn execution_audit(
-    prepared: &super::tool_registry::PreparedTool,
-    limits: &ContainerLimits,
+    _prepared: &super::tool_registry::PreparedTool,
+    limits: &ToolExecutionLimits,
 ) -> Result<ToolExecutionAudit, String> {
-    let (backend, image, network_name) = match limits.backend {
-        ExecutionBackend::Host => ("host", None, None),
-        ExecutionBackend::Docker => {
-            validate_container_image(&prepared.container_image)?;
-            let network = match &limits.network_access {
-                NetworkPolicy::None => Some("none".to_string()),
-                NetworkPolicy::TargetOnly(_) => Some(limits.network_name.clone().map_or_else(
-                    || {
-                        std::env::var("PENTA_DOCKER_TARGET_NETWORK").map_err(|_| {
-                            "PENTA_DOCKER_TARGET_NETWORK 未配置，拒绝使用普通 bridge 网络"
-                                .to_string()
-                        })
-                    },
-                    Ok,
-                )?),
-                NetworkPolicy::Full => {
-                    Some(std::env::var("PENTA_DOCKER_FULL_NETWORK").map_err(|_| {
-                        "PENTA_DOCKER_FULL_NETWORK 未配置，拒绝开放容器网络".to_string()
-                    })?)
-                }
-            };
-            ("docker", Some(prepared.container_image.clone()), network)
-        }
-    };
     Ok(ToolExecutionAudit {
-        backend,
-        image_digest_pinned: image
-            .as_deref()
-            .is_some_and(|value| value.contains("@sha256:")),
-        container_image: image,
+        backend: "host",
         network_policy: limits.network_access.audit_name(),
-        network_name,
         cpu_cores: limits.cpu_cores,
         memory_mb: limits.memory_mb,
         timeout_seconds: limits.timeout_seconds,
     })
 }
 
-fn validate_container_image(image: &str) -> Result<(), String> {
-    if image.is_empty() {
-        return Err("工具没有受支持的容器镜像".into());
-    }
-    if image.ends_with(":latest") {
-        return Err("拒绝使用 latest 工具镜像".into());
-    }
-    let require_digest =
-        !cfg!(test) && std::env::var("PENTA_REQUIRE_IMAGE_DIGEST").as_deref() != Ok("false");
-    if require_digest && !image.contains("@sha256:") {
-        return Err(format!(
-            "工具镜像 {image} 未固定 digest；请配置 PENTA_TOOLKIT_IMAGE 为 name@sha256:..."
-        ));
-    }
-    Ok(())
-}
-
 fn build_runner(
     prepared: &super::tool_registry::PreparedTool,
-    limits: &ContainerLimits,
+    limits: &ToolExecutionLimits,
 ) -> Result<(&'static str, Vec<String>), String> {
-    match limits.backend {
-        ExecutionBackend::Host => {
-            if !cfg!(test) {
-                return Err(
-                    "生产环境禁止宿主机直连执行；安全工具必须使用 Docker 隔离执行器".into(),
-                );
-            }
-            let memory_bytes = limits.memory_mb.saturating_mul(1024 * 1024);
-            let cpu_seconds = limits.timeout_seconds.max(1);
-            let mut args = vec![
-                format!("--as={memory_bytes}"),
-                format!("--cpu={cpu_seconds}"),
-                "--".into(),
-                prepared.program.into(),
-            ];
-            args.extend(prepared.args.clone());
-            Ok(("/usr/bin/prlimit", args))
-        }
-        ExecutionBackend::Docker => {
-            validate_container_image(&prepared.container_image)?;
-            let network = match &limits.network_access {
-                NetworkPolicy::None => "none".to_string(),
-                NetworkPolicy::TargetOnly(_) => limits
-                    .network_name
-                    .clone()
-                    .or_else(|| std::env::var("PENTA_DOCKER_TARGET_NETWORK").ok())
-                    .ok_or_else(|| {
-                        "PENTA_DOCKER_TARGET_NETWORK 未配置，拒绝使用普通 bridge 网络".to_string()
-                    })?,
-                NetworkPolicy::Full
-                    if std::env::var("PENTA_ALLOW_FULL_NETWORK").as_deref() == Ok("true") =>
-                {
-                    std::env::var("PENTA_DOCKER_FULL_NETWORK").map_err(|_| {
-                        "PENTA_DOCKER_FULL_NETWORK 未配置，拒绝开放容器网络".to_string()
-                    })?
-                }
-                NetworkPolicy::Full => return Err("当前策略禁止容器访问完整网络".into()),
-            };
-            let mut args = vec![
-                "run".into(),
-                "--rm".into(),
-                "--pull".into(),
-                "never".into(),
-                "--read-only".into(),
-                "--init".into(),
-                "--tmpfs".into(),
-                "/tmp:rw,noexec,nosuid,size=64m".into(),
-                "--network".into(),
-                network,
-                "--cap-drop".into(),
-                "ALL".into(),
-                "--security-opt".into(),
-                "no-new-privileges".into(),
-                "--pids-limit".into(),
-                "64".into(),
-                "--memory".into(),
-                format!("{}m", limits.memory_mb),
-                "--cpus".into(),
-                limits.cpu_cores.to_string(),
-            ];
-            if let Some(state_path) = limits.allowed_paths.first() {
-                #[cfg(unix)]
-                use std::os::unix::fs::MetadataExt;
-                let canonical = std::fs::canonicalize(state_path)
-                    .map_err(|error| format!("HTTP 会话状态目录无效: {error}"))?;
-                let allowed_root = std::env::var("PENTA_TOOL_STATE_ROOT")
-                    .unwrap_or_else(|_| "/tmp/kairos-pent-tool-state".into());
-                let allowed_root = std::fs::canonicalize(&allowed_root)
-                    .map_err(|error| format!("工具状态根目录无效: {error}"))?;
-                if !canonical.starts_with(&allowed_root) {
-                    return Err("拒绝挂载工具状态根目录以外的路径".into());
-                }
-                args.extend([
-                    "--user".into(),
-                    {
-                        #[cfg(unix)]
-                        {
-                            let metadata = std::fs::metadata(&canonical)
-                                .map_err(|error| format!("读取工具状态目录失败: {error}"))?;
-                            format!("{}:{}", metadata.uid(), metadata.gid())
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            "65534:65534".into()
-                        }
-                    },
-                    "--mount".into(),
-                    format!("type=bind,src={},dst=/state", canonical.to_string_lossy()),
-                ]);
-            }
-            args.extend([
-                "--label".into(),
-                format!(
-                    "kairos.pent.network-policy={}",
-                    limits.network_access.audit_name()
-                ),
-                prepared.container_image.clone(),
-                prepared.program.into(),
-            ]);
-            args.extend(prepared.args.clone());
-            Ok(("/usr/bin/docker", args))
-        }
-    }
+    let memory_bytes = limits.memory_mb.saturating_mul(1024 * 1024);
+    let cpu_seconds = limits.timeout_seconds.max(1);
+    // Use --rss (resident set size) instead of --as (address space).
+    // Go runtimes pre-reserve large virtual address spaces that --as rejects,
+    // but their actual physical memory usage stays within bounds.
+    let mut args = vec![
+        format!("--rss={memory_bytes}"),
+        format!("--cpu={cpu_seconds}"),
+        "--".into(),
+        prepared.program.into(),
+    ];
+    args.extend(prepared.args.clone());
+    Ok(("/usr/bin/prlimit", args))
+}
+
+fn ensure_host_state_dir() -> Result<(), String> {
+    let state_root =
+        std::env::var("PENTA_TOOL_STATE_ROOT").unwrap_or_else(|_| "/tmp/kairos-pent-tool-state".into());
+    std::fs::create_dir_all(&state_root)
+        .map_err(|error| format!("创建工具状态目录失败: {error}"))
+}
+
+/// Fast synchronous check: does `path` point to an executable regular file?
+fn path_is_executable(path: &str) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// Whether on-demand auto-install is allowed.
+/// Controlled by `PENTA_AUTO_INSTALL_TOOLS` (default: enabled).
+fn auto_install_enabled() -> bool {
+    std::env::var("PENTA_AUTO_INSTALL_TOOLS")
+        .map(|v| v != "false" && v != "0" && v != "no")
+        .unwrap_or(true)
 }
 
 async fn read_bounded<R>(mut reader: R) -> Result<(String, bool), String>
@@ -404,11 +364,10 @@ mod tests {
         {
             return;
         }
-        let limits = ContainerLimits {
+        let limits = ToolExecutionLimits {
             memory_mb: 512,
             timeout_seconds: 15,
             network_access: NetworkPolicy::TargetOnly("127.0.0.1".into()),
-            backend: ExecutionBackend::Host,
             ..Default::default()
         };
         let output = execute_tool("tcp_scan", &["scan".into(), "127.0.0.1".into()], &limits)
@@ -420,29 +379,20 @@ mod tests {
     }
 
     #[test]
-    fn docker_runner_has_hardening_flags() {
+    fn host_runner_uses_prlimit_and_direct_tool() {
         let prepared = super::prepare_tool(
             "tcp_scan",
             &["scan".into(), "127.0.0.1".into()],
             &NetworkPolicy::TargetOnly("127.0.0.1".into()),
         )
         .unwrap();
-        let limits = ContainerLimits {
-            backend: ExecutionBackend::Docker,
+        let limits = ToolExecutionLimits {
             network_access: NetworkPolicy::None,
             ..Default::default()
         };
         let (runner, args) = build_runner(&prepared, &limits).unwrap();
-        assert_eq!(runner, "/usr/bin/docker");
-        assert!(args.windows(2).any(|pair| pair == ["--cap-drop", "ALL"]));
-        assert!(args.contains(&"--read-only".to_string()));
-        assert!(args.contains(&"no-new-privileges".to_string()));
-        assert!(args.windows(2).any(|pair| {
-            pair
-                == [
-                    "kairos-platform/pent-toolkit:kali-2026.1",
-                    "/usr/bin/nmap",
-                ]
-        }));
+        assert_eq!(runner, "/usr/bin/prlimit");
+        assert!(args.contains(&"--".to_string()));
+        assert!(args.contains(&"/usr/bin/nmap".to_string()));
     }
 }

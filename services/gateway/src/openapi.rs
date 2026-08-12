@@ -46,33 +46,6 @@ pub async fn document() -> Json<Value> {
             "/system/audit-logs": { "get": { "tags": ["system-audit"], "summary": "List audit logs", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Audit logs" } } } },
             "/health": { "get": { "tags": ["ops"], "summary": "Health check", "responses": { "200": { "description": "OK" } } } },
             "/infra/capabilities": { "get": { "tags": ["infra"], "summary": "Infra module capabilities", "responses": { "200": { "description": "OK" } } } },
-            "/toon/capabilities": { "get": { "tags": ["toon"], "summary": "Toon module capabilities", "responses": { "200": { "description": "OK" } } } },
-            "/toon/projects": {
-                "get": { "tags": ["toon"], "summary": "List toon projects", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Projects" } } },
-                "post": { "tags": ["toon"], "summary": "Create toon project", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Created project id" } } }
-            },
-            "/toon/projects/{id}": {
-                "get": { "tags": ["toon"], "summary": "Get toon project", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Project" } } },
-                "put": { "tags": ["toon"], "summary": "Update toon project", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } },
-                "delete": { "tags": ["toon"], "summary": "Delete toon project", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } }
-            },
-            "/toon/projects/{id}/publish": { "post": { "tags": ["toon"], "summary": "Publish toon project", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Publication id" } } } },
-            "/toon/projects/{project_id}/episodes": {
-                "get": { "tags": ["toon"], "summary": "List episodes", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Episodes" } } },
-                "post": { "tags": ["toon"], "summary": "Create episode", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Created episode id" } } }
-            },
-            "/toon/episodes/{id}": {
-                "put": { "tags": ["toon"], "summary": "Update episode", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } },
-                "delete": { "tags": ["toon"], "summary": "Delete episode", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } }
-            },
-            "/toon/episodes/{episode_id}/scenes": {
-                "get": { "tags": ["toon"], "summary": "List scenes", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Scenes" } } },
-                "post": { "tags": ["toon"], "summary": "Create scene", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Created scene id" } } }
-            },
-            "/toon/scenes/{id}": {
-                "put": { "tags": ["toon"], "summary": "Update scene", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } },
-                "delete": { "tags": ["toon"], "summary": "Delete scene", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } }
-            },
             "/media/capabilities": { "get": { "tags": ["media"], "summary": "Media module capabilities", "responses": { "200": { "description": "OK" } } } },
             "/media/assets": {
                 "get": { "tags": ["media"], "summary": "List media assets", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Assets" } } },

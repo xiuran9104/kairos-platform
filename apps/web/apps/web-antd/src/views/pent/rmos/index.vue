@@ -1,16 +1,25 @@
 <script lang="ts" setup>
 import type { EchartsUIType } from '@vben/plugins/echarts';
-import { nextTick, onMounted, ref } from 'vue';
+import { nextTick, onMounted, ref, watch } from 'vue';
 import { EchartsUI, useEcharts } from '@vben/plugins/echarts';
-import { getRmosMemories, submitRmosFeedback } from '#/api/pent';
+import { getPentProjects, getRmosMemories, submitRmosFeedback } from '#/api/pent';
 import { requestClient } from '#/api/request';
 
+const projects = ref<any[]>([]); const selectedProjectId = ref<string>();
 const memories = ref<any[]>([]); const loading = ref(false); const activeTab = ref('graph');
 const feedbackLoading = ref<string|null>(null); const graphData = ref<any>({nodes:[],edges:[]});
 const graphChart = ref<EchartsUIType>();
 const { renderEcharts } = useEcharts(graphChart);
 
-async function fetchAll() { loading.value=true; try{memories.value=(await getRmosMemories()) as any[]||[]}catch{/* */}finally{loading.value=false} }
+async function loadProjects() { try { projects.value = (await getPentProjects()) as any[]; } catch { projects.value = []; } }
+async function fetchAll() {
+  if (!selectedProjectId.value) { memories.value = []; return; }
+  loading.value=true;
+  try {
+    memories.value = (await getRmosMemories({ project_id: selectedProjectId.value })) as any[] || [];
+  } catch { /* */ }
+  finally { loading.value = false; }
+}
 
 async function buildGraph() {
   try { graphData.value = await requestClient.get('/pent/rmos/attack-graph') || {nodes:[],edges:[]} } catch { /* */ }
@@ -39,16 +48,20 @@ async function buildGraph() {
 
 async function submitFeedback(memoryId:string, feedback:'useful'|'useless') { feedbackLoading.value=memoryId; try{await submitRmosFeedback(memoryId,{feedback});fetchAll()}catch{/* */}finally{feedbackLoading.value=null} }
 
-onMounted(async () => { await fetchAll(); await buildGraph(); });
+watch(selectedProjectId, () => { fetchAll(); });
+onMounted(async () => { await loadProjects(); if (projects.value.length > 0) selectedProjectId.value = projects.value[0].id; });
 </script>
 
 <template>
-  <div style="padding:24px;min-height:100%">
-    <a-page-header title="RMOS 攻击记忆" sub-title="攻击图谱 · 攻击路径 · 记忆召回">
-      <template #extra><a-button @click="fetchAll" :loading="loading">刷新</a-button></template>
-    </a-page-header>
-
-    <a-tabs v-model:activeKey="activeTab" @change="async (k:string) => { if(k==='graph') { await buildGraph(); } }">
+  <div style="padding:24px;min-height:100%;background-color: var(--ant-color-bg-layout)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-weight:600;font-size:16px">RMOS 记忆</span>
+        <a-select v-model:value="selectedProjectId" :options="projects.map(p => ({ label: p.name, value: p.id }))" placeholder="选择项目" style="width:220px" allow-clear />
+      </div>
+      <a-button size="small" @click="fetchAll" :loading="loading">刷新</a-button>
+    </div>
+    <a-tabs v-model:activeKey="activeTab" size="small" style="margin-bottom:12px" @change="async (k:string) => { if(k==='graph') { await buildGraph(); } }">
       <a-tab-pane key="graph" tab="攻击图谱">
         <a-empty v-if="!graphData.nodes?.length" description="暂无图谱数据 · 执行扫描后自动生成" />
         <EchartsUI v-else ref="graphChart" height="65vh" />

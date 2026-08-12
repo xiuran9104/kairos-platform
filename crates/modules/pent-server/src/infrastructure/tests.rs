@@ -122,7 +122,7 @@ mod evidence_tests {
     fn finding_links_to_evidence_ids() {
         // Findings reference evidence via evidence_ids JSON array
         let insert_sql = r#"
-            INSERT INTO pent_findings(id,run_id,title,severity,status,target,evidence_ids)
+            INSERT INTO pent_findings(id,run_id,project_id,title,severity,status,target,evidence_ids)
             VALUES($1,$2,$3,$4,$5,$6,$7)
         "#;
         assert!(insert_sql.contains("evidence_ids"));
@@ -182,18 +182,16 @@ mod ai_model_tests {
 
 #[cfg(test)]
 mod tool_execution_tests {
-    use crate::infrastructure::process::{ContainerLimits, ExecutionBackend, NetworkPolicy};
+    use crate::infrastructure::process::{NetworkPolicy, ToolExecutionLimits};
 
     #[test]
-    fn container_limits_are_sensible() {
-        let limits = ContainerLimits {
+    fn tool_execution_limits_are_sensible() {
+        let limits = ToolExecutionLimits {
             cpu_cores: 1.0,
             memory_mb: 512,
             timeout_seconds: 300,
             network_access: NetworkPolicy::TargetOnly("example.com".into()),
-            network_name: Some("pent-target".into()),
             allowed_paths: vec!["/tmp".into()],
-            backend: ExecutionBackend::Docker,
         };
         assert!(limits.cpu_cores > 0.0);
         assert!(limits.memory_mb >= 128);
@@ -203,32 +201,15 @@ mod tool_execution_tests {
 
     #[test]
     fn host_execution_uses_direct_binary() {
-        let limits = ContainerLimits {
+        let limits = ToolExecutionLimits {
             cpu_cores: 2.0,
             memory_mb: 1024,
             timeout_seconds: 120,
             network_access: NetworkPolicy::Full,
-            network_name: None,
             allowed_paths: vec![],
-            backend: ExecutionBackend::Host,
         };
-        assert_eq!(limits.backend, ExecutionBackend::Host);
-        // Host execution should not require allowed_paths
-    }
-
-    #[test]
-    fn docker_execution_requires_allowed_paths() {
-        let limits = ContainerLimits {
-            cpu_cores: 1.0,
-            memory_mb: 256,
-            timeout_seconds: 60,
-            network_access: NetworkPolicy::TargetOnly("target.test".into()),
-            network_name: Some("pent-target".into()),
-            allowed_paths: vec!["/output".into()],
-            backend: ExecutionBackend::Docker,
-        };
-        assert_eq!(limits.backend, ExecutionBackend::Docker);
-        assert!(!limits.allowed_paths.is_empty());
+        assert!(matches!(limits.network_access, NetworkPolicy::Full));
+        assert!(limits.allowed_paths.is_empty());
     }
 
     #[test]

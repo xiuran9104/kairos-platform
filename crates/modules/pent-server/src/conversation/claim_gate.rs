@@ -97,8 +97,21 @@ fn flag_like_tokens(content: &str) -> Vec<String> {
         let word = word.trim_matches(|c: char| {
             matches!(
                 c,
-                '(' | ')' | '[' | ']' | '<' | '>' | ',' | '.' | ';' | ':' | '。' | '，' | '；'
-                    | '：' | '！' | '？'
+                '(' | ')'
+                    | '['
+                    | ']'
+                    | '<'
+                    | '>'
+                    | ','
+                    | '.'
+                    | ';'
+                    | ':'
+                    | '。'
+                    | '，'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
             )
         });
         let lower = word.to_ascii_lowercase();
@@ -128,7 +141,9 @@ mod tests {
 
     #[test]
     fn extracts_backtick_spans_and_flags() {
-        let tokens = extract_assertions("注入 payload `' OR 1=1--` 得到 `sql syntax error`，flag 为 flag{abc123}。");
+        let tokens = extract_assertions(
+            "注入 payload `' OR 1=1--` 得到 `sql syntax error`，flag 为 flag{abc123}。",
+        );
         assert!(tokens.contains(&"' OR 1=1--".to_string()));
         assert!(tokens.contains(&"sql syntax error".to_string()));
         assert!(tokens.contains(&"flag{abc123}".to_string()));
@@ -143,7 +158,10 @@ mod tests {
     #[test]
     fn grounded_claims_pass() {
         let evidence = cited(&["HTTP/1.1 200 OK\nsql syntax error near '' OR 1=1--"]);
-        let assessment = assess_claims("结论：存在注入，payload `' OR 1=1--`，特征 `sql syntax error`", &evidence);
+        let assessment = assess_claims(
+            "结论：存在注入，payload `' OR 1=1--`，特征 `sql syntax error`",
+            &evidence,
+        );
         assert!(assessment.ungrounded.is_empty());
         assert!(assessment.rejection().is_none());
     }
@@ -152,7 +170,10 @@ mod tests {
     fn fabricated_token_is_rejected_with_details() {
         let evidence = cited(&["HTTP/1.1 200 OK\nplain page"]);
         let assessment = assess_claims("漏洞已验证，marker `pwned-by-agent-777`", &evidence);
-        assert_eq!(assessment.ungrounded, vec!["pwned-by-agent-777".to_string()]);
+        assert_eq!(
+            assessment.ungrounded,
+            vec!["pwned-by-agent-777".to_string()]
+        );
         let rejection = assessment.rejection().unwrap();
         assert!(rejection.contains("pwned-by-agent-777"));
         assert!(rejection.contains("逐字投影"));

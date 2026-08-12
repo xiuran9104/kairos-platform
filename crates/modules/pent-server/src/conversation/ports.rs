@@ -159,15 +159,6 @@ pub trait ConversationContextSource: Send + Sync {
 }
 
 #[async_trait]
-pub trait ConversationAuthorizationService: Send + Sync {
-    async fn reconcile_explicit_authorization(
-        &self,
-        session_id: &str,
-        content: &str,
-    ) -> anyhow::Result<bool>;
-}
-
-#[async_trait]
 pub trait ConversationIntentDetector: Send + Sync {
     async fn detect(
         &self,

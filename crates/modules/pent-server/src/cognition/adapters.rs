@@ -26,9 +26,7 @@ pub fn select_next_action(graph: &TaskCoordinationGraph) -> Option<&PlanNode> {
         .nodes
         .iter()
         .filter(|node| node.node_type == PlanNodeType::Action)
-        .filter(|node| {
-            matches!(node.status, PlanNodeStatus::Pending | PlanNodeStatus::Ready)
-        })
+        .filter(|node| matches!(node.status, PlanNodeStatus::Pending | PlanNodeStatus::Ready))
         .filter(|node| node.attempt < node.max_attempts)
         .filter(|node| parent_allows(graph, node))
         .min_by_key(|node| node.priority)
@@ -42,9 +40,7 @@ pub fn select_all_executable_actions(graph: &TaskCoordinationGraph) -> Vec<&Plan
         .nodes
         .iter()
         .filter(|node| node.node_type == PlanNodeType::Action)
-        .filter(|node| {
-            matches!(node.status, PlanNodeStatus::Pending | PlanNodeStatus::Ready)
-        })
+        .filter(|node| matches!(node.status, PlanNodeStatus::Pending | PlanNodeStatus::Ready))
         .filter(|node| node.attempt < node.max_attempts)
         .filter(|node| parent_allows(graph, node))
         .collect();
@@ -110,8 +106,12 @@ fn stage_dependencies_met(graph: &TaskCoordinationGraph, stage: &PlanNode) -> bo
 
 fn risk_for_capability(capability: &str) -> String {
     match capability {
-        "sqli_validate" | "xss_validate" | "csrf_validate" | "command_injection_validate"
-        | "file_inclusion_validate" | "file_upload_validate" => "medium".into(),
+        "sqli_validate"
+        | "xss_validate"
+        | "csrf_validate"
+        | "command_injection_validate"
+        | "file_inclusion_validate"
+        | "file_upload_validate" => "medium".into(),
         _ => "low".into(),
     }
 }
@@ -119,8 +119,8 @@ fn risk_for_capability(capability: &str) -> String {
 #[async_trait]
 impl StepPlanner for DeterministicStepPlanner {
     async fn propose(&self, graph: &TaskCoordinationGraph) -> anyhow::Result<ActionProposal> {
-        let node = select_next_action(graph)
-            .ok_or_else(|| anyhow::anyhow!("NO_EXECUTABLE_ACTION"))?;
+        let node =
+            select_next_action(graph).ok_or_else(|| anyhow::anyhow!("NO_EXECUTABLE_ACTION"))?;
         Ok(ActionProposal {
             action_id: uuid::Uuid::new_v4().to_string(),
             plan_id: graph.plan_id.clone(),
@@ -192,12 +192,14 @@ impl PreReflector for ScopePreflector {
                 && node.capability.as_deref() == Some(proposal.capability.as_str())
                 && node.target.as_deref() == Some(proposal.target.as_str())
         });
-        Ok(kairos_platform_pent_core::cognition::deterministic_preflect(
-            proposal,
-            duplicate,
-            true,
-            scope_valid,
-        ))
+        Ok(
+            kairos_platform_pent_core::cognition::deterministic_preflect(
+                proposal,
+                duplicate,
+                true,
+                scope_valid,
+            ),
+        )
     }
 }
 
@@ -206,7 +208,6 @@ impl PreReflector for ScopePreflector {
 pub struct ProcessExecutor {
     pool: PgPool,
     run_id: String,
-    backend: crate::infrastructure::process::ExecutionBackend,
 }
 
 impl ProcessExecutor {
@@ -214,28 +215,15 @@ impl ProcessExecutor {
         Self {
             pool,
             run_id: run_id.to_string(),
-            backend: crate::infrastructure::process::ExecutionBackend::from_env(),
-        }
-    }
-
-    /// Explicit backend override (tests, operator-forced execution modes).
-    pub fn with_backend(
-        pool: PgPool,
-        run_id: &str,
-        backend: crate::infrastructure::process::ExecutionBackend,
-    ) -> Self {
-        Self {
-            pool,
-            run_id: run_id.to_string(),
-            backend,
         }
     }
 
     fn command_for(proposal: &ActionProposal) -> Result<(String, Vec<String>), String> {
         match proposal.capability.as_str() {
-            "tcp_scan" | "scanner_nmap" => {
-                Ok(("tcp_scan".into(), vec!["scan".into(), proposal.target.clone()]))
-            }
+            "tcp_scan" | "scanner_nmap" => Ok((
+                "tcp_scan".into(),
+                vec!["scan".into(), proposal.target.clone()],
+            )),
             "http_probe" | "scanner_nuclei" => Ok((
                 "http_probe".into(),
                 vec!["probe".into(), proposal.target.clone()],
@@ -249,14 +237,11 @@ impl ProcessExecutor {
 #[async_trait]
 impl CognitiveExecutor for ProcessExecutor {
     async fn execute(&self, proposal: &ActionProposal) -> anyhow::Result<ToolExecutionResult> {
-        let (tool_name, command) = Self::command_for(proposal)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        let limits = crate::infrastructure::process::ContainerLimits {
+        let (tool_name, command) =
+            Self::command_for(proposal).map_err(|error| anyhow::anyhow!(error))?;
+        let limits = crate::infrastructure::process::ToolExecutionLimits {
             timeout_seconds: 120,
-            network_access: crate::infrastructure::process::NetworkPolicy::TargetOnly(
-                proposal.target.clone(),
-            ),
-            backend: self.backend,
+            network_access: crate::infrastructure::process::NetworkPolicy::Full,
             ..Default::default()
         };
         let started = std::time::Instant::now();
@@ -274,10 +259,7 @@ impl CognitiveExecutor for ProcessExecutor {
 
         // Persist tool call + raw evidence so the fact layer stays complete.
         let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-        let backend_name = match limits.backend {
-            crate::infrastructure::process::ExecutionBackend::Docker => "docker",
-            crate::infrastructure::process::ExecutionBackend::Host => "host",
-        };
+        let backend_name = "host";
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO pent_tool_calls(
@@ -302,10 +284,7 @@ impl CognitiveExecutor for ProcessExecutor {
         .await?;
         let evidence_id = uuid::Uuid::new_v4().to_string();
         let source = serde_json::to_string(&result)?;
-        let hash = format!(
-            "sha256:{:x}",
-            sha2::Sha256::digest(source.as_bytes())
-        );
+        let hash = format!("sha256:{:x}", sha2::Sha256::digest(source.as_bytes()));
         sqlx::query(
             "INSERT INTO pent_evidence(id,run_id,tool_call_id,source,content_hash,content_type)
              VALUES($1,$2,$3,$4,$5,'application/json')",
@@ -341,11 +320,9 @@ impl ActionReflector for HeuristicReflector {
             && (!result.observations.is_empty() || !result.findings.is_empty());
         let (information_gain, reason_codes, lessons) = match (&result.status, useful) {
             (ToolExecutionStatus::Succeeded, true) => (0.6, vec![], vec![]),
-            (ToolExecutionStatus::Succeeded, false) => (
-                0.2,
-                vec!["NO_NEW_OBSERVATION".into()],
-                vec![],
-            ),
+            (ToolExecutionStatus::Succeeded, false) => {
+                (0.2, vec!["NO_NEW_OBSERVATION".into()], vec![])
+            }
             (ToolExecutionStatus::Partial, _) => (0.3, vec!["PARTIAL_RESULT".into()], vec![]),
             _ => (
                 0.0,
@@ -480,16 +457,16 @@ impl MetaMetricsSource for DbMetaMetrics {
             .iter()
             .take_while(|(exit_code, _)| *exit_code != 0)
             .count() as u32;
-        let successes = recent.iter().filter(|(exit_code, _)| *exit_code == 0).count();
+        let successes = recent
+            .iter()
+            .filter(|(exit_code, _)| *exit_code == 0)
+            .count();
         let observation_confidence = if recent.is_empty() {
             0.8
         } else {
             successes as f32 / recent.len() as f32
         };
-        let fingerprints: Vec<&str> = recent
-            .iter()
-            .filter_map(|(_, fp)| fp.as_deref())
-            .collect();
+        let fingerprints: Vec<&str> = recent.iter().filter_map(|(_, fp)| fp.as_deref()).collect();
         let unique: std::collections::HashSet<&&str> = fingerprints.iter().collect();
         let loop_similarity = if fingerprints.len() < 2 {
             0.0
@@ -663,25 +640,108 @@ mod tests {
     fn next_action_prefers_lowest_priority_number_with_parent_running() {
         let g = graph(
             vec![
-                node("s1", PlanNodeType::Stage, PlanNodeStatus::Running, 1, None, None, None, 0, 1),
-                node("s2", PlanNodeType::Stage, PlanNodeStatus::Pending, 2, None, None, None, 0, 1),
-                node("a1", PlanNodeType::Action, PlanNodeStatus::Pending, 1, Some("s1"), Some("tcp_scan"), Some("127.0.0.1"), 0, 2),
-                node("a2", PlanNodeType::Action, PlanNodeStatus::Pending, 5, Some("s1"), Some("http_probe"), Some("127.0.0.1"), 0, 2),
-                node("a3", PlanNodeType::Action, PlanNodeStatus::Pending, 0, Some("s2"), Some("dns_lookup"), Some("127.0.0.1"), 0, 2),
-                node("a4", PlanNodeType::Action, PlanNodeStatus::Pending, 0, Some("s1"), Some("x"), Some("127.0.0.1"), 2, 2),
+                node(
+                    "s1",
+                    PlanNodeType::Stage,
+                    PlanNodeStatus::Running,
+                    1,
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+                node(
+                    "s2",
+                    PlanNodeType::Stage,
+                    PlanNodeStatus::Pending,
+                    2,
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+                node(
+                    "a1",
+                    PlanNodeType::Action,
+                    PlanNodeStatus::Pending,
+                    1,
+                    Some("s1"),
+                    Some("tcp_scan"),
+                    Some("127.0.0.1"),
+                    0,
+                    2,
+                ),
+                node(
+                    "a2",
+                    PlanNodeType::Action,
+                    PlanNodeStatus::Pending,
+                    5,
+                    Some("s1"),
+                    Some("http_probe"),
+                    Some("127.0.0.1"),
+                    0,
+                    2,
+                ),
+                node(
+                    "a3",
+                    PlanNodeType::Action,
+                    PlanNodeStatus::Pending,
+                    0,
+                    Some("s2"),
+                    Some("dns_lookup"),
+                    Some("127.0.0.1"),
+                    0,
+                    2,
+                ),
+                node(
+                    "a4",
+                    PlanNodeType::Action,
+                    PlanNodeStatus::Pending,
+                    0,
+                    Some("s1"),
+                    Some("x"),
+                    Some("127.0.0.1"),
+                    2,
+                    2,
+                ),
             ],
             vec![],
         );
         let selected = select_next_action(&g).expect("an action is selectable");
-        assert_eq!(selected.node_id, "a1", "a3 被父阶段阻塞、a4 尝试次数耗尽，优先级 1 最先执行");
+        assert_eq!(
+            selected.node_id, "a1",
+            "a3 被父阶段阻塞、a4 尝试次数耗尽，优先级 1 最先执行"
+        );
     }
 
     #[test]
     fn expandable_stage_requires_dependencies_completed() {
         let g = graph(
             vec![
-                node("s1", PlanNodeType::Stage, PlanNodeStatus::Completed, 1, None, None, None, 0, 1),
-                node("s2", PlanNodeType::Stage, PlanNodeStatus::Pending, 2, None, None, None, 0, 1),
+                node(
+                    "s1",
+                    PlanNodeType::Stage,
+                    PlanNodeStatus::Completed,
+                    1,
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+                node(
+                    "s2",
+                    PlanNodeType::Stage,
+                    PlanNodeStatus::Pending,
+                    2,
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
             ],
             vec![PlanEdge {
                 from: "s1".into(),
@@ -696,8 +756,28 @@ mod tests {
         );
         let g2 = graph(
             vec![
-                node("s1", PlanNodeType::Stage, PlanNodeStatus::Running, 1, None, None, None, 0, 1),
-                node("s2", PlanNodeType::Stage, PlanNodeStatus::Pending, 2, None, None, None, 0, 1),
+                node(
+                    "s1",
+                    PlanNodeType::Stage,
+                    PlanNodeStatus::Running,
+                    1,
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+                node(
+                    "s2",
+                    PlanNodeType::Stage,
+                    PlanNodeStatus::Pending,
+                    2,
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
             ],
             vec![PlanEdge {
                 from: "s1".into(),
@@ -713,8 +793,14 @@ mod tests {
     fn scope_matching_normalizes_urls_and_ports() {
         assert_eq!(host_of("http://Example.com:8080/a?b=1"), "example.com");
         assert_eq!(host_of("127.0.0.1"), "127.0.0.1");
-        assert!(target_in_scope("http://127.0.0.1:9000/x", &["127.0.0.1".into()]));
-        assert!(!target_in_scope("http://evil.example", &["127.0.0.1".into()]));
+        assert!(target_in_scope(
+            "http://127.0.0.1:9000/x",
+            &["127.0.0.1".into()]
+        ));
+        assert!(!target_in_scope(
+            "http://evil.example",
+            &["127.0.0.1".into()]
+        ));
         assert!(!target_in_scope("", &["127.0.0.1".into()]));
     }
 
@@ -763,21 +849,33 @@ mod tests {
         let reflector = HeuristicReflector;
         let g = graph(vec![], vec![]);
         let useful = reflector
-            .reflect(&g, &proposal("tcp_scan", "127.0.0.1", "a1"), &tool_result(ToolExecutionStatus::Succeeded, 2))
+            .reflect(
+                &g,
+                &proposal("tcp_scan", "127.0.0.1", "a1"),
+                &tool_result(ToolExecutionStatus::Succeeded, 2),
+            )
             .await
             .unwrap();
         assert!(useful.useful);
         assert!(!useful.retry);
 
         let empty = reflector
-            .reflect(&g, &proposal("tcp_scan", "127.0.0.1", "a1"), &tool_result(ToolExecutionStatus::Succeeded, 0))
+            .reflect(
+                &g,
+                &proposal("tcp_scan", "127.0.0.1", "a1"),
+                &tool_result(ToolExecutionStatus::Succeeded, 0),
+            )
             .await
             .unwrap();
         assert!(!empty.useful);
         assert!(empty.retry);
 
         let failed = reflector
-            .reflect(&g, &proposal("tcp_scan", "127.0.0.1", "a1"), &tool_result(ToolExecutionStatus::Failed, 0))
+            .reflect(
+                &g,
+                &proposal("tcp_scan", "127.0.0.1", "a1"),
+                &tool_result(ToolExecutionStatus::Failed, 0),
+            )
             .await
             .unwrap();
         assert!(failed.reason_codes.contains(&"TOOL_FAILED".to_string()));
@@ -800,19 +898,43 @@ mod tests {
         };
         // Attempts remaining → L1 retry with bumped attempt.
         let g = graph(
-            vec![node("a1", PlanNodeType::Action, PlanNodeStatus::Pending, 1, None, Some("tcp_scan"), Some("127.0.0.1"), 0, 2)],
+            vec![node(
+                "a1",
+                PlanNodeType::Action,
+                PlanNodeStatus::Pending,
+                1,
+                None,
+                Some("tcp_scan"),
+                Some("127.0.0.1"),
+                0,
+                2,
+            )],
             vec![],
         );
         let meta = kairos_platform_pent_core::cognition::evaluate_meta_state(
-            "run", "plan", 1,
+            "run",
+            "plan",
+            1,
             MetaMetrics {
-                plan_confidence: 1.0, observation_confidence: 1.0, evidence_coverage: 0.0,
-                recent_information_gain: 0.0, loop_similarity: 0.0, failure_streak: 0,
-                budget_pressure: 0.0, scope_risk: 0.0, model_disagreement: 0.0,
+                plan_confidence: 1.0,
+                observation_confidence: 1.0,
+                evidence_coverage: 0.0,
+                recent_information_gain: 0.0,
+                loop_similarity: 0.0,
+                failure_streak: 0,
+                budget_pressure: 0.0,
+                scope_risk: 0.0,
+                model_disagreement: 0.0,
             },
         );
         let delta = replanner
-            .replan(&g, &proposal("tcp_scan", "127.0.0.1", "a1"), &tool_result(ToolExecutionStatus::Failed, 0), &reflection, &meta)
+            .replan(
+                &g,
+                &proposal("tcp_scan", "127.0.0.1", "a1"),
+                &tool_result(ToolExecutionStatus::Failed, 0),
+                &reflection,
+                &meta,
+            )
             .await
             .unwrap()
             .expect("retry delta");
@@ -824,21 +946,46 @@ mod tests {
 
         // Attempts exhausted → L2: node failed + alternative action added.
         let g2 = graph(
-            vec![node("a1", PlanNodeType::Action, PlanNodeStatus::Pending, 1, Some("s1"), Some("tcp_scan"), Some("127.0.0.1"), 1, 2)],
+            vec![node(
+                "a1",
+                PlanNodeType::Action,
+                PlanNodeStatus::Pending,
+                1,
+                Some("s1"),
+                Some("tcp_scan"),
+                Some("127.0.0.1"),
+                1,
+                2,
+            )],
             vec![],
         );
         let delta2 = replanner
-            .replan(&g2, &proposal("tcp_scan", "127.0.0.1", "a1"), &tool_result(ToolExecutionStatus::Failed, 0), &reflection, &meta)
+            .replan(
+                &g2,
+                &proposal("tcp_scan", "127.0.0.1", "a1"),
+                &tool_result(ToolExecutionStatus::Failed, 0),
+                &reflection,
+                &meta,
+            )
             .await
             .unwrap()
             .expect("fallback delta");
         assert_eq!(delta2.replan_level, ReplanLevel::Tool);
         let next2 = kairos_platform_pent_core::cognition::apply_plan_delta(&g2, &delta2).unwrap();
         assert_eq!(
-            next2.nodes.iter().find(|n| n.node_id == "a1").unwrap().status,
+            next2
+                .nodes
+                .iter()
+                .find(|n| n.node_id == "a1")
+                .unwrap()
+                .status,
             PlanNodeStatus::Failed
         );
-        let alt = next2.nodes.iter().find(|n| n.node_id == "a1-alt").expect("alt node");
+        let alt = next2
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "a1-alt")
+            .expect("alt node");
         assert_eq!(alt.capability.as_deref(), Some("http_probe"));
         assert_eq!(alt.status, PlanNodeStatus::Pending);
     }

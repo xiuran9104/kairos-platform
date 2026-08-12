@@ -16,26 +16,30 @@ impl OpenStackAdapter {
     }
 
     async fn keystone_token(&self, creds: &CloudCredentials) -> Result<String, String> {
-        let body = serde_json::json!({
-            "auth": {
-                "identity": {
-                    "methods": ["password"],
-                    "password": {
-                        "user": {
-                            "name": creds.username.clone().unwrap_or_default(),
-                            "domain": { "name": creds.domain.clone().unwrap_or_else(|| "Default".into()) },
-                            "password": creds.password.clone().unwrap_or_default()
+        let body = if creds.password.is_none() {
+            serde_json::json!({"auth":{"identity":{"methods":["application_credential"],"application_credential":{"id":creds.access_key.clone().unwrap_or_default(),"secret":creds.secret_key.clone().unwrap_or_default()}}}})
+        } else {
+            serde_json::json!({
+                "auth": {
+                    "identity": {
+                        "methods": ["password"],
+                        "password": {
+                            "user": {
+                                "name": creds.username.clone().unwrap_or_default(),
+                                "domain": { "name": creds.domain.clone().unwrap_or_else(|| "Default".into()) },
+                                "password": creds.password.clone().unwrap_or_default()
+                            }
+                        }
+                    },
+                    "scope": {
+                        "project": {
+                            "name": creds.project_name.clone().unwrap_or_else(|| "admin".into()),
+                            "domain": { "name": creds.domain.clone().unwrap_or_else(|| "Default".into()) }
                         }
                     }
-                },
-                "scope": {
-                    "project": {
-                        "name": creds.project_name.clone().unwrap_or_else(|| "admin".into()),
-                        "domain": { "name": creds.domain.clone().unwrap_or_else(|| "Default".into()) }
-                    }
                 }
-            }
-        });
+            })
+        };
         let client = reqwest::Client::new();
         let resp = client
             .post(format!(

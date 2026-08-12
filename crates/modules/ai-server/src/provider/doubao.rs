@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_toonflow_payload_to_seedance_content() {
+    fn converts_video_payload_to_seedance_content() {
         let body = DouBaoMediaProvider::video_body(&config(), json!({"prompt":"镜头推进","references":["https://example.com/first.png"],"aspect_ratio":"16:9","audio":true})).unwrap();
         assert_eq!(body["model"], "doubao-seedance-2-0-260128");
         assert_eq!(body["content"][1]["role"], "first_frame");

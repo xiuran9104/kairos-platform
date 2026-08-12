@@ -3,13 +3,23 @@ import { fetchEventSource } from '@vben/request';
 import { useAccessStore } from '@vben/stores';
 import { useAppConfig } from '@vben/hooks';
 
-export * from './assets';
 export * from './guard';
 export * from './rmos';
 export * from './settings';
+export * from './hitl';
+export * from './agent-settings';
 export * from './traffic';
 export * from './tools';
 export * from './workspace';
+export * from './capability-mcp';
+export * from './capability-skills';
+export * from './ops-assets';
+export * from './ops-facts';
+export * from './ops-workflows';
+export * from './ops-files';
+export * from './ops-infocollect';
+export * from './capability-knowledge';
+export * from './capability-agents';
 
 export interface PentAgentSession {
   id: string;
@@ -51,6 +61,9 @@ export interface CreatePentSessionInput {
 
 export function getPentProjects() { return requestClient.get('/pent/projects'); }
 export function createPentProject(data: any) { return requestClient.post('/pent/projects', data); }
+export function updatePentProject(id: string, data: any) { return requestClient.put(`/pent/projects/${id}`, data); }
+export function deletePentProject(id: string) { return requestClient.delete(`/pent/projects/${id}`); }
+export function updatePentProjectModel(id: string, modelConfigId: number) { return requestClient.put(`/pent/projects/${id}/model`, { model_config_id: modelConfigId }); }
 export function getPentTasks() { return requestClient.get('/pent/tasks'); }
 export function createPentTask(data: any) { return requestClient.post('/pent/tasks', data); }
 export function cancelPentTask(id: string) { return requestClient.post(`/pent/tasks/${id}/cancel`); }
@@ -58,7 +71,12 @@ export function deletePentTask(id: string) { return requestClient.delete(`/pent/
 export function getPentRuns() { return requestClient.get('/pent/runs'); }
 export function createPentRun(data: any) { return requestClient.post('/pent/runs', data); }
 export function cancelPentRun(id: string) { return requestClient.post(`/pent/runs/${id}/cancel`); }
+export function pausePentRun(id: string) { return requestClient.post(`/pent/runs/${id}/pause`); }
+export function resumePentRun(id: string) { return requestClient.post(`/pent/runs/${id}/resume`); }
+export function deletePentRun(id: string) { return requestClient.delete(`/pent/runs/${id}`); }
 export function getPentRunEvents(runId: string) { return requestClient.get(`/pent/runs/${runId}/events`); }
+export function getPentRunToolCalls(runId: string) { return requestClient.get(`/pent/runs/${runId}/tool-calls`); }
+export function getPentRunPlan(runId: string) { return requestClient.get(`/pent/runs/${runId}/plan`); }
 
 /** Stream run events via SSE with proper Authorization header (no token in URL). */
 export function streamPentRunEvents(
@@ -84,8 +102,8 @@ export function streamPentRunEvents(
 
 export function getPentRunEvidence(runId: string) { return requestClient.get(`/pent/runs/${runId}/evidence`); }
 export function getPentRunFindings(runId: string) { return requestClient.get(`/pent/runs/${runId}/findings`); }
-export function getPentApprovals() { return requestClient.get('/pent/approvals'); }
-export function decidePentApproval(id: string, data: any) { return requestClient.post(`/pent/approvals/${id}/decision`, data); }
+export function getPentProjectFindings(projectId: string) { return requestClient.get(`/pent/projects/${projectId}/findings`); }
+export function getPentProjectTraffic(projectId: string, params?: Record<string, any>) { return requestClient.get(`/pent/projects/${projectId}/traffic`, { params }); }
 export function getPentTools() { return requestClient.get('/pent/tools'); }
 
 // Skill management
@@ -161,4 +179,7 @@ export function sendPentRunInstruction(
   },
 ) {
   return requestClient.post(`/pent/runs/${runId}/instructions`, data);
+}
+export function updatePentSessionModel(id: string, modelId: number) {
+  return requestClient.put(`/pent/sessions/${id}/model`, { model_id: modelId });
 }

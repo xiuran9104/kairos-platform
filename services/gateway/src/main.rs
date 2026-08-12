@@ -41,8 +41,11 @@ async fn main() -> anyhow::Result<()> {
         &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
     )
     .await;
+    let mcp_registry = kairos_platform_pent_server::tooling::mcp::registry::shared().await;
+    load_db_mcp_servers(&database, &mcp_registry).await;
     let pent_state = kairos_platform_pent_server::PentState::new(database.clone())
-        .with_nats(nats_bus.handle());
+        .with_nats(nats_bus.handle())
+        .with_mcp(mcp_registry);
     match kairos_platform_pent_server::infrastructure::recipe::load_from_db(&database).await {
         Ok(count) => tracing::info!(count, "tool recipes loaded from pent_tool_definitions"),
         Err(error) => warn!(%error, "tool recipe load failed; falling back to hardcoded registry"),
@@ -101,6 +104,39 @@ async fn connect_redis() -> Option<RedisClient> {
     }
 }
 
+/// Start MCP servers that were configured through the capability center UI
+/// and persisted in `pent_mcp_servers` (stdio transport only).
+async fn load_db_mcp_servers(
+    pool: &kairos_platform_framework_database::PgPool,
+    registry: &kairos_platform_pent_server::tooling::mcp::registry::McpRegistry,
+) {
+    use kairos_platform_pent_server::tooling::mcp::protocol::McpServerConfig;
+    let rows = sqlx::query_as::<_, (String, String, serde_json::Value, serde_json::Value)>(
+        "SELECT name, command, args, env FROM pent_mcp_servers WHERE enabled AND transport='stdio'",
+    )
+    .fetch_all(pool)
+    .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "failed to load configured MCP servers");
+            return;
+        }
+    };
+    for (name, command, args, env) in rows {
+        let config = McpServerConfig {
+            id: name,
+            command,
+            args: serde_json::from_value(args).unwrap_or_default(),
+            env: serde_json::from_value(env).unwrap_or_default(),
+            auto_start: true,
+        };
+        if let Err(error) = registry.add_server(config).await {
+            warn!(%error, "failed to start configured MCP server");
+        }
+    }
+}
+
 /// Recover any conversation turns orphaned by a previous shutdown.
 async fn recover_orphaned_turns(pool: &kairos_platform_framework_database::PgPool) {
     let result = sqlx::query(
@@ -110,7 +146,10 @@ async fn recover_orphaned_turns(pool: &kairos_platform_framework_database::PgPoo
     .await;
     match result {
         Ok(r) if r.rows_affected() > 0 => {
-            tracing::info!(count = r.rows_affected(), "recovered orphaned conversation turns");
+            tracing::info!(
+                count = r.rows_affected(),
+                "recovered orphaned conversation turns"
+            );
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "failed to recover orphaned turns"),

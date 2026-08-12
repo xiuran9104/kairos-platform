@@ -4,19 +4,28 @@ pub mod config;
 pub mod conversation;
 pub mod infrastructure;
 pub(crate) mod report;
+mod agents;
+mod assets;
+mod facts;
+mod files;
+mod infocollect;
+mod knowledge_logs;
+mod mcp_servers;
+mod monitor;
 mod runtime_policy;
 mod security;
 mod session;
 mod skills;
 pub mod tooling;
 pub mod transport;
+mod workflows;
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     middleware::from_fn,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_framework_security::CurrentUser;
@@ -31,6 +40,7 @@ pub struct PentState {
     pub pool: PgPool,
     conversation_tasks: conversation::turn_tasks::TurnTaskRegistry,
     pub nats: Option<crate::transport::mq::NatsHandle>,
+    pub mcp_registry: Option<std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>>,
 }
 
 impl PentState {
@@ -39,6 +49,7 @@ impl PentState {
             pool,
             conversation_tasks: Default::default(),
             nats: None,
+            mcp_registry: None,
         }
     }
 
@@ -46,34 +57,42 @@ impl PentState {
         self.nats = Some(nats);
         self
     }
+
+    pub fn with_mcp(mut self, mcp: std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>) -> Self {
+        self.mcp_registry = Some(mcp);
+        self
+    }
 }
 
 pub fn routes(state: PentState) -> Router {
     let protected = Router::new()
         .route("/pent/projects", get(list_projects).post(create_project))
-        .route("/pent/projects/{id}", get(get_project))
+        .route(
+            "/pent/projects/{id}",
+            get(get_project).put(update_project).delete(delete_project),
+        )
+        .route("/pent/projects/{id}/model", put(update_project_model))
         .route("/pent/tasks", get(list_tasks).post(create_task))
         .route("/pent/tasks/{id}", get(get_task).delete(delete_task))
         .route("/pent/tasks/{id}/cancel", post(cancel_task))
         .route("/pent/runs", get(list_runs).post(create_run))
-        .route("/pent/runs/{id}", get(get_run))
+        .route("/pent/runs/{id}", get(get_run).delete(delete_run))
         .route("/pent/runs/{id}/cancel", post(cancel_run))
+        .route("/pent/runs/{id}/pause", post(pause_run))
+        .route("/pent/runs/{id}/resume", post(resume_run))
         .route("/pent/runs/{id}/events", get(get_run_events))
         .route("/pent/runs/{id}/tool-calls", get(get_tool_calls))
-        .route("/pent/approvals", get(list_approvals))
-        .route("/pent/approvals/{id}/decision", post(decide_approval))
+        .route("/pent/runs/{id}/plan", get(get_run_plan))
         // /pent/chat removed — was a demo stub with keyword-fixed replies
         .merge(tooling::http::routes())
+        .route("/pent/nodes", get(list_nodes))
         .route("/pent/metrics", get(metrics))
         .route("/pent/tools/overview", get(tools_overview))
         .route("/pent/traffic", get(traffic_list))
         .route("/pent/rmos/memories", get(rmos_memories))
         .route("/pent/rmos/memories/{id}/feedback", post(rmos_feedback))
+        .route("/pent/rmos/global-search", get(rmos_global_search))
         .route("/pent/rmos/attack-graph", get(attack_graph))
-        .route(
-            "/pent/settings/model-role-bindings",
-            get(get_model_bindings).put(update_model_bindings),
-        )
         .route(
             "/pent/settings/runtime-policy",
             get(get_runtime_policy).put(update_runtime_policy),
@@ -85,11 +104,25 @@ pub fn routes(state: PentState) -> Router {
         .route("/pent/runs/{id}/traffic", get(get_run_traffic))
         .route("/pent/evidence/{id}", get(get_evidence))
         .route("/pent/findings/{id}", get(get_finding).post(review_finding))
+        .route("/pent/projects/{id}/findings", get(get_project_findings))
+        .route("/api/projects/{id}/vulnerabilities", get(get_project_findings))
+        .route("/pent/projects/{id}/traffic", get(get_project_traffic))
         .route("/pent/traffic/{id}", get(get_traffic))
         .route("/pent/artifacts/{id}/download", get(download_artifact))
         .merge(session::routes())
         .merge(conversation::http::routes())
+        .merge(conversation::agent_http::routes())
+        .merge(conversation::hitl_http::routes())
         .merge(skills::routes())
+        .merge(monitor::routes())
+        .merge(infocollect::routes())
+        .merge(mcp_servers::routes())
+        .merge(knowledge_logs::routes())
+        .merge(agents::routes())
+        .merge(workflows::routes())
+        .merge(files::routes())
+        .merge(assets::routes())
+        .merge(facts::routes())
         .route_layer(from_fn(security::authorize_request));
 
     Router::new()
@@ -159,7 +192,16 @@ async fn list_projects(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let rows = sqlx::query_scalar::<_, Value>("SELECT to_jsonb(t) FROM pent_projects t WHERE tenant_id=$1 AND ($2 OR created_by=$3) AND deleted=0 ORDER BY created_at DESC LIMIT 100")
+    let rows = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(t) || jsonb_build_object(
+             'model_config_id', (
+                 SELECT model_config_id FROM pent_model_role_bindings
+                 WHERE project_id=t.id AND model_role='conversation' AND enabled=true LIMIT 1
+             )
+         )
+         FROM pent_projects t
+         WHERE t.tenant_id=$1 AND ($2 OR t.created_by=$3) AND t.deleted=0
+         ORDER BY t.created_at DESC LIMIT 100")
         .bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
         .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
@@ -171,7 +213,14 @@ async fn get_project(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let v = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_projects t
+        "SELECT to_jsonb(t) || jsonb_build_object(
+             'model_config_id', (
+                 SELECT model_config_id FROM pent_model_role_bindings
+                 WHERE project_id=t.id AND model_role='conversation' AND enabled=true
+                 LIMIT 1
+             )
+         )
+         FROM pent_projects t
          WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0",
     )
     .bind(&id)
@@ -202,13 +251,111 @@ async fn create_project(
     )))
 }
 
+async fn update_project_model(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let model_config_id = body["model_config_id"].as_i64().filter(|&v| v > 0)
+        .ok_or_else(|| AppError::bad_request("请选择有效的模型"))?;
+    sqlx::query(
+        "INSERT INTO pent_model_role_bindings(tenant_id,project_id,model_role,model_config_id,temperature,max_output_tokens,timeout_seconds,enabled,revision,updated_at)
+         VALUES($1,$2,'conversation',$3,0.7,4096,120,true,1,now())
+         ON CONFLICT(tenant_id,project_id,model_role) DO UPDATE SET
+         model_config_id=EXCLUDED.model_config_id,revision=pent_model_role_bindings.revision+1,updated_at=now()",
+    )
+    .bind(tenant_id).bind(&id).bind(model_config_id)
+    .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(json!({"message":"项目模型已更新"}))))
+}
+
+async fn update_project(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let name = body["name"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::bad_request("项目名称不能为空"))?;
+    let description = body.get("description").and_then(Value::as_str);
+    let asset_scope = body
+        .get("asset_scope")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    if !asset_scope.is_array() {
+        return Err(AppError::bad_request("资产范围必须是数组"));
+    }
+    let affected = sqlx::query(
+        "UPDATE pent_projects
+         SET name=$2, description=$3, asset_scope=$4, updated_at=now()
+         WHERE id=$1 AND tenant_id=$5 AND ($6 OR created_by=$7) AND deleted=0",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(description)
+    .bind(&asset_scope)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::not_found("项目不存在"));
+    }
+    get_project(State(s), Path(id), user).await
+}
+
+async fn delete_project(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let affected = sqlx::query(
+        "UPDATE pent_projects SET deleted=1, updated_at=now()
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::not_found("项目不存在或已删除"));
+    }
+    Ok(Json(ApiResponse::new(json!({"deleted": id}))))
+}
+
 async fn list_tasks(
     State(s): State<PentState>,
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_tasks t WHERE tenant_id=$1 AND ($2 OR created_by=$3) AND deleted=0 ORDER BY created_at DESC LIMIT 100",
+        "SELECT to_jsonb(t) || jsonb_build_object(
+             'status', COALESCE(
+                 (SELECT r.status FROM pent_runs r
+                  WHERE r.task_id=t.id
+                  ORDER BY r.created_at DESC LIMIT 1),
+                 CASE WHEN t.status='running' THEN 'cancelled' ELSE t.status END
+             ),
+             'latest_run_id',
+             (SELECT r.id FROM pent_runs r
+              WHERE r.task_id=t.id ORDER BY r.created_at DESC LIMIT 1)
+         )
+         FROM pent_tasks t
+         WHERE tenant_id=$1 AND ($2 OR created_by=$3) AND deleted=0
+         ORDER BY created_at DESC LIMIT 100",
     )
     .bind(tenant_id)
     .bind(security::tenant_wide(&user))
@@ -244,21 +391,23 @@ async fn create_task(
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    if body.get("authorization_confirmed").and_then(Value::as_bool) != Some(true) {
-        return Err(AppError::bad_request("必须明确确认已获得目标测试授权"));
-    }
     let id = Uuid::new_v4().to_string();
     let name = body["name"].as_str().unwrap_or("untitled");
     let desc = body.get("description").and_then(|v| v.as_str());
-    let target = normalize_confirmed_scope(
-        body.get("target_scope").cloned().unwrap_or_default(),
-        &user.user_id,
-    )?;
     let priority = body["priority"].as_str().unwrap_or("medium");
-    let pid = body["project_id"].as_str();
-    if let Some(project_id) = pid {
-        ensure_project_access(&s.pool, project_id, &user).await?;
-    }
+    let pid = body["project_id"]
+        .as_str()
+        .ok_or_else(|| AppError::bad_request("请选择所属项目"))?;
+    ensure_project_access(&s.pool, pid, &user).await?;
+    let project_scope = sqlx::query_scalar::<_, Value>(
+        "SELECT asset_scope FROM pent_projects WHERE id=$1 AND tenant_id=$2 AND deleted=0",
+    )
+    .bind(pid)
+    .bind(tenant_id)
+    .fetch_one(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    let target = normalize_confirmed_scope(project_scope, &user.user_id)?;
     sqlx::query("INSERT INTO pent_tasks(id,tenant_id,name,description,target_scope,priority,project_id,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
         .bind(&id).bind(tenant_id).bind(name).bind(desc).bind(&target).bind(priority).bind(pid).bind(&user.user_id)
         .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
@@ -357,6 +506,19 @@ async fn get_run(
     .ok_or_else(|| AppError::not_found("not found"))?;
     Ok(Json(ApiResponse::new(v)))
 }
+async fn get_run_plan(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    security::ensure_run_access(&s.pool, &id, &user).await?;
+    let plan = sqlx::query_scalar::<_, Value>(
+        "SELECT graph FROM pent_plan_versions WHERE run_id=$1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(&id).fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
+    .unwrap_or_else(|| json!({"run_id":id,"version":0,"nodes":[]}));
+    Ok(Json(ApiResponse::new(plan)))
+}
 async fn create_run(
     State(s): State<PentState>,
     user: CurrentUser,
@@ -403,7 +565,8 @@ async fn create_run(
     }
     // NATS: notify workers that a new run is available
     if let Some(ref nats) = s.nats {
-        let payload = serde_json::to_vec(&json!({"run_id": id, "task_id": task_id})).unwrap_or_default();
+        let payload =
+            serde_json::to_vec(&json!({"run_id": id, "task_id": task_id})).unwrap_or_default();
         nats.publish("penta.run.requested", &payload).await;
     }
     Ok(Json(ApiResponse::new(
@@ -418,12 +581,12 @@ async fn cancel_run(
     let tenant_id = security::tenant_id(&user)?;
     let affected = sqlx::query(
         "UPDATE pent_runs
-         SET cancel_requested_at=now(),
-             status=CASE WHEN status='running' THEN 'cancelling' ELSE 'cancelled' END,
-             completed_at=CASE WHEN status='running' THEN completed_at ELSE now() END,
+         SET cancel_requested_at=COALESCE(cancel_requested_at,now()),
+             status='cancelled',
+             completed_at=COALESCE(completed_at,now()),
              updated_at=now()
          WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4)
-           AND status IN ('queued','running','waiting_approval')",
+           AND status IN ('queued','running','cancelling','waiting_approval')",
     )
     .bind(&id)
     .bind(tenant_id)
@@ -437,6 +600,23 @@ async fn cancel_run(
         return Err(AppError::bad_request("Run 不存在或当前状态不能取消"));
     }
     sqlx::query(
+        "UPDATE pent_tasks t SET status='cancelled',updated_at=now()
+         FROM pent_runs r WHERE r.id=$1 AND t.id=r.task_id",
+    )
+    .bind(&id)
+    .execute(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    sqlx::query(
+        "UPDATE pent_agent_sessions
+         SET active_run_id=NULL,updated_at=now()
+         WHERE active_run_id=$1",
+    )
+    .bind(&id)
+    .execute(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    sqlx::query(
         "UPDATE pent_approvals SET status='cancelled',updated_at=now()
          WHERE run_id=$1 AND status='pending'",
     )
@@ -445,6 +625,140 @@ async fn cancel_run(
     .await
     .map_err(|error| AppError::internal(error.to_string()))?;
     Ok(Json(ApiResponse::new(json!({"message":"Run 已取消"}))))
+}
+
+async fn pause_run(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let affected = sqlx::query(
+        "UPDATE pent_runs SET status='paused',cancel_requested_at=now(),worker_id=NULL,
+                lease_expires_at=NULL,updated_at=now()
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4)
+           AND status IN ('queued','running','waiting_approval')",
+    )
+    .bind(&id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
+    .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.rows_affected();
+    if affected == 0 { return Err(AppError::bad_request("Run 不存在或当前状态不能暂停")); }
+    append_run_event(&s.pool, &id, "run.interrupted", json!({"mode":"pause","requested_by":user.user_id})).await.map_err(AppError::internal)?;
+    Ok(Json(ApiResponse::new(json!({"message":"Run 已暂停；检查点和 Evidence 已保留"}))))
+}
+
+async fn resume_run(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let affected = sqlx::query(
+        "UPDATE pent_runs SET status='queued',cancel_requested_at=NULL,completed_at=NULL,
+                failure_code=NULL,failure_message=NULL,next_attempt_at=now(),updated_at=now()
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4) AND status='paused'",
+    )
+    .bind(&id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
+    .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.rows_affected();
+    if affected == 0 { return Err(AppError::bad_request("Run 不存在或当前状态不能恢复")); }
+    sqlx::query("UPDATE pent_agent_sessions SET status='running',active_run_id=$1,updated_at=now() WHERE id=(SELECT session_id FROM pent_runs WHERE id=$1)")
+        .bind(&id).execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    append_run_event(&s.pool, &id, "run.resumed", json!({"source":"checkpoint","requested_by":user.user_id})).await.map_err(AppError::internal)?;
+    if let Some(ref nats) = s.nats {
+        let payload = serde_json::to_vec(&json!({"run_id":id,"resume":true})).unwrap_or_default();
+        nats.publish("penta.run.requested", &payload).await;
+    }
+    Ok(Json(ApiResponse::new(json!({"message":"Run 已从检查点重新入队"}))))
+}
+
+async fn delete_run(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let mut tx = s
+        .pool
+        .begin()
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let (status, task_id) = sqlx::query_as::<_, (String, String)>(
+        "SELECT status,task_id FROM pent_runs
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4)
+         FOR UPDATE",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .ok_or_else(|| AppError::not_found("Run 不存在"))?;
+
+    if !matches!(
+        status.as_str(),
+        "completed" | "failed" | "cancelled" | "cancelling"
+    ) {
+        return Err(AppError::bad_request(
+            "只能删除已完成、失败、已取消或正在取消的 Run",
+        ));
+    }
+
+    sqlx::query("UPDATE pent_agent_sessions SET active_run_id=NULL,updated_at=now() WHERE active_run_id=$1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+
+    for table in [
+        "pent_approvals",
+        "pent_artifacts",
+        "pent_context_snapshots",
+        "pent_conversation_turns",
+        "pent_evidence",
+        "pent_findings",
+        "pent_http_traffic",
+        "pent_metacognitive_snapshots",
+        "pent_model_calls",
+        "pent_plan_deltas",
+        "pent_plan_versions",
+        "pent_pre_reflections",
+        "pent_reflections",
+        "pent_run_events",
+        "pent_run_instructions",
+        "pent_subtasks",
+        "pent_tool_calls",
+        "pent_tool_feedback",
+        "pent_tool_route_decisions",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE run_id=$1"))
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+    }
+
+    sqlx::query("DELETE FROM pent_runs WHERE id=$1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    sqlx::query(
+        "UPDATE pent_tasks SET status=COALESCE(
+             (SELECT status FROM pent_runs WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1),
+             'cancelled'
+         ),updated_at=now()
+         WHERE id=$1",
+    )
+    .bind(&task_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+
+    Ok(Json(ApiResponse::new(json!({"message":"Run 已删除"}))))
 }
 async fn get_run_events(
     State(s): State<PentState>,
@@ -484,122 +798,60 @@ async fn get_tool_calls(
     .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
 }
-async fn list_approvals(
-    State(s): State<PentState>,
-    user: CurrentUser,
-) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    let tenant_id = security::tenant_id(&user)?;
-    let rows = sqlx::query_scalar::<_, Value>("SELECT to_jsonb(a) FROM pent_approvals a JOIN pent_runs r ON r.id=a.run_id WHERE r.tenant_id=$1 AND ($2 OR r.user_id=$3) AND a.status='pending' AND a.expires_at>now() ORDER BY a.created_at DESC LIMIT 50")
-        .bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-        .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(ApiResponse::new(rows)))
-}
-async fn decide_approval(
-    State(s): State<PentState>,
-    Path(id): Path<String>,
-    user: CurrentUser,
-    Json(body): Json<Value>,
-) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let tenant_id = security::tenant_id(&user)?;
-    let decision = body["decision"].as_str().unwrap_or("denied");
-    let status = if decision == "approved" {
-        "approved"
-    } else {
-        "denied"
-    };
-    let mut tx = s
-        .pool
-        .begin()
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    let run_id = sqlx::query_scalar::<_, String>(
-        "UPDATE pent_approvals a
-         SET status=$2,decision=$3,decided_by=$4,updated_at=now()
-         FROM pent_runs r
-         WHERE a.id=$1 AND r.id=a.run_id AND r.tenant_id=$5
-           AND ($6 OR r.user_id=$4)
-           AND a.status='pending' AND a.expires_at>now()
-         RETURNING a.run_id",
-    )
-    .bind(&id)
-    .bind(status)
-    .bind(decision)
-    .bind(&user.user_id)
-    .bind(tenant_id)
-    .bind(security::tenant_wide(&user))
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    .ok_or_else(|| AppError::bad_request("审批不存在、已处理或已过期"))?;
-    if status == "approved" {
-        sqlx::query(
-            "UPDATE pent_tool_calls
-             SET permission_decision='approved'
-             WHERE id=(SELECT tool_call_id FROM pent_approvals WHERE id=$1)",
-        )
-        .bind(&id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-        sqlx::query(
-            "UPDATE pent_runs
-             SET status='queued',
-                 execution_cursor=execution_cursor || jsonb_build_object(
-                     'state','approved','approved_at',now()
-                 ),
-                 updated_at=now()
-             WHERE id=$1 AND tenant_id=$2 AND status='waiting_approval'",
-        )
-        .bind(&run_id)
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    } else {
-        sqlx::query(
-            "UPDATE pent_tool_calls
-             SET permission_decision='denied'
-             WHERE id=(SELECT tool_call_id FROM pent_approvals WHERE id=$1)",
-        )
-        .bind(&id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-        sqlx::query(
-            "UPDATE pent_runs
-             SET status='blocked',failure_code='approval_denied',
-                 failure_message='中高风险验证审批被拒绝',
-                 execution_cursor=execution_cursor || jsonb_build_object(
-                     'state','denied','denied_at',now()
-                 ),
-                 completed_at=now(),updated_at=now()
-             WHERE id=$1 AND tenant_id=$2 AND status='waiting_approval'",
-        )
-        .bind(&run_id)
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    }
-    tx.commit()
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(ApiResponse::new(json!({"message":"审批完成"}))))
-}
-async fn list_tools(State(s): State<PentState>) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_tool_definitions t WHERE lifecycle_status='active' ORDER BY namespace, name LIMIT 100"
-    ).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(ApiResponse::new(rows)))
-}
 
 // ── Worker executor with AI agent and lease renewal ─────────────────────
 
 /// Background worker: picks up queued runs, calls AI for analysis, manages lease.
+// ── Host tool auto-install ──────────────────────────────────────────────
+
+async fn ensure_host_tools() {
+    use crate::infrastructure::tool_lifecycle;
+
+    let tools = tool_lifecycle::all_host_tools();
+    let mut healthy = 0usize;
+    let mut installed = 0usize;
+    let mut failed = Vec::new();
+
+    for lifecycle in &tools {
+        if lifecycle.is_installed().await {
+            healthy += 1;
+            continue;
+        }
+        tracing::warn!(
+            tool = lifecycle.tool_name,
+            path = lifecycle.binary_path,
+            "host tool missing; attempting install"
+        );
+        match lifecycle.install().await {
+            Ok(()) => {
+                tracing::info!(tool = lifecycle.tool_name, "installed successfully");
+                installed += 1;
+            }
+            Err(error) => {
+                tracing::error!(
+                    tool = lifecycle.tool_name,
+                    error = %error,
+                    "install failed; tool will not be available"
+                );
+                failed.push(lifecycle.tool_name);
+            }
+        }
+    }
+
+    tracing::info!(
+        healthy,
+        installed,
+        failed = ?failed,
+        total = tools.len(),
+        "host tool startup check complete"
+    );
+}
+
 pub async fn start_worker(pool: PgPool, worker_id: String, lease_ttl: i64) {
     if let Err(error) = register_worker(&pool, &worker_id).await {
         tracing::warn!(worker=%worker_id, error=%error, "worker registration failed");
     }
+    tokio::spawn(ensure_host_tools());
     let maintenance_pool = pool.clone();
     tokio::spawn(async move {
         loop {
@@ -630,16 +882,23 @@ pub async fn start_worker(pool: PgPool, worker_id: String, lease_ttl: i64) {
 }
 
 async fn register_worker(pool: &PgPool, worker_id: &str) -> Result<(), String> {
+    let capacity: i32 = std::env::var("PENTA_WORKER_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 100);
     sqlx::query(
         "INSERT INTO pent_workers(worker_id,capacity,status,last_heartbeat,registered_at)
-         VALUES($1,1,'active',now(),now())
+         VALUES($1,$2,'active',now(),now())
          ON CONFLICT(worker_id) DO UPDATE SET
-             capacity=excluded.capacity,status='active',last_heartbeat=now()",
+             capacity=EXCLUDED.capacity,status='active',last_heartbeat=now()",
     )
     .bind(worker_id)
+    .bind(capacity)
     .execute(pool)
     .await
     .map_err(|error| error.to_string())?;
+    tracing::info!(worker_id, capacity, "worker registered");
     Ok(())
 }
 
@@ -726,9 +985,35 @@ async fn recovery_scanner(pool: &PgPool) -> Result<(), String> {
     Ok(())
 }
 
+// ── M2-F12: Distributed scan nodes ────────────────────────────────────
+
+async fn list_nodes(
+    State(s): State<PentState>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    let rows = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'worker_id', worker_id,
+             'status', status,
+             'capacity', capacity,
+             'last_heartbeat', last_heartbeat,
+             'registered_at', registered_at
+         ) FROM pent_workers ORDER BY registered_at DESC",
+    )
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    let _ = &user;
+    Ok(Json(ApiResponse::new(rows)))
+}
+
 // ── Metrics ─────────────────────────────────────────────────────────────
 
-async fn metrics(State(s): State<PentState>, user: CurrentUser) -> Result<Json<Value>, AppError> {
+async fn metrics(
+    State(s): State<PentState>,
+    user: CurrentUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let tenant_wide = security::tenant_wide(&user);
     async fn cnt(
@@ -822,22 +1107,63 @@ async fn metrics(State(s): State<PentState>, user: CurrentUser) -> Result<Json<V
     let findings = findings.unwrap_or(0);
     let tools = tools.unwrap_or(0);
     let calls = tool_calls.unwrap_or(0);
-    Ok(Json(json!({
-        "runs": {"queued":queued,"running":running,"completed":completed,"failed":failed,"cancelled":cancelled},
-        "approvals_pending": waiting,
-        "sessions": sessions.unwrap_or(0),
-        "findings": findings,
-        "tools": tools,
-        "tool_calls": calls,
-        "worker_count": 1,
-        "success_rate": if completed + failed > 0 { format!("{:.0}%", completed as f64 / (completed + failed) as f64 * 100.0) } else { "N/A".to_string() }
-    })))
+    let is_prometheus = params.get("format").map(|v| v.as_str()) == Some("prometheus");
+    if is_prometheus {
+        let mut out = String::new();
+        out.push_str(&format!("# HELP pent_runs_total Run count by status\n"));
+        out.push_str(&format!("# TYPE pent_runs_total gauge\n"));
+        out.push_str(&format!("pent_runs_total{{status=\"queued\"}} {}\n", queued));
+        out.push_str(&format!("pent_runs_total{{status=\"running\"}} {}\n", running));
+        out.push_str(&format!("pent_runs_total{{status=\"completed\"}} {}\n", completed));
+        out.push_str(&format!("pent_runs_total{{status=\"failed\"}} {}\n", failed));
+        out.push_str(&format!("pent_runs_total{{status=\"cancelled\"}} {}\n", cancelled));
+        out.push_str(&format!("# HELP pent_approvals_pending Pending approval count\n"));
+        out.push_str(&format!("# TYPE pent_approvals_pending gauge\n"));
+        out.push_str(&format!("pent_approvals_pending {}\n", waiting));
+        out.push_str(&format!("# HELP pent_sessions_total Active agent sessions\n"));
+        out.push_str(&format!("# TYPE pent_sessions_total gauge\n"));
+        out.push_str(&format!("pent_sessions_total {}\n", sessions.unwrap_or(0)));
+        out.push_str(&format!("# HELP pent_findings_total Total findings\n"));
+        out.push_str(&format!("# TYPE pent_findings_total gauge\n"));
+        out.push_str(&format!("pent_findings_total {}\n", findings));
+        out.push_str(&format!("# HELP pent_tools_active Active tool count\n"));
+        out.push_str(&format!("# TYPE pent_tools_active gauge\n"));
+        out.push_str(&format!("pent_tools_active {}\n", tools));
+        out.push_str(&format!("# HELP pent_tool_calls_total Total tool calls\n"));
+        out.push_str(&format!("# TYPE pent_tool_calls_total counter\n"));
+        out.push_str(&format!("pent_tool_calls_total {}\n", calls));
+        let success = if completed + failed > 0 {
+            completed as f64 / (completed + failed) as f64
+        } else { 0.0 };
+        out.push_str(&format!("# HELP pent_success_rate Run success rate\n"));
+        out.push_str(&format!("# TYPE pent_success_rate gauge\n"));
+        out.push_str(&format!("pent_success_rate {:.4}\n", success));
+        return Ok(axum::response::Response::builder()
+            .header("content-type", "text/plain; version=0.0.4")
+            .body(axum::body::Body::from(out))
+            .unwrap());
+    }
+    Ok(axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({
+                "runs": {"queued":queued,"running":running,"completed":completed,"failed":failed,"cancelled":cancelled},
+                "approvals_pending": waiting,
+                "sessions": sessions.unwrap_or(0),
+                "findings": findings,
+                "tools": tools,
+                "tool_calls": calls,
+                "worker_count": 1,
+                "success_rate": if completed + failed > 0 { format!("{:.0}%", completed as f64 / (completed + failed) as f64 * 100.0) } else { "N/A".to_string() }
+            }).to_string(),
+        ))
+        .unwrap())
 }
 
 async fn tools_overview(
     State(s): State<PentState>,
     user: CurrentUser,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let tenant_wide = security::tenant_wide(&user);
     let total: i64 = sqlx::query_scalar(
@@ -890,190 +1216,11 @@ async fn tools_overview(
     .into_iter()
     .map(|(name, cnt)| json!({"name":name,"count":cnt}))
     .collect();
-    Ok(Json(
+    Ok(Json(ApiResponse::new(
         json!({"total_tools":total,"total_calls":total_calls,"success_rate": format!("{:.0}%", success_rate),"healthy_tools":total,"top_tools":top}),
-    ))
+    )))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolAuthorization {
-    Allowed,
-    WaitingForApproval,
-}
-
-// Approval machinery is kept for the approvals API and its integration test;
-// the unified conversation runtime enforces scope guards instead of per-tool approvals.
-#[allow(dead_code)]
-async fn authorize_tool_call(
-    pool: &PgPool,
-    run_id: &str,
-    tool_name: &str,
-    target: &str,
-) -> Result<ToolAuthorization, String> {
-    if std::env::var("PENTA_ENV").as_deref() == Ok("development")
-        && std::env::var("PENTA_AUTO_APPROVE_ALL_TOOLS").as_deref() == Ok("true")
-    {
-        append_run_event(
-            pool,
-            run_id,
-            "approval.auto_granted",
-            json!({
-                "tool_name": tool_name,
-                "target": target,
-                "reason": "explicit local debug override"
-            }),
-        )
-        .await?;
-        return Ok(ToolAuthorization::Allowed);
-    }
-    sqlx::query(
-        "UPDATE pent_approvals
-         SET status='expired',updated_at=now()
-         WHERE run_id=$1 AND status='pending' AND expires_at<=now()",
-    )
-    .bind(run_id)
-    .execute(pool)
-    .await
-    .map_err(|error| error.to_string())?;
-    let definition: Option<(String, String)> = sqlx::query_as(
-        "SELECT risk_level, approval_policy
-         FROM pent_tool_definitions
-         WHERE tool_id=$1 AND lifecycle_status='active'
-         ORDER BY revision DESC
-         LIMIT 1",
-    )
-    .bind(tool_name)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| error.to_string())?;
-    let (risk_level, approval_policy) = definition.unwrap_or_else(|| {
-        let risk = match tool_name {
-            "ssh_exec"
-            | "sql_query"
-            | "command_injection_validate"
-            | "file_inclusion_validate"
-            | "file_upload_validate" => "high",
-            "nuclei" | "afrog" | "sqli_validate" | "xss_validate" | "csrf_validate" => "medium",
-            _ => "low",
-        };
-        (risk.to_string(), "conditional".to_string())
-    });
-    let tenant_id: i64 = sqlx::query_scalar("SELECT tenant_id FROM pent_runs WHERE id=$1")
-        .bind(run_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|error| error.to_string())?;
-    let policy = runtime_policy::load(pool, tenant_id)
-        .await
-        .map_err(|error| format!("{error:?}"))?;
-    // VulnClaw-style default: scope confirmation + tool-layer constraints are
-    // the authorization boundary; per-tool human approval is opt-in via
-    // PENTA_APPROVAL_MODE=policy. Every auto-grant is audited.
-    if std::env::var("PENTA_APPROVAL_MODE").as_deref() != Ok("policy") {
-        append_run_event(
-            pool,
-            run_id,
-            "approval.auto_granted",
-            json!({
-                "tool_name": tool_name,
-                "target": target,
-                "risk_level": risk_level,
-                "reason": "approval_mode=auto（默认免审批；设置 PENTA_APPROVAL_MODE=policy 恢复人工审批）"
-            }),
-        )
-        .await?;
-        return Ok(ToolAuthorization::Allowed);
-    }
-    let needs_approval = approval_policy == "always"
-        || policy
-            .require_approval_for
-            .as_array()
-            .is_some_and(|levels| levels.iter().any(|level| level == &risk_level))
-        || (!policy.auto_approve_low_risk && risk_level == "low");
-    if !needs_approval {
-        return Ok(ToolAuthorization::Allowed);
-    }
-
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT a.status
-         FROM pent_approvals a
-         JOIN pent_tool_calls c ON c.id=a.tool_call_id
-         WHERE a.run_id=$1 AND a.tool_name=$2
-           AND c.params_summary->>'target'=$3
-         ORDER BY a.created_at DESC
-         LIMIT 1",
-    )
-    .bind(run_id)
-    .bind(tool_name)
-    .bind(target)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| error.to_string())?;
-    match existing.as_deref() {
-        Some("approved") => return Ok(ToolAuthorization::Allowed),
-        Some("pending") => return Ok(ToolAuthorization::WaitingForApproval),
-        Some("denied") => return Err(format!("工具 {tool_name} 的审批已拒绝")),
-        _ => {}
-    }
-
-    let tool_call_id = Uuid::new_v4().to_string();
-    let approval_id = Uuid::new_v4().to_string();
-    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-    sqlx::query(
-        "INSERT INTO pent_tool_calls(
-             id,run_id,tool_name,params_summary,permission_decision
-         ) VALUES($1,$2,$3,$4,'pending_approval')",
-    )
-    .bind(&tool_call_id)
-    .bind(run_id)
-    .bind(tool_name)
-    .bind(json!({"target": target}))
-    .execute(&mut *tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    sqlx::query(
-        "INSERT INTO pent_approvals(
-             id,run_id,tool_call_id,risk_level,tool_name,description,status,
-             requested_by,expires_at
-         )
-         SELECT $1,$2,$3,$4,$5,$6,'pending',user_id,
-                now()+($7||' seconds')::interval
-         FROM pent_runs WHERE id=$2",
-    )
-    .bind(&approval_id)
-    .bind(run_id)
-    .bind(&tool_call_id)
-    .bind(&risk_level)
-    .bind(tool_name)
-    .bind(format!("在已确认目标 {target} 上执行 {tool_name}"))
-    .bind(policy.approval_ttl_seconds)
-    .execute(&mut *tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    sqlx::query(
-        "UPDATE pent_runs
-         SET status='waiting_approval',lease_expires_at=NULL,worker_id=NULL,
-             execution_cursor=jsonb_build_object(
-                 'state','waiting_approval',
-                 'tool_name',$2,
-                 'target',$3,
-                 'tool_call_id',$4,
-                 'approval_id',$5
-             ),
-             updated_at=now()
-         WHERE id=$1 AND status='running'",
-    )
-    .bind(run_id)
-    .bind(tool_name)
-    .bind(target)
-    .bind(&tool_call_id)
-    .bind(&approval_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    tx.commit().await.map_err(|error| error.to_string())?;
-    Ok(ToolAuthorization::WaitingForApproval)
-}
 
 async fn process_one_run(pool: &PgPool, worker_id: &str, lease_ttl: i64) -> Result<(), String> {
     let Some(claim) = runtime_policy::claim(pool, worker_id, lease_ttl).await? else {
@@ -1143,7 +1290,9 @@ async fn execute_claimed_run(
     if session_run? {
         return Ok(());
     }
-    Err(format!("Run {run_id} 未能关联 Agent 会话，无法进入会话运行时"))
+    Err(format!(
+        "Run {run_id} 未能关联 Agent 会话，无法进入会话运行时"
+    ))
 }
 
 /// Attach a synthetic agent session to a run created outside the chat flow so
@@ -1350,12 +1499,82 @@ pub(crate) async fn append_run_event(
 async fn traffic_list(
     State(s): State<PentState>,
     user: CurrentUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(c) FROM pent_model_calls c JOIN pent_agent_sessions s ON s.id=c.session_id WHERE s.tenant_id=$1 AND ($2 OR s.created_by=$3) ORDER BY c.started_at DESC LIMIT 200"
-    ).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-    .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    let project_id = params.get("project_id").filter(|v| !v.is_empty()).map(|v| v.as_str());
+    let rows = if let Some(pid) = project_id {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(c) FROM pent_model_calls c
+             JOIN pent_agent_sessions s ON s.id=c.session_id
+             JOIN pent_runs r ON r.session_id=s.id
+             WHERE r.project_id=$1 AND s.tenant_id=$2 AND ($3 OR s.created_by=$4)
+             ORDER BY c.started_at DESC LIMIT 200"
+        ).bind(pid).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
+        .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
+    } else {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(c) FROM pent_model_calls c JOIN pent_agent_sessions s ON s.id=c.session_id WHERE s.tenant_id=$1 AND ($2 OR s.created_by=$3) ORDER BY c.started_at DESC LIMIT 200"
+        ).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
+        .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
+    };
+    Ok(Json(ApiResponse::new(rows)))
+}
+
+// ── M2-F14: Cross-project global memory search ──────────────────────
+
+async fn rmos_global_search(
+    State(s): State<PentState>,
+    user: CurrentUser,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    let query = params.get("q").map(String::as_str).unwrap_or("");
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let tenant_id = security::tenant_id(&user)?;
+    let rows = if query.is_empty() {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(t) FROM pent_knowledge_documents t
+             WHERE tenant_id=$1 AND ($2 OR created_by=$3)
+             ORDER BY created_at DESC LIMIT $4",
+        )
+        .bind(tenant_id)
+        .bind(security::tenant_wide(&user))
+        .bind(&user.user_id)
+        .bind(limit)
+        .fetch_all(&s.pool)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+    } else {
+        // Full-text search across all projects in the tenant
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(t) || jsonb_build_object(
+                 'rank', ts_rank(
+                     to_tsvector('simple', coalesce(t.content,'')),
+                     plainto_tsquery('simple', $1)
+                 )
+             )
+             FROM pent_knowledge_documents t
+             WHERE t.tenant_id=$2 AND ($3 OR t.created_by=$4)
+               AND to_tsvector('simple', coalesce(t.content,'')) @@ plainto_tsquery('simple', $1)
+             ORDER BY ts_rank(
+                 to_tsvector('simple', coalesce(t.content,'')),
+                 plainto_tsquery('simple', $1)
+             ) DESC
+             LIMIT $5",
+        )
+        .bind(&query)
+        .bind(tenant_id)
+        .bind(security::tenant_wide(&user))
+        .bind(&user.user_id)
+        .bind(limit)
+        .fetch_all(&s.pool)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+    };
     Ok(Json(ApiResponse::new(rows)))
 }
 
@@ -1363,13 +1582,22 @@ async fn traffic_list(
 
 async fn rmos_memories(
     State(s): State<PentState>,
+    user: CurrentUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
-    let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_knowledge_documents t ORDER BY created_at DESC LIMIT 200",
-    )
-    .fetch_all(&s.pool)
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
+    let tenant_id = security::tenant_id(&user)?;
+    let project_id = params.get("project_id").filter(|v| !v.is_empty()).map(|v| v.as_str());
+    let rows = if let Some(pid) = project_id {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(t) FROM pent_knowledge_documents t
+             WHERE tags ? $1
+             ORDER BY created_at DESC LIMIT 200"
+        ).bind(pid).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
+    } else {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(t) FROM pent_knowledge_documents t ORDER BY created_at DESC LIMIT 200"
+        ).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
+    };
     Ok(Json(ApiResponse::new(rows)))
 }
 
@@ -1439,8 +1667,21 @@ async fn get_model_bindings(
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_model_role_bindings t WHERE tenant_id=$1 AND enabled=true ORDER BY model_role"
-    ).bind(tenant_id).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+        "SELECT to_jsonb(t) || jsonb_build_object('inherited', t.tenant_id <> $1)
+         FROM pent_model_role_bindings t
+         WHERE t.tenant_id=$1 OR (
+             t.tenant_id=0 AND NOT EXISTS (
+                 SELECT 1 FROM pent_model_role_bindings own
+                 WHERE own.tenant_id=$1 AND own.project_id=t.project_id
+                   AND own.model_role=t.model_role
+             )
+         )
+         ORDER BY model_role",
+    )
+    .bind(tenant_id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
 }
 
@@ -1450,16 +1691,56 @@ async fn update_model_bindings(
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    if let Some(bindings) = body["bindings"].as_array() {
-        for b in bindings {
-            sqlx::query("UPDATE pent_model_role_bindings SET model_config_id=$4,temperature=$5,max_output_tokens=$6,timeout_seconds=$7,enabled=$8,updated_at=now() WHERE tenant_id=$1 AND model_role=$2 AND project_id=$3")
-                .bind(tenant_id).bind(b["model_role"].as_str().unwrap_or("")).bind(b["project_id"].as_str().unwrap_or(""))
-                .bind(b["model_config_id"].as_i64().unwrap_or(0)).bind(b["temperature"].as_f64().unwrap_or(0.7))
-                .bind(b["max_output_tokens"].as_i64().unwrap_or(4096) as i32).bind(b["timeout_seconds"].as_i64().unwrap_or(120) as i32)
-                .bind(b["enabled"].as_bool().unwrap_or(true))
-                .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    let bindings = body["bindings"]
+        .as_array()
+        .ok_or_else(|| AppError::bad_request("bindings 必须是数组"))?;
+    let mut tx = s.pool.begin().await.map_err(|e| AppError::internal(e.to_string()))?;
+    for binding in bindings {
+        let role = binding["model_role"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::bad_request("模型角色不能为空"))?;
+        let project_id = binding["project_id"].as_str().unwrap_or("");
+        let model_config_id = binding["model_config_id"]
+            .as_i64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| AppError::bad_request("模型配置 ID 必须大于 0"))?;
+        let temperature = binding["temperature"].as_f64().unwrap_or(0.7);
+        let max_tokens = binding["max_output_tokens"].as_i64().unwrap_or(4096);
+        let timeout = binding["timeout_seconds"].as_i64().unwrap_or(120);
+        if !(0.0..=2.0).contains(&temperature)
+            || !(256..=131_072).contains(&max_tokens)
+            || !(5..=3600).contains(&timeout)
+        {
+            return Err(AppError::bad_request("模型参数超出允许范围"));
         }
+        sqlx::query(
+            "INSERT INTO pent_model_role_bindings(
+                 tenant_id,project_id,model_role,model_config_id,temperature,
+                 max_output_tokens,timeout_seconds,enabled,revision,updated_at
+             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,1,now())
+             ON CONFLICT(tenant_id,project_id,model_role) DO UPDATE SET
+                 model_config_id=EXCLUDED.model_config_id,
+                 temperature=EXCLUDED.temperature,
+                 max_output_tokens=EXCLUDED.max_output_tokens,
+                 timeout_seconds=EXCLUDED.timeout_seconds,
+                 enabled=EXCLUDED.enabled,
+                 revision=pent_model_role_bindings.revision+1,
+                 updated_at=now()",
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(role)
+        .bind(model_config_id)
+        .bind(temperature)
+        .bind(max_tokens as i32)
+        .bind(timeout as i32)
+        .bind(binding["enabled"].as_bool().unwrap_or(true))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
     }
+    tx.commit().await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(json!({"message":"已保存"}))))
 }
 
@@ -1468,18 +1749,73 @@ async fn get_runtime_policy(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let policy = runtime_policy::load(&s.pool, tenant_id).await?;
-    Ok(Json(ApiResponse::new(json!(policy))))
+    let policy = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(t)
+             - 'approval_ttl_seconds' - 'auto_approve_low_risk' - 'require_approval_for'
+             || jsonb_build_object('inherited', t.tenant_id <> $1)
+         FROM pent_runtime_policies t
+         WHERE tenant_id IN ($1, 0)
+         ORDER BY CASE WHEN tenant_id=$1 THEN 0 ELSE 1 END
+         LIMIT 1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .unwrap_or_else(|| json!({
+        "max_concurrent_runs": 5,
+        "lease_ttl_seconds": 120,
+        "max_tool_timeout_seconds": 900,
+        "max_retries_per_run": 3,
+        "retry_base_delay_seconds": 15,
+        "inherited": true
+    }));
+    Ok(Json(ApiResponse::new(policy)))
 }
 
 async fn update_runtime_policy(
     State(s): State<PentState>,
     user: CurrentUser,
-    Json(body): Json<runtime_policy::UpdateRuntimePolicy>,
+    Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let policy = runtime_policy::save(&s.pool, tenant_id, &user.user_id, body).await?;
-    Ok(Json(ApiResponse::new(json!(policy))))
+    let concurrent = body["max_concurrent_runs"].as_i64().unwrap_or(5);
+    let lease = body["lease_ttl_seconds"].as_i64().unwrap_or(120);
+    let timeout = body["max_tool_timeout_seconds"].as_i64().unwrap_or(900);
+    let retries = body["max_retries_per_run"].as_i64().unwrap_or(3);
+    let retry_delay = body["retry_base_delay_seconds"].as_i64().unwrap_or(15);
+    if !(1..=100).contains(&concurrent)
+        || !(30..=3600).contains(&lease)
+        || !(10..=7200).contains(&timeout)
+        || !(0..=20).contains(&retries)
+        || !(1..=3600).contains(&retry_delay)
+    {
+        return Err(AppError::bad_request("运行策略参数超出允许范围"));
+    }
+    sqlx::query(
+        "INSERT INTO pent_runtime_policies(
+             tenant_id,max_concurrent_runs,lease_ttl_seconds,max_tool_timeout_seconds,
+             max_retries_per_run,retry_base_delay_seconds,updated_by,updated_at
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,now())
+         ON CONFLICT(tenant_id) DO UPDATE SET
+             max_concurrent_runs=EXCLUDED.max_concurrent_runs,
+             lease_ttl_seconds=EXCLUDED.lease_ttl_seconds,
+             max_tool_timeout_seconds=EXCLUDED.max_tool_timeout_seconds,
+             max_retries_per_run=EXCLUDED.max_retries_per_run,
+             retry_base_delay_seconds=EXCLUDED.retry_base_delay_seconds,
+             updated_by=EXCLUDED.updated_by,updated_at=now()",
+    )
+    .bind(tenant_id)
+    .bind(concurrent as i32)
+    .bind(lease as i32)
+    .bind(timeout as i32)
+    .bind(retries as i32)
+    .bind(retry_delay as i32)
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(json!({"message":"运行策略已保存"}))))
 }
 
 // ── SSE streaming for run events ──────────────────────────────────────────
@@ -1707,10 +2043,7 @@ async fn get_traffic(
     if let Some(obj) = sanitized.as_object_mut() {
         for field in ["request_body", "response_body"] {
             if let Some(text) = obj.get(field).and_then(Value::as_str) {
-                obj.insert(
-                    field.into(),
-                    Value::String(sanitize_sensitive_data(text)),
-                );
+                obj.insert(field.into(), Value::String(sanitize_sensitive_data(text)));
             }
         }
         for field in ["request_headers", "response_headers"] {
@@ -1740,6 +2073,84 @@ async fn get_traffic(
     }
     Ok(Json(ApiResponse::new(sanitized)))
 }
+// ── Project-scoped findings, traffic & vulnerabilities ──────────────
+
+async fn get_project_findings(
+    State(s): State<PentState>,
+    Path(project_id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    // Reject unauthorized project access
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pent_projects WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0)",
+    )
+    .bind(&project_id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
+    .fetch_one(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    if !exists { return Err(AppError::bad_request("项目不存在或无权访问")); }
+    // Use project_id directly when populated, fall back to run-level join
+    let items = sqlx::query_scalar::<_, Value>(
+        "SELECT row_to_json(t) FROM (
+             SELECT f.* FROM pent_findings f
+             WHERE f.project_id=$1 AND f.project_id IS NOT NULL
+             UNION ALL
+             SELECT f.* FROM pent_findings f
+             JOIN pent_runs r ON r.id=f.run_id
+             WHERE r.project_id=$1 AND f.project_id IS NULL AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)
+             ORDER BY created_at DESC LIMIT 200
+         ) t",
+    )
+    .bind(&project_id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
+    .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    // Severity summary
+    let summary: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT severity, cnt FROM (
+             SELECT COALESCE(f.severity,'info') as severity, count(*) as cnt FROM pent_findings f
+             WHERE f.project_id=$1 AND f.project_id IS NOT NULL
+             GROUP BY f.severity
+             UNION ALL
+             SELECT COALESCE(f.severity,'info') as severity, count(*) as cnt FROM pent_findings f
+             JOIN pent_runs r ON r.id=f.run_id
+             WHERE r.project_id=$1 AND f.project_id IS NULL AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)
+             GROUP BY f.severity
+         ) t",
+    )
+    .bind(&project_id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
+    .fetch_all(&s.pool).await.unwrap_or_default();
+    let severity_summary: serde_json::Value = summary.into_iter().fold(json!({}), |mut acc, (sev, cnt)| {
+        acc[&sev] = json!(cnt); acc
+    });
+    Ok(Json(ApiResponse::new(json!({"items": items, "severity_summary": severity_summary}))))
+}
+
+async fn get_project_traffic(
+    State(s): State<PentState>,
+    Path(project_id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(100).clamp(1, 500);
+    let rows = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(t) FROM (
+             SELECT t.id, t.run_id, t.tool_name, t.method, t.url, t.response_status, t.duration_ms, t.created_at
+             FROM pent_http_traffic t
+             JOIN pent_runs r ON r.id=t.run_id
+             WHERE r.project_id=$1 AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)
+             ORDER BY t.created_at DESC LIMIT $5
+         ) t",
+    )
+    .bind(&project_id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(limit)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(rows)))
+}
+
 async fn get_finding(
     State(s): State<PentState>,
     Path(id): Path<String>,
@@ -1875,100 +2286,5 @@ impl<T: serde::Serialize> ApiResponse<T> {
             data,
             message: "ok".into(),
         }
-    }
-}
-
-#[cfg(test)]
-mod approval_mode_tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL)"]
-    async fn auto_approval_mode_allows_high_risk_tool_without_human_decision() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
-        let config = kairos_platform_framework_database::DatabaseConfig::new(
-            url,
-            1,
-            2,
-            std::time::Duration::from_secs(10),
-        )
-        .expect("valid test database config");
-        let pool = kairos_platform_framework_database::connect(&config)
-            .await
-            .expect("connect test database");
-        let run_id = "approval-it-run";
-
-        sqlx::query("DELETE FROM pent_run_events WHERE run_id=$1")
-            .bind(run_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup events");
-        sqlx::query("DELETE FROM pent_runs WHERE id=$1")
-            .bind(run_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup run");
-        sqlx::query("DELETE FROM pent_tool_definitions WHERE tool_id='it-approval-tool'")
-            .execute(&pool)
-            .await
-            .expect("cleanup tool");
-        sqlx::query(
-            "INSERT INTO pent_runs(id, task_id, tenant_id, user_id, status, objective_snapshot)
-             VALUES ($1,'approval-it-task',0,'it-tester','running','审批模式测试')",
-        )
-        .bind(run_id)
-        .execute(&pool)
-        .await
-        .expect("seed run");
-        // A tool whose manifest demands approval on every call.
-        sqlx::query(
-            "INSERT INTO pent_tool_definitions(
-                 tool_id, version, namespace, name, description, source,
-                 risk_level, approval_policy, lifecycle_status
-             ) VALUES ('it-approval-tool','1.0.0','test','审批测试工具','测试','builtin',
-                       'high','always','active')",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed tool");
-
-        // Default mode (no PENTA_APPROVAL_MODE=policy): auto-grant.
-        let result = authorize_tool_call(&pool, run_id, "it-approval-tool", "192.0.2.10").await;
-        assert!(
-            matches!(result, Ok(ToolAuthorization::Allowed)),
-            "默认模式必须自动批准，实际：{result:?}"
-        );
-        let audited: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pent_run_events
-             WHERE run_id=$1 AND event_type='approval.auto_granted')",
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .expect("query audit event");
-        assert!(audited, "自动批准必须留下审计事件");
-        let run_status: String = sqlx::query_scalar(
-            "SELECT status FROM pent_runs WHERE id=$1",
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .expect("query run status");
-        assert_eq!(run_status, "running", "免审批不得改变 Run 状态");
-
-        sqlx::query("DELETE FROM pent_run_events WHERE run_id=$1")
-            .bind(run_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup events after test");
-        sqlx::query("DELETE FROM pent_runs WHERE id=$1")
-            .bind(run_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup run after test");
-        sqlx::query("DELETE FROM pent_tool_definitions WHERE tool_id='it-approval-tool'")
-            .execute(&pool)
-            .await
-            .expect("cleanup tool after test");
     }
 }

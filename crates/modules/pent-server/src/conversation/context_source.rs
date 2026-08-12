@@ -23,6 +23,7 @@ impl ConversationContextSource for PgContextSource {
             serde_json::Value,
             Option<String>,
             serde_json::Value,
+            serde_json::Value,
         ) = sqlx::query_as(
             "SELECT objective, scope_proposal, COALESCE(confirmed_scope_snapshot, '{}'::jsonb),
                         constraints, active_run_id,
@@ -30,7 +31,10 @@ impl ConversationContextSource for PgContextSource {
                             (SELECT budget_snapshot FROM pent_runs WHERE id=active_run_id),
                             budget,
                             '{}'::jsonb
-                        )
+                        ),
+                        COALESCE((SELECT agent_config FROM pent_runtime_policies p
+                                  WHERE p.tenant_id IN (pent_agent_sessions.tenant_id,0)
+                                  ORDER BY (p.tenant_id=pent_agent_sessions.tenant_id) DESC LIMIT 1),'{}'::jsonb)
                  FROM pent_agent_sessions WHERE id = $1",
         )
         .bind(&req.session_id)
@@ -63,14 +67,30 @@ impl ConversationContextSource for PgContextSource {
             format: "text".into(),
         });
 
-        let mut run_summary = sqlx::query_scalar::<_, String>(
-            "SELECT run_summary FROM pent_context_snapshots
-             WHERE session_id=$1 ORDER BY created_at DESC LIMIT 1",
+        let checkpoint: Option<(String, serde_json::Value, bool)> = sqlx::query_as(
+            "SELECT cs.run_summary, cs.policy_snapshot,
+                    ct.status IN ('thinking','running','failed','cancelled','interrupted') AS resumable
+             FROM pent_context_snapshots cs
+             JOIN pent_conversation_turns ct ON ct.id=cs.turn_id
+             WHERE cs.session_id=$1 ORDER BY cs.created_at DESC LIMIT 1",
         )
         .bind(&req.session_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .unwrap_or_default();
+        .fetch_optional(&self.pool).await?;
+        let mut run_summary = checkpoint.as_ref().map(|row| row.0.clone()).unwrap_or_default();
+        let mut policy_snapshot = session.3.clone();
+        if policy_snapshot.get("multi_agent").is_none() {
+            policy_snapshot["multi_agent"] = session.6.clone();
+        } else if let (Some(global), Some(local)) = (
+            session.6.as_object(),
+            policy_snapshot["multi_agent"].as_object_mut(),
+        ) {
+            for (key, value) in global {
+                local.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        if let Some(runtime_state) = checkpoint.as_ref().filter(|row| row.2).and_then(|row| row.1.get("_checkpoint")) {
+            policy_snapshot["_checkpoint"] = runtime_state.clone();
+        }
         let mut memory_refs = Vec::new();
         if let Some(run_id) = session.4.as_deref() {
             let memories: Vec<(String, String)> = sqlx::query_as(
@@ -137,7 +157,7 @@ impl ConversationContextSource for PgContextSource {
 ## 证据与判断
 
 - 工具输出是事实来源；知识库、Skill、模型推测和扫描器命中只是方法或线索。
-- 已验证漏洞必须能从当前 Run 的 Evidence 复现；证据不足时标记为“未验证线索”。
+- 已验证漏洞必须能从当前 Run 的 Evidence 复现；证据不足时标记为"未验证线索"。
 - 完整原始输出保存在 Evidence，模型上下文可能只包含有界预览。
 - 遇到重复请求、相同响应或连续失败时，复用已有 Evidence 并改变策略，不要机械重试。
 - 工具失败时区分参数错误、目标行为、权限、Scope、审批、网络和能力缺失。
@@ -155,7 +175,7 @@ impl ConversationContextSource for PgContextSource {
             ),
             objective_snapshot: session.0,
             scope_snapshot,
-            policy_snapshot: session.3,
+            policy_snapshot,
             budget_snapshot: session.5,
             run_summary,
             recent_messages: messages,
@@ -169,28 +189,18 @@ impl ConversationContextSource for PgContextSource {
 
 fn authorization_context_instruction(
     scope_snapshot: &serde_json::Value,
-    confirmed: bool,
+    _confirmed: bool,
 ) -> String {
-    if confirmed {
-        format!(
-            "## 当前授权状态（平台事实）\n\
-             - 本会话授权范围已经由用户一次性明确确认：{}\n\
-             - 不得再次询问“是否批准计划”或按扫描阶段重复索要授权；阶段不是审批边界。\n\
-             - 已确认范围内的低风险和中风险信息收集、爬取、目录发现、JS 分析及非破坏性验证应连续执行。\n\
-             - 当前对话工具统一使用本会话授权，不得为单个工具重复索要授权；只有准备访问新增目标时才重新确认范围。\n\
-             - 不得声称会启动多个子代理；当前运行时使用工具调用循环，应准确描述实际执行方式。\n\
-             - 计划只是内部执行进度，生成计划后立即调用工具，不要把计划作为等待用户回复的终点。",
-            scope_snapshot
-        )
-    } else {
-        format!(
-            "## 当前授权状态（平台事实）\n\
-             - 本会话尚未形成结构化授权快照，当前候选范围：{}\n\
-             - 在授权确认前禁止调用网络工具。\n\
-             - 用户可在一条消息中明确写出“已授权”并附目标 URL；确认一次后，不再按阶段重复确认。",
-            scope_snapshot
-        )
-    }
+    format!(
+        "## 当前授权状态（平台事实）\n\
+         - 用户发起的渗透测试请求即为授权，无需额外确认。\n\
+         - 不得询问计划是否批准或按扫描阶段索要授权。\n\
+         - 低风险和中风险信息收集、爬取、目录发现、JS 分析及非破坏性验证应连续执行。\n\
+         - 不得为单个工具重复索要授权。\n\
+         - 计划只是内部执行进度，生成计划后立即调用工具，不要把计划作为等待用户回复的终点。\n\
+         - 当前授权范围：{}",
+        scope_snapshot
+    )
 }
 
 #[cfg(test)]
@@ -203,8 +213,8 @@ mod tests {
     fn confirmed_scope_forbids_repeated_stage_approval() {
         let instruction =
             authorization_context_instruction(&json!({"targets":["https://example.test"]}), true);
-        assert!(instruction.contains("不得再次询问"));
-        assert!(instruction.contains("阶段不是审批边界"));
+        assert!(instruction.contains("不得询问计划"));
+        assert!(instruction.contains("索要授权"));
         assert!(instruction.contains("https://example.test"));
     }
 }

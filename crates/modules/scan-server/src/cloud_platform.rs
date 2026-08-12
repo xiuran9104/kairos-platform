@@ -43,9 +43,9 @@ pub async fn zone_create(
     State(s): State<ScanState>,
     Json(req): Json<CreateCloudZoneRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let id: i32 = sqlx::query_scalar("INSERT INTO scan_cloud_zones(zone_name,zone_code,description) VALUES($1,$2,$3) RETURNING id")
-        .bind(&req.zone_name).bind(&req.zone_code).bind(&req.description)
-        .fetch_one(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    let id: i64 = sqlx::query_scalar("INSERT INTO scan_cloud_zones(provider_id,zone_name,zone_code,zone_type,description) VALUES($1,$2,$3,$4,$5) RETURNING id")
+        .bind(req.provider_id).bind(&req.zone_name).bind(&req.zone_code).bind(&req.zone_type).bind(&req.description)
+        .fetch_one(&s.pool).await.map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(ApiResponse::new(
         json!({"message": "云区创建成功", "id": id}),
     )))
@@ -55,9 +55,9 @@ pub async fn zone_update(
     Path(id): Path<i32>,
     Json(req): Json<UpdateCloudZoneRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    sqlx::query("UPDATE scan_cloud_zones SET zone_name=COALESCE($2,zone_name),zone_code=COALESCE($3,zone_code),description=COALESCE($4,description) WHERE id=$1 AND deleted=0")
-        .bind(id).bind(&req.zone_name).bind(&req.zone_code).bind(&req.description)
-        .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    sqlx::query("UPDATE scan_cloud_zones SET provider_id=COALESCE($2,provider_id),zone_name=COALESCE($3,zone_name),zone_code=COALESCE($4,zone_code),zone_type=COALESCE($5,zone_type),description=COALESCE($6,description) WHERE id=$1 AND deleted=0")
+        .bind(id).bind(req.provider_id).bind(&req.zone_name).bind(&req.zone_code).bind(&req.zone_type).bind(&req.description)
+        .execute(&s.pool).await.map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(ApiResponse::new(json!({"message": "云区更新成功"}))))
 }
 pub async fn zone_delete(
@@ -106,9 +106,9 @@ pub async fn platform_create(
     State(s): State<ScanState>,
     Json(req): Json<CreateCloudPlatformRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let id: i32 = sqlx::query_scalar("INSERT INTO scan_cloud_platforms(zone_id,platform_name,platform_code,description) VALUES($1,$2,$3,$4) RETURNING id")
+    let id: i64 = sqlx::query_scalar("INSERT INTO scan_cloud_platforms(zone_id,platform_name,platform_code,description) VALUES($1,$2,$3,$4) RETURNING id")
         .bind(req.zone_id).bind(&req.platform_name).bind(&req.platform_code).bind(&req.description)
-        .fetch_one(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+        .fetch_one(&s.pool).await.map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(ApiResponse::new(
         json!({"message": "云平台创建成功", "id": id}),
     )))
@@ -120,7 +120,7 @@ pub async fn platform_update(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     sqlx::query("UPDATE scan_cloud_platforms SET zone_id=COALESCE($2,zone_id),platform_name=COALESCE($3,platform_name),platform_code=COALESCE($4,platform_code),description=COALESCE($5,description) WHERE id=$1 AND deleted=0")
         .bind(id).bind(req.zone_id).bind(&req.platform_name).bind(&req.platform_code).bind(&req.description)
-        .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+        .execute(&s.pool).await.map_err(|e| AppError::bad_request(e.to_string()))?;
     Ok(Json(ApiResponse::new(json!({"message": "云平台更新成功"}))))
 }
 pub async fn platform_delete(

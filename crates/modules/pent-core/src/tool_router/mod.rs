@@ -24,7 +24,10 @@ pub fn route_tools(
         .map(|tool| scorer::score(request, tool))
         .collect();
     selected.sort_by(|left, right| right.score.total_cmp(&left.score));
-    selected.truncate(request.top_k.clamp(1, 10));
+    // No artificial cap — the caller decides how many tools the model sees.
+    if request.top_k > 0 {
+        selected.truncate(request.top_k);
+    }
 
     ToolRouteDecision {
         request_id: uuid::Uuid::new_v4().to_string(),

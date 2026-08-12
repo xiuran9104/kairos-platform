@@ -14,17 +14,36 @@ pg_dump "$database_url" \
   --no-owner \
   --no-privileges \
   --exclude-table-data='pent_agent_sessions' \
+  --exclude-table-data='pent_agent_lessons' \
+  --exclude-table-data='pent_artifacts' \
+  --exclude-table-data='pent_context_snapshots' \
   --exclude-table-data='pent_conversation_messages' \
+  --exclude-table-data='pent_conversation_turns' \
   --exclude-table-data='pent_runs' \
   --exclude-table-data='pent_tool_calls' \
   --exclude-table-data='pent_approvals' \
   --exclude-table-data='pent_evidence' \
   --exclude-table-data='pent_findings' \
   --exclude-table-data='pent_http_traffic' \
+  --exclude-table-data='pent_knowledge_documents' \
+  --exclude-table-data='pent_metacognitive_snapshots' \
+  --exclude-table-data='pent_model_calls' \
+  --exclude-table-data='pent_plan_deltas' \
+  --exclude-table-data='pent_plan_versions' \
+  --exclude-table-data='pent_pre_reflections' \
+  --exclude-table-data='pent_projects' \
+  --exclude-table-data='pent_reflections' \
   --exclude-table-data='pent_run_events' \
   --exclude-table-data='pent_run_instructions' \
+  --exclude-table-data='pent_subtasks' \
+  --exclude-table-data='pent_tasks' \
+  --exclude-table-data='pent_tool_feedback' \
+  --exclude-table-data='pent_tool_route_decisions' \
   --exclude-table-data='scan_tasks' \
   --exclude-table-data='scan_port_details' \
+  --exclude-table-data='infra_api_access_log' \
+  --exclude-table-data='infra_api_error_log' \
+  --exclude-table-data='infra_job_log' \
   --exclude-table-data='system_oauth2_access_token' \
   --exclude-table-data='system_oauth2_refresh_token' \
   --exclude-table-data='system_login_log' \

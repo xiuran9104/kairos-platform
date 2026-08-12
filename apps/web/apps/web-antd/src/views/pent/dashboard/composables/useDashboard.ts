@@ -1,6 +1,5 @@
 import { onMounted, onUnmounted, ref } from 'vue';
 import {
-  getPentApprovals,
   getPentProjects,
   getPentRuns,
   getPentSessions,
@@ -39,12 +38,19 @@ export function useDashboard() {
   const projects = ref<any[]>([]);
   const tasks = ref<any[]>([]);
   const runs = ref<any[]>([]);
-  const approvals = ref<any[]>([]);
   const sessions = ref<any[]>([]);
   const toolOverview = ref<any>({});
 
   const activity = ref<ActivityItem[]>([]);
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
+
+  function asList(value: any): any[] {
+    if (Array.isArray(value)) return value;
+    for (const key of ['items', 'data', 'list', 'results']) {
+      if (Array.isArray(value?.[key])) return value[key];
+    }
+    return [];
+  }
 
   const metrics = ref<DashboardMetrics>({
     totalTasks: 0,
@@ -59,8 +65,6 @@ export function useDashboard() {
   const queuedCount = () => runs.value.filter((r: any) => r.status === 'queued').length;
   const failedCount = () => runs.value.filter((r: any) => r.status === 'failed').length;
   const completedCount = () => runs.value.filter((r: any) => r.status === 'completed').length;
-  const pendingApprovals = () =>
-    approvals.value.filter((a: any) => a.status === 'pending' || a.status === 'requested').length;
 
   // Compute finding severity distribution from run events
   const findingSeverity = ref<FindingSeverity>({
@@ -85,17 +89,6 @@ export function useDashboard() {
         color: r.status === 'failed' ? 'red' : r.status === 'completed' ? 'green' : 'blue',
       });
     });
-    approvals.value
-      .filter((a: any) => a.status === 'pending')
-      .slice(0, 2)
-      .forEach((a: any) => {
-        items.push({
-          type: 'approval',
-          text: `审批 ${a.id?.slice(0, 12)} 等待决策`,
-          time: a.created_at,
-          color: 'orange',
-        });
-      });
     items.sort((a, b) => new Date(b.time || 0).getTime() - new Date(a.time || 0).getTime());
     return items.slice(0, 10);
   }
@@ -104,20 +97,18 @@ export function useDashboard() {
     loading.value = true;
     error.value = null;
     try {
-      const [p, t, r, a, s, to] = await Promise.all([
+      const [p, t, r, s, to] = await Promise.all([
         getPentProjects().catch(() => []),
         getPentTasks().catch(() => []),
         getPentRuns().catch(() => []),
-        getPentApprovals().catch(() => []),
         getPentSessions().catch(() => []),
         getPentToolOverview().catch(() => ({})),
       ]);
 
-      projects.value = (p as any[]) || [];
-      tasks.value = (t as any[]) || [];
-      runs.value = (r as any[]) || [];
-      approvals.value = (a as any[]) || [];
-      sessions.value = (s as any[]) || [];
+      projects.value = asList(p);
+      tasks.value = asList(t);
+      runs.value = asList(r);
+      sessions.value = asList(s);
       toolOverview.value = to || {};
 
       // Compute metrics
@@ -164,7 +155,6 @@ export function useDashboard() {
     projects,
     tasks,
     runs,
-    approvals,
     sessions,
     toolOverview,
     metrics,
@@ -174,7 +164,6 @@ export function useDashboard() {
     queuedCount,
     failedCount,
     completedCount,
-    pendingApprovals,
     fetchAll,
   };
 }

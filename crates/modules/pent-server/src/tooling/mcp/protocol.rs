@@ -37,6 +37,7 @@ pub struct JsonRpcError {
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeRequest {
     pub protocol_version: String,
     pub capabilities: ClientCapabilities,
@@ -44,12 +45,14 @@ pub struct InitializeRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {
     #[serde(default)]
     pub roots: Option<RootsCapability>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RootsCapability {
     #[serde(default)]
     pub list_changed: bool,
@@ -62,6 +65,7 @@ pub struct Implementation {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
@@ -77,6 +81,7 @@ pub struct ServerCapabilities {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolsCapability {
     #[serde(default)]
     pub list_changed: bool,
@@ -90,6 +95,7 @@ pub struct ListToolsResult {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolDef {
     pub name: String,
     #[serde(default)]
@@ -107,6 +113,7 @@ pub struct CallToolParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CallToolResult {
     pub content: Vec<ContentBlock>,
     #[serde(default)]

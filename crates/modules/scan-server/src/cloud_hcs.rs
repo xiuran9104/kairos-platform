@@ -23,6 +23,28 @@ impl HcsAdapter {
         // Simplified implementation for the adapter interface.
         "SDK-HMAC-SHA256 Credential=placeholder".into()
     }
+
+    async fn token(&self, creds: &CloudCredentials) -> Result<String, String> {
+        if let Some(token) = &creds.token {
+            return Ok(token.clone());
+        }
+        let body = serde_json::json!({"auth":{"identity":{"methods":["password"],"password":{"user":{"name":creds.username.clone().unwrap_or_default(),"password":creds.password.clone().unwrap_or_default(),"domain":{"name":creds.domain.clone().unwrap_or_else(||"Default".into())}}}},"scope":{"project":{"id":creds.project_id.clone().unwrap_or_default()}}}});
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v3/auth/tokens",
+                creds.endpoint.trim_end_matches('/')
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| format!("HCS IAM 认证失败: {error}"))?;
+        response
+            .headers()
+            .get("x-subject-token")
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+            .ok_or_else(|| "HCS IAM 响应中没有 Token".into())
+    }
 }
 
 #[async_trait]
@@ -33,6 +55,7 @@ impl CloudApi for HcsAdapter {
 
     async fn test_connection(&self, creds: &CloudCredentials) -> Result<CloudTestResult, String> {
         let start = std::time::Instant::now();
+        let token = self.token(creds).await.unwrap_or_default();
         let client = reqwest::Client::new();
         let result = client
             .get(format!(
@@ -40,7 +63,7 @@ impl CloudApi for HcsAdapter {
                 creds.endpoint.trim_end_matches('/'),
                 creds.project_id.clone().unwrap_or_default()
             ))
-            .header("X-Auth-Token", creds.token.clone().unwrap_or_default())
+            .header("X-Auth-Token", token)
             .send()
             .await;
         Ok(match result {
@@ -61,6 +84,7 @@ impl CloudApi for HcsAdapter {
 
     async fn list_instances(&self, creds: &CloudCredentials) -> Result<Vec<CloudInstance>, String> {
         let client = reqwest::Client::new();
+        let token = self.token(creds).await?;
         let endpoint = format!(
             "{}/v1/{}/cloudservers/detail",
             creds.endpoint.trim_end_matches('/'),
@@ -68,7 +92,7 @@ impl CloudApi for HcsAdapter {
         );
         let resp: Value = client
             .get(&endpoint)
-            .header("X-Auth-Token", creds.token.clone().unwrap_or_default())
+            .header("X-Auth-Token", token)
             .send()
             .await
             .map_err(|e| format!("HCS ECS API: {e}"))?
@@ -264,6 +288,7 @@ impl CloudApi for HcsAdapter {
         flavor: &str,
         system_disk_gb: u32,
     ) -> Result<CloudInstance, String> {
+        let token = self.token(creds).await?;
         let body = serde_json::json!({"server": {"name": name, "imageRef": image_id, "flavorRef": flavor, "root_volume": {"volumetype": "SSD", "size": system_disk_gb}, "count": 1}});
         let client = reqwest::Client::new();
         let resp: Value = client
@@ -272,6 +297,7 @@ impl CloudApi for HcsAdapter {
                 creds.endpoint.trim_end_matches('/'),
                 creds.project_id.clone().unwrap_or_default()
             ))
+            .header("X-Auth-Token", token)
             .json(&body)
             .send()
             .await
