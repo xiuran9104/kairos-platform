@@ -1,6 +1,5 @@
 <script lang="ts" setup>
 import { onMounted, ref } from 'vue';
-import { message } from 'ant-design-vue';
 import { requestClient } from '#/api/request';
 defineOptions({ name: 'PentProviders' });
 const bindings = ref<any[]>([]);

@@ -236,7 +236,7 @@ pub(crate) async fn execute_tool_direct(
 pub async fn execute_tool(
     tool_name: &str,
     command: &[String],
-    limits: &ContainerLimits,
+    limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
     if let Some(executor) = crate::infrastructure::execution::global_executor() {
         executor.execute(tool_name, command, limits).await

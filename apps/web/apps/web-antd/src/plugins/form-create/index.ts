@@ -4,7 +4,7 @@ import formCreate from '@form-create/ant-design-vue';
 import install from '@form-create/ant-design-vue/auto-import';
 import FcDesigner from '@form-create/antd-designer';
 // 👇使用 form-create 需额外全局引入 ant-design-vue 组件
-import {
+import Antd, {
   Alert,
   Badge,
   Card,
@@ -92,6 +92,9 @@ const components = [
 
 // 参考 https://www.form-create.com/v3/ant-design-vue/auto-import 文档
 export function setupFormCreate(app: App) {
+  // 全量注册 ant-design-vue 组件，保证页面侧直接使用 a-* 标签（如 a-page-header、
+  // a-descriptions、a-statistic）都能解析；下面 components 列表保留用于自定义组件。
+  app.use(Antd);
   components.forEach((component) => {
     app.component(component.name as string, component);
   });

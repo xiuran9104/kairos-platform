@@ -547,12 +547,26 @@ onDeactivated(() => {
                 @change="(e: any) => setToolChecked(t, e.target.checked)"
               />
               <div style="min-width: 0; flex: 1">
-                <div style="font-weight: 600; font-size: 13px">{{ t.name }}</div>
+                <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap">
+                  <span style="font-weight: 600; font-size: 13px">{{ t.name }}</span>
+                  <a-tag
+                    :color="t.risk_level === 'high' ? 'red' : t.risk_level === 'medium' ? 'orange' : 'green'"
+                    style="font-size: 11px; margin-inline-end: 0"
+                  >{{ t.risk_level || 'low' }}</a-tag>
+                </div>
                 <div
                   style="font-size: 12px; color: var(--ant-color-text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap"
                   :title="t.description || '无描述'"
                 >
                   {{ t.description || '无描述' }}
+                </div>
+                <div style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px">
+                  <a-tag color="blue" style="font-size: 11px; margin-inline-end: 0">{{ t.namespace }}</a-tag>
+                  <a-tag
+                    v-for="cap in (t.capabilities || []).slice(0, 3)"
+                    :key="cap"
+                    style="font-size: 11px; margin-inline-end: 0"
+                  >{{ cap }}</a-tag>
                 </div>
               </div>
             </div>

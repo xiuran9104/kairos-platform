@@ -789,6 +789,12 @@ importers:
       '@vueuse/integrations':
         specifier: 'catalog:'
         version: 14.3.0(async-validator@4.2.5)(axios@1.18.1)(focus-trap@8.2.2)(nprogress@0.2.0)(qrcode@1.5.4)(sortablejs@1.15.7)(vue@3.5.39(typescript@6.0.3))
+      '@xterm/addon-fit':
+        specifier: ^0.11.0
+        version: 0.11.0
+      '@xterm/xterm':
+        specifier: ^6.0.0
+        version: 6.0.0
       ant-design-vue:
         specifier: 'catalog:'
         version: 4.2.6(patch_hash=bc2b48260eda125a2ded463ce1854dc1958e4682c5c8fe290ea9d12398bad630)(vue@3.5.39(typescript@6.0.3))
@@ -6146,6 +6152,12 @@ packages:
   '@xmldom/xmldom@0.8.13':
     resolution: {integrity: sha512-KRYzxepc14G/CEpEGc3Yn+JKaAeT63smlDr+vjB8jRfgTBBI9wRj/nkQEO+ucV8p8I9bfKLWp37uHgFrbntPvw==}
     engines: {node: '>=10.0.0'}
+
+  '@xterm/addon-fit@0.11.0':
+    resolution: {integrity: sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==}
+
+  '@xterm/xterm@6.0.0':
+    resolution: {integrity: sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==}
 
   '@xyflow/svelte@1.6.1':
     resolution: {integrity: sha512-o84RpjWMAs5tXjYPj6PUjMccBgeF4TFA8DllBqMSbnhJD3ZxLhttp4NmdHZAIM1T5bK5NAzCat+M37uT/9+rTw==}
@@ -16012,6 +16024,10 @@ snapshots:
       xe-utils: 4.0.10
 
   '@xmldom/xmldom@0.8.13': {}
+
+  '@xterm/addon-fit@0.11.0': {}
+
+  '@xterm/xterm@6.0.0': {}
 
   '@xyflow/svelte@1.6.1(svelte@5.56.4(@typescript-eslint/types@8.62.0))':
     dependencies:

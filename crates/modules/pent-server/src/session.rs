@@ -300,26 +300,34 @@ async fn create_message(
         return Err(AppError::bad_request("消息内容不能为空"));
     }
 
-    let message_id = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO pent_conversation_messages(
-             id, session_id, role, message_type, content, payload, created_by
-         ) VALUES($1, $2, 'user', $3, $4, $5, $6)",
-    )
-    .bind(&message_id)
-    .bind(&id)
-    .bind(&request.message_type)
-    .bind(content)
-    .bind(&request.payload)
-    .bind(&user.user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(internal)?;
+    // 创建 turn（用户消息由 begin_turn 一并写入），后台执行 Agent 工具循环，
+    // 前端通过 /pent/turns/{turn_id}/stream 接收流式回复。
+    let turn_request = kairos_platform_pent_api::AgentTurnRequest {
+        session_id: id.clone(),
+        content: content.to_string(),
+        message_type: kairos_platform_pent_api::ConversationMessageType::Chat,
+        client_request_id: format!("msg-{}", Uuid::new_v4()),
+        attachments: vec![],
+    };
+    let runtime = crate::conversation::build_runtime(&state.pool, None);
+    let (turn_id, _run_id) = runtime
+        .begin_turn_only(&turn_request)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    let pool = state.pool.clone();
+    let turn_id_clone = turn_id.clone();
+    tokio::spawn(async move {
+        let runtime = crate::conversation::build_runtime(&pool, None);
+        if let Err(error) = runtime.execute_turn(turn_id_clone, &turn_request).await {
+            tracing::warn!(error = %error, "conversation turn execution failed");
+        }
+    });
 
     Ok(Json(ApiResponse::new(json!({
-        "id": message_id,
+        "id": turn_id,
+        "turn_id": turn_id,
         "session_id": id,
-        "status": "accepted"
+        "status": "thinking"
     }))))
 }
 

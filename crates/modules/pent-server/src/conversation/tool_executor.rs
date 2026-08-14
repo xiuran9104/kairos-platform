@@ -506,15 +506,13 @@ fn isolated_http_limits(
     _scope_snapshot: &serde_json::Value,
     target: &str,
     state_dir: &std::path::Path,
-) -> crate::infrastructure::process::ContainerLimits {
-    crate::infrastructure::process::ContainerLimits {
+ ) -> crate::infrastructure::process::ToolExecutionLimits {
+    crate::infrastructure::process::ToolExecutionLimits {
         timeout_seconds: 30,
         network_access: crate::infrastructure::process::NetworkPolicy::TargetOnly(
             target.to_string(),
         ),
-        network_name: std::env::var("PENTA_DOCKER_TARGET_NETWORK").ok(),
         allowed_paths: vec![state_dir.to_string_lossy().into_owned()],
-        backend: crate::infrastructure::process::ExecutionBackend::Docker,
         ..Default::default()
     }
 }

@@ -13,6 +13,7 @@ mod knowledge_logs;
 mod mcp_servers;
 mod monitor;
 mod runtime_policy;
+mod terminal;
 mod security;
 mod session;
 mod skills;
@@ -72,6 +73,15 @@ pub fn routes(state: PentState) -> Router {
             get(get_project).put(update_project).delete(delete_project),
         )
         .route("/pent/projects/{id}/model", put(update_project_model))
+        .route(
+            "/pent/settings/model-bindings",
+            get(get_model_bindings).put(update_model_bindings),
+        )
+        .route(
+            "/pent/settings/sections/{section}",
+            get(get_platform_section).put(update_platform_section),
+        )
+        .route("/pent/settings/robots", get(get_robot_settings).put(update_robot_settings))
         .route("/pent/tasks", get(list_tasks).post(create_task))
         .route("/pent/tasks/{id}", get(get_task).delete(delete_task))
         .route("/pent/tasks/{id}/cancel", post(cancel_task))
@@ -121,6 +131,7 @@ pub fn routes(state: PentState) -> Router {
         .merge(agents::routes())
         .merge(workflows::routes())
         .merge(files::routes())
+        .merge(terminal::routes())
         .merge(assets::routes())
         .merge(facts::routes())
         .route_layer(from_fn(security::authorize_request));
@@ -290,15 +301,24 @@ async fn update_project(
     if !asset_scope.is_array() {
         return Err(AppError::bad_request("资产范围必须是数组"));
     }
+    let status = body
+        .get("status")
+        .and_then(Value::as_str);
+    if let Some(status) = status {
+        if !matches!(status, "active" | "paused" | "archived") {
+            return Err(AppError::bad_request("项目状态无效"));
+        }
+    }
     let affected = sqlx::query(
         "UPDATE pent_projects
-         SET name=$2, description=$3, asset_scope=$4, updated_at=now()
-         WHERE id=$1 AND tenant_id=$5 AND ($6 OR created_by=$7) AND deleted=0",
+         SET name=$2, description=$3, asset_scope=$4, status=COALESCE($5,status), updated_at=now()
+         WHERE id=$1 AND tenant_id=$6 AND ($7 OR created_by=$8) AND deleted=0",
     )
     .bind(&id)
     .bind(name)
     .bind(description)
     .bind(&asset_scope)
+    .bind(status)
     .bind(tenant_id)
     .bind(security::tenant_wide(&user))
     .bind(&user.user_id)
@@ -1660,6 +1680,108 @@ async fn attack_graph(
 }
 
 // ── Platform Settings ──────────────────────────────────────────────────────
+
+fn platform_section_defaults(section: &str) -> Option<Value> {
+    Some(match section {
+        "assets" => json!({"auto_discovery":true,"discovery_interval_minutes":60,"alive_check_enabled":true,"asset_retention_days":365,"duplicate_strategy":"merge","risk_sync_enabled":true}),
+        "knowledge" => json!({"enabled":true,"base_path":"knowledge_base","embedding_model_config_id":0,"retrieval_top_k":5,"similarity_threshold":0.65,"sub_index_filter":"","multi_query_max_queries":4,"rerank_model_config_id":0,"prefetch_top_k":20,"max_context_chars":0,"max_context_tokens":0,"chunk_strategy":"markdown_then_recursive","request_timeout_seconds":120,"batch_size":64,"prefer_source_file":false,"sub_indexes":"","chunk_size":768,"chunk_overlap":50,"max_chunks_per_item":20,"max_rpm":100,"rate_limit_delay_ms":600,"max_retries":3,"retry_delay_ms":1000}),
+        "c2" => json!({"enabled":true,"heartbeat_seconds":30,"offline_timeout_seconds":120,"max_concurrent_jobs":10,"tls_required":true,"allow_unregistered_nodes":false,"command_timeout_seconds":600}),
+        "robots" => json!({"enabled":true,"max_active_agents":8,"default_role":"penetration_tester","auto_assign_tasks":true,"idle_timeout_minutes":30,"memory_enabled":true,"collaboration_enabled":true}),
+        "terminal" => json!({"session_timeout_minutes":60,"max_sessions_per_user":5,"command_audit_enabled":true,"dangerous_command_confirmation":true,"file_transfer_enabled":true,"max_upload_mb":100,"default_shell":"bash"}),
+        _ => return None,
+    })
+}
+
+async fn get_robot_settings(State(s): State<PentState>, user: CurrentUser) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let stored = sqlx::query_scalar::<_, Option<Value>>("SELECT agent_config->'robot_channels' FROM pent_runtime_policies WHERE tenant_id IN ($1,0) ORDER BY (tenant_id=$1) DESC LIMIT 1")
+        .bind(tenant_id).fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.flatten().unwrap_or_else(|| json!({}));
+    let channels = ["wechat","wecom","dingtalk","lark","telegram","slack","discord","qq"];
+    Ok(Json(ApiResponse::new(Value::Array(channels.into_iter().map(|id| json!({"id":id,"enabled":stored[id]["enabled"].as_bool().unwrap_or(false),"app_id":stored[id]["app_id"].as_str().unwrap_or(""),"configured":stored[id]["secret"].as_str().is_some_and(|v| !v.is_empty())})).collect()))))
+}
+
+async fn update_robot_settings(State(s): State<PentState>, user: CurrentUser, Json(body): Json<Value>) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let old = sqlx::query_scalar::<_, Option<Value>>("SELECT agent_config->'robot_channels' FROM pent_runtime_policies WHERE tenant_id=$1").bind(tenant_id).fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.flatten().unwrap_or_else(|| json!({}));
+    let rows = body["channels"].as_array().ok_or_else(|| AppError::bad_request("channels 必须是数组"))?;
+    let mut saved = serde_json::Map::new();
+    for row in rows { let id=row["id"].as_str().filter(|v| matches!(*v,"wechat"|"wecom"|"dingtalk"|"lark"|"telegram"|"slack"|"discord"|"qq")).ok_or_else(|| AppError::bad_request("不支持的机器人类型"))?; let input=row["secret"].as_str().unwrap_or(""); let secret=if input.is_empty(){old[id]["secret"].clone()}else{Value::String(infrastructure::secrets::encrypt_api_key(input))}; saved.insert(id.into(),json!({"enabled":row["enabled"].as_bool().unwrap_or(false),"app_id":row["app_id"].as_str().unwrap_or(""),"secret":secret})); }
+    let config=Value::Object(saved);
+    sqlx::query("INSERT INTO pent_runtime_policies(tenant_id,agent_config,updated_by) VALUES($1,jsonb_build_object('robot_channels',$2),$3) ON CONFLICT(tenant_id) DO UPDATE SET agent_config=pent_runtime_policies.agent_config || jsonb_build_object('robot_channels',$2),updated_by=$3,updated_at=now()")
+        .bind(tenant_id).bind(&config).bind(&user.user_id).execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    get_robot_settings(State(s),user).await
+}
+
+async fn get_platform_section(
+    State(s): State<PentState>,
+    Path(section): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let defaults = platform_section_defaults(&section)
+        .ok_or_else(|| AppError::not_found("设置分类不存在"))?;
+    let tenant_id = security::tenant_id(&user)?;
+    let stored = sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT agent_config->'platform_settings'->$2
+         FROM pent_runtime_policies
+         WHERE tenant_id IN ($1,0)
+         ORDER BY (tenant_id=$1) DESC LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(&section)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .flatten()
+    .unwrap_or_else(|| json!({}));
+    let merged = match (defaults, stored) {
+        (Value::Object(mut base), Value::Object(values)) => {
+            for (key, value) in values {
+                if base.contains_key(&key) {
+                    base.insert(key, value);
+                }
+            }
+            Value::Object(base)
+        }
+        (base, _) => base,
+    };
+    Ok(Json(ApiResponse::new(merged)))
+}
+
+async fn update_platform_section(
+    State(s): State<PentState>,
+    Path(section): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let defaults = platform_section_defaults(&section)
+        .ok_or_else(|| AppError::not_found("设置分类不存在"))?;
+    let values = body
+        .as_object()
+        .ok_or_else(|| AppError::bad_request("设置内容必须是对象"))?;
+    let allowed = defaults.as_object().expect("section defaults are objects");
+    if values.keys().any(|key| !allowed.contains_key(key)) {
+        return Err(AppError::bad_request("设置包含未知字段"));
+    }
+    let tenant_id = security::tenant_id(&user)?;
+    sqlx::query(
+        "INSERT INTO pent_runtime_policies(tenant_id,agent_config,updated_by)
+         VALUES($1,jsonb_build_object('platform_settings',jsonb_build_object($2,$3)), $4)
+         ON CONFLICT(tenant_id) DO UPDATE SET
+           agent_config=pent_runtime_policies.agent_config || jsonb_build_object(
+             'platform_settings',
+             COALESCE(pent_runtime_policies.agent_config->'platform_settings','{}'::jsonb)
+               || jsonb_build_object($2,$3)
+           ),updated_by=$4,updated_at=now()",
+    )
+    .bind(tenant_id)
+    .bind(&section)
+    .bind(&body)
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(ApiResponse::new(body)))
+}
 
 async fn get_model_bindings(
     State(s): State<PentState>,

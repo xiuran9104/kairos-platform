@@ -63,6 +63,7 @@ pub mod structured_output;
 pub mod tool_bus;
 pub mod tool_catalog;
 pub mod tool_executor;
+pub mod tool_guard;
 mod tool_extensions;
 pub mod traffic;
 pub(crate) mod turn_tasks;

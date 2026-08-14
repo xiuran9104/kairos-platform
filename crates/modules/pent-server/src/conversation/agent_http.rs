@@ -32,7 +32,9 @@ async fn update_settings(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant = security::tenant_id(&user)?;
     validate(&config)?;
-    sqlx::query("INSERT INTO pent_runtime_policies(tenant_id,agent_config,updated_by) VALUES($1,$2,$3) ON CONFLICT(tenant_id) DO UPDATE SET agent_config=EXCLUDED.agent_config,updated_by=EXCLUDED.updated_by,updated_at=now()")
+    let mut config = config;
+    if let Some(values) = config.as_object_mut() { values.remove("inherited"); }
+    sqlx::query("INSERT INTO pent_runtime_policies(tenant_id,agent_config,updated_by) VALUES($1,$2,$3) ON CONFLICT(tenant_id) DO UPDATE SET agent_config=pent_runtime_policies.agent_config || EXCLUDED.agent_config,updated_by=EXCLUDED.updated_by,updated_at=now()")
         .bind(tenant).bind(config).bind(&user.user_id).execute(&state.pool).await.map_err(internal)?;
     Ok(Json(ApiResponse::new(
         json!({"message":"Agent 设置已保存"}),

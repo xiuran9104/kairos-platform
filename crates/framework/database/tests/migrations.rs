@@ -81,13 +81,14 @@ async fn applies_all_migrations_to_empty_postgres() {
         "SELECT count(*) FROM system_menu
          WHERE deleted = 0 AND status = 0
            AND id IN (30500, 30501, 30502, 30503, 30504, 30505, 30506, 30507, 30508,
-                      30510, 30511, 30512, 30513, 30514, 30515, 30516, 30517)",
+                      30510, 30511, 30512, 30513, 30514, 30515, 30516, 30517,
+                      30518, 30519)",
     )
     .fetch_one(&pool)
     .await
     .expect("read pent capability/ops menus");
     assert_eq!(
-        pent_capability_ops_menus, 17,
+        pent_capability_ops_menus, 19,
         "pent capability/ops menus must be bootstrapped"
     );
 

@@ -2,6 +2,7 @@
 import type { PentAsset } from '#/api/pent/ops-assets';
 
 import { computed, onMounted, reactive, ref } from 'vue';
+import { useRoute } from 'vue-router';
 import { message } from 'ant-design-vue';
 
 import { getPentProjects } from '#/api/pent';
@@ -15,6 +16,8 @@ import {
   mergePentAssets,
   updatePentAsset,
 } from '#/api/pent/ops-assets';
+
+const route = useRoute();
 
 // ── 字典 ───────────────────────────────────────────────────────────────────
 const statusOptions = [
@@ -984,6 +987,10 @@ function exportSelected() {
 }
 
 onMounted(() => {
+  const routeProjectId = Array.isArray(route.query.project_id)
+    ? route.query.project_id[0]
+    : route.query.project_id;
+  if (routeProjectId) projectFilter.value = routeProjectId;
   readSavedViews();
   fetchProjects();
   fetchAssets();

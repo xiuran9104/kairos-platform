@@ -9,6 +9,7 @@ export interface HitlSettings {
   hitl_mode: 'approval' | 'review_edit';
   hitl_reviewer: 'audit_agent' | 'human';
   hitl_tool_whitelist: string[];
+  retention_days: number;
   inherited?: boolean;
 }
 

@@ -1,7 +1,7 @@
 //! Elastic tool execution — execution ids, cancellation, concurrency limits,
 //! and per-tool circuit breakers (D-06).
 
-use super::process::{ContainerLimits, ToolOutput, execute_tool_direct};
+use super::process::{ToolExecutionLimits, ToolOutput, execute_tool_direct};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,7 +91,7 @@ impl ExecutionRegistry {
         self: Arc<Self>,
         tool_name: String,
         arguments: Vec<String>,
-        limits: ContainerLimits,
+        limits: ToolExecutionLimits,
     ) -> ExecutionId {
         let id = self.next_id();
         let cancel = CancellationToken::new();
@@ -125,7 +125,7 @@ impl ExecutionRegistry {
         &self,
         tool_name: String,
         arguments: Vec<String>,
-        limits: ContainerLimits,
+        limits: ToolExecutionLimits,
         cancel: CancellationToken,
         id: ExecutionId,
     ) {
@@ -229,7 +229,7 @@ impl ExecutionRegistry {
 async fn execute_with_cancel(
     tool_name: String,
     arguments: Vec<String>,
-    limits: ContainerLimits,
+    limits: ToolExecutionLimits,
     cancel: CancellationToken,
 ) -> Result<ToolOutput, String> {
     // Wrap the synchronous execute_tool in a cancellable task.
@@ -376,7 +376,7 @@ impl ElasticExecutor {
         &self,
         tool_name: &str,
         arguments: &[String],
-        limits: &ContainerLimits,
+        limits: &ToolExecutionLimits,
     ) -> Result<ToolOutput, String> {
         self.breaker.check(tool_name).await?;
 

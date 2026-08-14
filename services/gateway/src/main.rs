@@ -130,6 +130,8 @@ async fn load_db_mcp_servers(
             args: serde_json::from_value(args).unwrap_or_default(),
             env: serde_json::from_value(env).unwrap_or_default(),
             auto_start: true,
+            url: None,
+            headers: Default::default(),
         };
         if let Err(error) = registry.add_server(config).await {
             warn!(%error, "failed to start configured MCP server");

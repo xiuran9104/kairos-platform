@@ -136,7 +136,14 @@ onMounted(fetchConversations);
         </template>
         <template v-else-if="column.key === 'actions'">
           <a-space :size="4">
-            <a-button size="small" type="link" @click="router.push('/pent/agent')">
+            <a-button
+              size="small"
+              type="link"
+              @click="router.push({
+                path: '/pent/chat',
+                query: { project_id: projectId, session_id: record.id },
+              })"
+            >
               打开对话
             </a-button>
             <a-popconfirm title="解绑该对话？" @confirm="unbind(record.id)">

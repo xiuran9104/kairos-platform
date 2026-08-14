@@ -1,219 +1,152 @@
 <script lang="ts" setup>
 import type { Edge, Node } from '@vue-flow/core';
-import type { PentFactGraph } from '#/api/pent/ops-facts';
+import type {
+  PentAttackGraphNode,
+  PentProjectAttackGraph,
+} from '#/api/pent/ops-attack-graph';
 
-import { nextTick, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import { message } from 'ant-design-vue';
 
 import { Background } from '@vue-flow/background';
 import { Controls } from '@vue-flow/controls';
 import { MarkerType, useVueFlow, VueFlow } from '@vue-flow/core';
+import { MiniMap } from '@vue-flow/minimap';
 
-import {
-  createPentFactEdge,
-  deletePentFactEdge,
-  getPentProjectFactGraph,
-} from '#/api/pent/ops-facts';
+import { getPentProjectAttackGraph } from '#/api/pent/ops-attack-graph';
 
 import '@vue-flow/core/dist/style.css';
 import '@vue-flow/core/dist/theme-default.css';
 import '@vue-flow/controls/dist/style.css';
+import '@vue-flow/minimap/dist/style.css';
 
 const props = defineProps<{ projectId: string }>();
 
-const CATEGORY_COLOR: Record<string, string> = {
-  target: '#1677ff',
-  auth: '#722ed1',
-  infra: '#13c2c2',
-  business: '#2f54eb',
-  finding: '#f5222d',
-  chain: '#fa8c16',
-  exploit: '#eb2f96',
-  poc: '#fa541c',
-  note: '#8c8c8c',
-  company: '#52c41a',
-  supplychain: '#a0d911',
+const KIND_META: Record<string, { color: string; label: string }> = {
+  asset: { color: '#1677ff', label: '资产/目标' },
+  context: { color: '#8c8c8c', label: '上下文' },
+  credential: { color: '#722ed1', label: '凭据' },
+  exploit: { color: '#fa541c', label: '利用/验证' },
+  vulnerability: { color: '#f5222d', label: '漏洞' },
+};
+const SEVERITY_COLOR: Record<string, string> = {
+  critical: '#a8071a',
+  high: '#f5222d',
+  info: '#8c8c8c',
+  low: '#1677ff',
+  medium: '#fa8c16',
 };
 
 const loading = ref(false);
-const graph = ref<PentFactGraph>({ nodes: [], edges: [] });
-const nodes = ref<Node[]>([]);
-const edges = ref<Edge[]>([]);
+const graph = ref<PentProjectAttackGraph>({
+  edges: [],
+  nodes: [],
+  summary: { assets: 0, credentials: 0, exploits: 0, vulnerabilities: 0 },
+});
+const flowNodes = ref<Node[]>([]);
+const flowEdges = ref<Edge[]>([]);
+const selectedKind = ref<string>();
+const detail = ref<null | PentAttackGraphNode>(null);
+const showDetail = ref(false);
 
 const { fitView, onNodeClick } = useVueFlow();
 
-// ── BFS 分层布局 ───────────────────────────────────────────────────────────
-function layoutNodes(g: PentFactGraph): Node[] {
-  const nodeIds = g.nodes.map((n) => n.fact_key);
-  const incoming = new Map<string, number>();
-  const adj = new Map<string, string[]>();
-  for (const id of nodeIds) {
-    incoming.set(id, 0);
-    adj.set(id, []);
-  }
-  for (const e of g.edges) {
-    if (!incoming.has(e.source_fact_key) || !incoming.has(e.target_fact_key)) continue;
-    incoming.set(
-      e.target_fact_key,
-      (incoming.get(e.target_fact_key) || 0) + 1,
-    );
-    adj.get(e.source_fact_key)?.push(e.target_fact_key);
-  }
-  // 按入度分层（Kahn 简化：反复剥进入度 0 的层；有环时剩余节点放最后一层）
-  const layerOf = new Map<string, number>();
-  let frontier = nodeIds.filter((id) => (incoming.get(id) || 0) === 0);
-  const remaining = new Map(incoming);
-  let layer = 0;
-  const assigned = new Set<string>();
-  while (frontier.length && layer < 20) {
-    const next: string[] = [];
-    for (const id of frontier) {
-      if (assigned.has(id)) continue;
-      assigned.add(id);
-      layerOf.set(id, layer);
-      for (const tgt of adj.get(id) || []) {
-        remaining.set(tgt, (remaining.get(tgt) || 1) - 1);
-        if ((remaining.get(tgt) || 0) <= 0 && !assigned.has(tgt)) next.push(tgt);
-      }
+const visibleNodeIds = computed(() => {
+  if (!selectedKind.value) return new Set(graph.value.nodes.map((node) => node.id));
+  const direct = new Set(
+    graph.value.nodes
+      .filter((node) => node.kind === selectedKind.value)
+      .map((node) => node.id),
+  );
+  for (const edge of graph.value.edges) {
+    if (direct.has(edge.source) || direct.has(edge.target)) {
+      direct.add(edge.source);
+      direct.add(edge.target);
     }
-    frontier = next;
-    layer++;
   }
-  for (const id of nodeIds) if (!layerOf.has(id)) layerOf.set(id, layer);
-  // 同层横排
-  const perLayer = new Map<number, string[]>();
-  for (const id of nodeIds) {
-    const l = layerOf.get(id) || 0;
-    const list = perLayer.get(l) || [];
-    list.push(id);
-    perLayer.set(l, list);
-  }
-  return g.nodes.map((n) => {
-    const l = layerOf.get(n.fact_key) || 0;
-    const idx = (perLayer.get(l) || []).indexOf(n.fact_key);
-    const color = CATEGORY_COLOR[n.category] || '#8c8c8c';
-    return {
-      id: n.fact_key,
-      position: { x: idx * 240, y: l * 140 },
-      data: { label: n.summary || n.fact_key, category: n.category },
-      style: {
-        border: `2px solid ${color}`,
-        borderRadius: '8px',
-        fontSize: '12px',
-        width: '200px',
-        opacity: n.deprecated ? 0.45 : 1,
-      },
-    } as Node;
-  });
+  return direct;
+});
+
+function nodeColor(node: PentAttackGraphNode) {
+  return (
+    SEVERITY_COLOR[node.severity || node.risk_level || ''] ||
+    KIND_META[node.kind]?.color ||
+    '#8c8c8c'
+  );
 }
 
 function rebuild() {
-  nodes.value = layoutNodes(graph.value);
-  edges.value = graph.value.edges.map((e) => ({
-    id: e.id,
-    source: e.source_fact_key,
-    target: e.target_fact_key,
-    label: e.edge_type || undefined,
-    markerEnd: MarkerType.ArrowClosed,
-  }));
-  nextTick(() => fitView({ padding: 0.2 }));
+  const ids = visibleNodeIds.value;
+  const visible = graph.value.nodes.filter((node) => ids.has(node.id));
+  const kindOrder = ['asset', 'context', 'vulnerability', 'exploit', 'credential'];
+  const lanes = new Map<string, PentAttackGraphNode[]>();
+  for (const node of visible) {
+    const lane = lanes.get(node.kind) || [];
+    lane.push(node);
+    lanes.set(node.kind, lane);
+  }
+  flowNodes.value = visible.map((node) => {
+    const column = Math.max(0, kindOrder.indexOf(node.kind));
+    const row = (lanes.get(node.kind) || []).indexOf(node);
+    const color = nodeColor(node);
+    return {
+      data: {
+        label: `${KIND_META[node.kind]?.label || node.kind}\n${node.name || '未命名'}`,
+      },
+      id: node.id,
+      position: { x: column * 250, y: row * 115 },
+      style: {
+        background: `${color}12`,
+        border: `2px solid ${color}`,
+        borderRadius: '9px',
+        fontSize: '12px',
+        maxWidth: '210px',
+        padding: '10px',
+        whiteSpace: 'pre-line',
+        width: '210px',
+      },
+    } as Node;
+  });
+  flowEdges.value = graph.value.edges
+    .filter((edge) => ids.has(edge.source) && ids.has(edge.target))
+    .map((edge) => ({
+      animated: edge.kind === 'exposes' || edge.kind === 'exploits',
+      id: edge.id,
+      label: edge.label || edge.kind,
+      markerEnd: MarkerType.ArrowClosed,
+      source: edge.source,
+      target: edge.target,
+    }));
+  nextTick(() => fitView({ padding: 0.18 }));
 }
 
 async function fetchGraph() {
   loading.value = true;
   try {
-    graph.value = (await getPentProjectFactGraph(props.projectId)) || {
-      nodes: [],
+    graph.value = await getPentProjectAttackGraph(props.projectId);
+    rebuild();
+  } catch (error: any) {
+    message.error(error?.message || '加载项目攻击路径失败');
+    graph.value = {
       edges: [],
+      nodes: [],
+      summary: { assets: 0, credentials: 0, exploits: 0, vulnerabilities: 0 },
     };
     rebuild();
-  } catch {
-    message.error('加载事实图失败');
-    graph.value = { nodes: [], edges: [] };
-    nodes.value = [];
-    edges.value = [];
   } finally {
     loading.value = false;
   }
 }
 
-// ── 连边模式 ───────────────────────────────────────────────────────────────
-const connectMode = ref(false);
-const connectSource = ref<string>('');
-const showEdgeModal = ref(false);
-const edgeType = ref('related');
-let connectTarget = '';
-
-function onNodeClickHandler(factKey: string) {
-  if (!connectMode.value) {
-    openDetail(factKey);
-    return;
-  }
-  if (!connectSource.value) {
-    connectSource.value = factKey;
-    message.info(`已选源节点 ${factKey}，请点击目标节点`);
-    return;
-  }
-  if (connectSource.value === factKey) {
-    message.warning('不能连接自身');
-    return;
-  }
-  connectTarget = factKey;
-  edgeType.value = 'related';
-  showEdgeModal.value = true;
+function selectKind(kind?: string) {
+  selectedKind.value = selectedKind.value === kind ? undefined : kind;
+  rebuild();
 }
 
-onNodeClick(({ node }) => onNodeClickHandler(node.id));
-
-async function confirmEdge() {
-  try {
-    await createPentFactEdge({
-      project_id: props.projectId,
-      source_fact_key: connectSource.value,
-      target_fact_key: connectTarget,
-      edge_type: edgeType.value.trim() || 'related',
-    });
-    message.success('已创建连边');
-    showEdgeModal.value = false;
-    connectSource.value = '';
-    await fetchGraph();
-  } catch {
-    message.error('创建失败（节点不存在或重复）');
-  }
-}
-
-function cancelConnect() {
-  connectMode.value = false;
-  connectSource.value = '';
-}
-
-// ── 节点详情 ───────────────────────────────────────────────────────────────
-const detailKey = ref('');
-const showDetail = ref(false);
-
-const detailNode = ref<PentFactGraph['nodes'][number] | null>(null);
-const detailEdges = ref<PentFactGraph['edges']>([]);
-
-function openDetail(factKey: string) {
-  detailKey.value = factKey;
-  detailNode.value =
-    graph.value.nodes.find((n) => n.fact_key === factKey) || null;
-  detailEdges.value = graph.value.edges.filter(
-    (e) => e.source_fact_key === factKey || e.target_fact_key === factKey,
-  );
+onNodeClick(({ node }) => {
+  detail.value = graph.value.nodes.find((item) => item.id === node.id) || null;
   showDetail.value = true;
-}
-
-async function removeEdge(id: string) {
-  try {
-    await deletePentFactEdge(id);
-    message.success('已删除连边');
-    await fetchGraph();
-    showDetail.value = false;
-  } catch {
-    message.error('删除失败');
-  }
-}
+});
 
 watch(() => props.projectId, fetchGraph);
 onMounted(fetchGraph);
@@ -221,82 +154,101 @@ onMounted(fetchGraph);
 
 <template>
   <div>
-    <div style="display: flex; gap: 8px; margin-bottom: 12px; align-items: center">
-      <a-button size="small" :loading="loading" @click="fetchGraph">刷新</a-button>
-      <a-button size="small" @click="fitView({ padding: 0.2 })">居中</a-button>
-      <a-button
-        size="small"
-        :type="connectMode ? 'primary' : 'default'"
-        @click="connectMode ? cancelConnect() : (connectMode = true)"
-      >
-        {{ connectMode ? '退出连边' : '连边' }}
-      </a-button>
-      <span v-if="connectMode" style="font-size: 12px; color: var(--ant-color-primary)">
-        {{ connectSource ? `源：${connectSource}，请选择目标节点` : '连边模式：点击源节点' }}
-      </span>
-      <span style="margin-left: auto; font-size: 12px; color: var(--ant-color-text-tertiary)">
-        节点 {{ graph.nodes.length }} · 边 {{ graph.edges.length }}
-      </span>
-    </div>
-
-    <a-empty
-      v-if="!graph.nodes.length && !loading"
-      description="暂无事实节点，请先在事实黑板添加事实"
-      style="margin: 48px 0"
+    <a-alert
+      message="攻击路径来自项目资产、实际漏洞、证据和已确认攻击事实，不再使用可手工编辑的事实关系图。"
+      type="info"
+      show-icon
+      style="margin-bottom: 12px"
     />
-    <div
-      v-else
-      style="height: 520px; border: 1px solid var(--ant-color-border-secondary); border-radius: 8px"
-    >
-      <VueFlow v-model:nodes="nodes" v-model:edges="edges" :nodes-draggable="false" fit-view-on-init>
-        <Background />
-        <Controls />
-      </VueFlow>
+    <div style="display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center">
+      <a-button size="small" :loading="loading" @click="fetchGraph">刷新</a-button>
+      <a-button size="small" @click="fitView({ padding: 0.18 })">居中</a-button>
+      <a-tag
+        v-for="(meta, kind) in KIND_META"
+        :key="kind"
+        :color="selectedKind === kind ? meta.color : 'default'"
+        style="cursor: pointer"
+        @click="selectKind(kind)"
+      >{{ meta.label }}</a-tag>
+      <span style="margin-left: auto; font-size: 12px; color: var(--ant-color-text-tertiary)">
+        {{ graph.summary.assets }} 资产 · {{ graph.summary.vulnerabilities }} 漏洞 ·
+        {{ graph.summary.exploits }} 利用 · {{ graph.summary.credentials }} 凭据
+      </span>
     </div>
 
-    <!-- 连边 modal -->
-    <a-modal
-      v-model:open="showEdgeModal"
-      title="创建连边"
-      @ok="confirmEdge"
+    <div
+      style="
+        position: relative;
+        height: 560px;
+        overflow: hidden;
+        border: 1px solid var(--ant-color-border-secondary);
+        border-radius: 8px;
+        background: var(--ant-color-bg-layout);
+      "
     >
-      <a-form layout="vertical">
-        <a-form-item label="关系">
-          <a-input :value="`${connectSource} → ${connectTarget}`" disabled />
-        </a-form-item>
-        <a-form-item label="edge_type">
-          <a-input v-model:value="edgeType" placeholder="如 contains / leads-to / related" />
-        </a-form-item>
-      </a-form>
-    </a-modal>
+      <VueFlow
+        v-model:nodes="flowNodes"
+        v-model:edges="flowEdges"
+        :nodes-draggable="true"
+        :min-zoom="0.2"
+        :max-zoom="2.5"
+        fit-view-on-init
+      >
+        <Background :gap="18" :size="1.2" />
+        <Controls />
+        <MiniMap pannable zoomable />
+      </VueFlow>
+      <div
+        v-if="!graph.nodes.length && !loading"
+        style="
+          position: absolute;
+          z-index: 5;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          pointer-events: none;
+        "
+      >
+        <a-empty description="暂无攻击路径；绑定项目资产并执行任务后会自动生成" />
+      </div>
+      <div
+        v-if="loading"
+        style="
+          position: absolute;
+          z-index: 6;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: color-mix(in srgb, var(--ant-color-bg-container) 55%, transparent);
+        "
+      >
+        <a-spin tip="加载攻击路径..." />
+      </div>
+    </div>
 
-    <!-- 节点详情 drawer -->
-    <a-drawer v-model:open="showDetail" title="节点详情" width="440">
-      <template v-if="detailNode">
+    <a-drawer v-model:open="showDetail" title="攻击路径节点" width="480">
+      <template v-if="detail">
         <a-descriptions :column="1" size="small" bordered>
-          <a-descriptions-item label="fact_key">{{ detailNode.fact_key }}</a-descriptions-item>
-          <a-descriptions-item label="分类">{{ detailNode.category }}</a-descriptions-item>
-          <a-descriptions-item label="摘要">{{ detailNode.summary }}</a-descriptions-item>
-          <a-descriptions-item label="置信度">{{ detailNode.confidence }}</a-descriptions-item>
+          <a-descriptions-item label="类型">
+            <a-tag :color="KIND_META[detail.kind]?.color">
+              {{ KIND_META[detail.kind]?.label || detail.kind }}
+            </a-tag>
+          </a-descriptions-item>
+          <a-descriptions-item label="名称">{{ detail.name }}</a-descriptions-item>
+          <a-descriptions-item v-if="detail.target" label="目标">{{ detail.target }}</a-descriptions-item>
+          <a-descriptions-item v-if="detail.severity" label="严重度">
+            {{ detail.severity }}
+          </a-descriptions-item>
+          <a-descriptions-item v-if="detail.status" label="状态">{{ detail.status }}</a-descriptions-item>
+          <a-descriptions-item v-if="detail.confidence !== undefined" label="置信度">
+            {{ detail.confidence }}
+          </a-descriptions-item>
+          <a-descriptions-item label="关联关系">
+            {{ graph.edges.filter((edge) => edge.source === detail?.id || edge.target === detail?.id).length }}
+          </a-descriptions-item>
         </a-descriptions>
-        <a-card size="small" title="关联边" style="margin-top: 12px">
-          <template v-if="detailEdges.length">
-            <div
-              v-for="e in detailEdges"
-              :key="e.id"
-              style="display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--ant-color-border-secondary); font-size: 12px"
-            >
-              <span style="flex: 1; word-break: break-all">
-                {{ e.source_fact_key }} → {{ e.target_fact_key }}
-                <a-tag size="small" style="margin-left: 4px">{{ e.edge_type }}</a-tag>
-              </span>
-              <a-popconfirm title="删除该连边？" @confirm="removeEdge(e.id)">
-                <a-button size="small" type="link" danger>删除</a-button>
-              </a-popconfirm>
-            </div>
-          </template>
-          <a-empty v-else description="无关联边" />
-        </a-card>
       </template>
     </a-drawer>
   </div>

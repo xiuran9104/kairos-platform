@@ -19,6 +19,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '启动 Agent', icon: 'lucide:message-square-code' },
       },
       {
+        path: '/pent/chat',
+        component: () => import('#/views/pent/chat/index.vue'),
+        name: 'PentChat',
+        meta: { title: '项目对话', icon: 'lucide:messages-square' },
+      },
+      {
         path: '/pent/tasks/:id',
         component: () => import('#/views/pent/task-monitor/index.vue'),
         name: 'PentTaskMonitor',
@@ -53,7 +59,8 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '漏洞', icon: 'lucide:alert-triangle' },
       },
       {
-        path: '/pent/settings',
+        path: '/pent/platform-settings',
+        alias: '/pent/settings',
         component: () => import('#/views/pent/platform-settings/index.vue'),
         name: 'PentSettings',
         meta: { title: '平台设置', icon: 'lucide:settings' },
@@ -69,18 +76,6 @@ const routes: RouteRecordRaw[] = [
         component: () => import('#/views/pent/rmos/index.vue'),
         name: 'PentRmos',
         meta: { title: 'RMOS 记忆', icon: 'lucide:brain-circuit' },
-      },
-      {
-        path: '/pent/tools',
-        component: () => import('#/views/pent/tools/index.vue'),
-        name: 'PentTools',
-        meta: { title: '工具生态', icon: 'lucide:wrench' },
-      },
-      {
-        path: '/pent/guard',
-        component: () => import('#/views/pent/guard/index.vue'),
-        name: 'PentGuard',
-        meta: { title: '拦截中心', icon: 'lucide:shield-ban', hideInMenu: true },
       },
       {
         path: '/pent/hitl',

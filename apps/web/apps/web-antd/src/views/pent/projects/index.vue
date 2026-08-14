@@ -10,11 +10,13 @@ import {
   getPentProjects,
   updatePentProject,
 } from '#/api/pent';
+import { getPentProjectStats, type PentProjectStats } from '#/api/pent/ops-facts';
 
 import AttackPath from './modules/attack-path.vue';
 import FactsBoard from './modules/facts-board.vue';
 import ProjectAssets from './modules/project-assets.vue';
 import ProjectConversations from './modules/project-conversations.vue';
+import ProjectSettings from './modules/project-settings.vue';
 
 const router = useRouter();
 
@@ -23,6 +25,9 @@ const loading = ref(false);
 const projects = ref<any[]>([]);
 const searchText = ref('');
 const selectedId = ref<string | null>(null);
+const activeTab = ref('facts');
+const showArchived = ref(false);
+const stats = ref<PentProjectStats | null>(null);
 
 async function fetchProjects() {
   loading.value = true;
@@ -39,9 +44,13 @@ async function fetchProjects() {
 }
 
 const filteredProjects = computed(() => {
-  if (!searchText.value) return projects.value;
+  let list = projects.value;
+  if (!showArchived.value) {
+    list = list.filter((p) => p.status !== 'archived');
+  }
+  if (!searchText.value) return list;
   const q = searchText.value.toLowerCase();
-  return projects.value.filter(
+  return list.filter(
     (p) =>
       (p.name || '').toLowerCase().includes(q) ||
       (p.description || '').toLowerCase().includes(q),
@@ -194,7 +203,13 @@ watch(
   selectedId,
   (id) => {
     findings.value = [];
-    if (id) fetchFindings(id);
+    stats.value = null;
+    if (id) {
+      fetchFindings(id);
+      getPentProjectStats(id)
+        .then((s) => (stats.value = s))
+        .catch(() => {});
+    }
   },
 );
 
@@ -217,6 +232,9 @@ onMounted(fetchProjects);
         <a-button type="primary" block style="margin-bottom: 12px" @click="openCreate">
           新建项目
         </a-button>
+        <a-checkbox v-model:checked="showArchived" style="margin-bottom: 8px; font-size: 12px">
+          显示已归档
+        </a-checkbox>
         <a-spin :spinning="loading">
           <div style="max-height: calc(100vh - 260px); overflow-y: auto">
             <div
@@ -274,9 +292,20 @@ onMounted(fetchProjects);
               <a-tag :color="statusColor[current.status] || 'default'">
                 {{ statusLabel[current.status] || current.status || '—' }}
               </a-tag>
+              <template v-if="stats">
+                <a-tag color="blue">{{ stats.fact_count }} 事实</a-tag>
+                <a-tag color="orange">{{ stats.vuln_count }} 漏洞</a-tag>
+                <a-tag color="purple">{{ stats.conversation_count }} 对话</a-tag>
+              </template>
             </template>
             <template #extra>
-              <a-button @click="openEdit">编辑</a-button>
+              <a-button @click="router.push('/pent/findings')">漏洞管理</a-button>
+              <a-button
+                type="primary"
+                style="margin-left: 8px"
+                @click="activeTab = 'facts'"
+              >+ 新增事实</a-button>
+              <a-button style="margin-left: 8px" @click="openEdit">编辑</a-button>
               <a-popconfirm
                 title="确定删除该项目？"
                 ok-text="删除"
@@ -296,7 +325,19 @@ onMounted(fetchProjects);
           </a-page-header>
 
           <a-card size="small" style="margin-top: 16px">
-            <a-tabs>
+            <a-tabs v-model:activeKey="activeTab">
+              <a-tab-pane key="facts" tab="事实黑板">
+                <FactsBoard :project-id="current.id" />
+              </a-tab-pane>
+              <a-tab-pane key="paths" tab="攻击路径">
+                <AttackPath :project-id="current.id" />
+              </a-tab-pane>
+              <a-tab-pane key="assets" tab="资产库">
+                <ProjectAssets :project-id="current.id" />
+              </a-tab-pane>
+              <a-tab-pane key="chats" tab="关联对话">
+                <ProjectConversations :project-id="current.id" />
+              </a-tab-pane>
               <a-tab-pane key="findings" tab="关联漏洞">
                 <a-table
                   :columns="findingColumns"
@@ -328,33 +369,7 @@ onMounted(fetchProjects);
                 </a-table>
               </a-tab-pane>
               <a-tab-pane key="settings" tab="设置">
-                <a-form layout="vertical" :model="editForm" style="max-width: 480px">
-                  <a-form-item label="名称" required>
-                    <a-input v-model:value="editForm.name" placeholder="项目名称" />
-                  </a-form-item>
-                  <a-form-item label="描述">
-                    <a-textarea
-                      v-model:value="editForm.description"
-                      :rows="3"
-                      placeholder="项目描述"
-                    />
-                  </a-form-item>
-                  <a-form-item>
-                    <a-button type="primary" :loading="saving" @click="doUpdate">保存</a-button>
-                  </a-form-item>
-                </a-form>
-              </a-tab-pane>
-              <a-tab-pane key="facts" tab="事实黑板">
-                <FactsBoard :project-id="current.id" />
-              </a-tab-pane>
-              <a-tab-pane key="paths" tab="攻击路径">
-                <AttackPath :project-id="current.id" />
-              </a-tab-pane>
-              <a-tab-pane key="assets" tab="资产库">
-                <ProjectAssets :project-id="current.id" />
-              </a-tab-pane>
-              <a-tab-pane key="chats" tab="关联对话">
-                <ProjectConversations :project-id="current.id" />
+                <ProjectSettings :project="current" @saved="fetchProjects" />
               </a-tab-pane>
             </a-tabs>
           </a-card>

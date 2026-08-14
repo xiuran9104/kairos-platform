@@ -1,4 +1,6 @@
 <script lang="ts" setup>
+import type { Ref } from 'vue';
+
 import { Page } from '@vben/common-ui';
 import { getZoneList, createZone, updateZone, deleteZone } from '#/api/scan/zone';
 import { useCrudList } from '../composables/useCrudList';
@@ -6,7 +8,7 @@ import { useCrudList } from '../composables/useCrudList';
 interface Zone { id: string; name: string; cidr: string; priority: number; machine_room_name?: string; }
 
 const {
-  data, loading, modalVisible, editingId, searchText, form,
+  loading, modalVisible, editingId, searchText, form: crudForm,
   filtered, fetchData, openCreate, openEdit, handleSubmit, handleDelete,
 } = useCrudList<Zone>({
   api: {
@@ -18,6 +20,7 @@ const {
   defaultForm: () => ({ id: '', name: '', cidr: '', priority: 50 }),
   searchKeys: ['name', 'cidr'],
 });
+const form = crudForm as Ref<Zone>;
 
 const columns = [
   { title: '名称', dataIndex: 'name' },

@@ -49,6 +49,29 @@ const categories = [
   'company',
   'supplychain',
 ];
+const categoryLabel: Record<string, string> = {
+  auth: '认证',
+  business: '业务',
+  chain: '关系链',
+  company: '企业',
+  exploit: '利用',
+  finding: '发现',
+  infra: '基础设施',
+  note: '备注',
+  poc: '验证',
+  supplychain: '供应链',
+  target: '目标',
+};
+const categoryColor: Record<string, string> = {
+  auth: 'purple',
+  business: 'cyan',
+  company: 'geekblue',
+  exploit: 'volcano',
+  finding: 'red',
+  infra: 'blue',
+  supplychain: 'orange',
+  target: 'green',
+};
 const confidenceColor: Record<string, string> = {
   confirmed: 'green',
   tentative: 'orange',
@@ -172,6 +195,16 @@ async function toggleDeprecate(f: PentFact) {
   }
 }
 
+async function confirmFact(f: PentFact) {
+  try {
+    await updatePentFact(f.id, { confidence: 'confirmed' });
+    message.success('事实已确认');
+    await refresh();
+  } catch {
+    message.error('确认失败');
+  }
+}
+
 async function doDelete(f: PentFact) {
   try {
     await deletePentFact(f.id);
@@ -260,7 +293,14 @@ onMounted(refresh);
           </span>
         </template>
         <template v-else-if="column.key === 'category'">
-          <a-tag size="small">{{ record.category }}</a-tag>
+          <a-tag size="small" :color="categoryColor[record.category]">
+            {{ categoryLabel[record.category] || record.category }}
+          </a-tag>
+        </template>
+        <template v-else-if="column.key === 'summary'">
+          <a style="color: var(--ant-color-text)" @click="openDetail(record)">
+            {{ record.summary }}
+          </a>
         </template>
         <template v-else-if="column.key === 'confidence'">
           <a-tag size="small" :color="confidenceColor[record.confidence] || 'default'">
@@ -274,6 +314,12 @@ onMounted(refresh);
           <a-space :size="4">
             <a-button size="small" type="link" @click="openDetail(record)">详情</a-button>
             <a-button size="small" type="link" @click="openEdit(record)">编辑</a-button>
+            <a-button
+              v-if="record.confidence === 'tentative' && !record.deprecated"
+              size="small"
+              type="link"
+              @click="confirmFact(record)"
+            >确认</a-button>
             <a-button size="small" type="link" @click="toggleDeprecate(record)">
               {{ record.deprecated ? '恢复' : '废弃' }}
             </a-button>

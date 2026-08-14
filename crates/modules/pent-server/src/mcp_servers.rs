@@ -317,6 +317,8 @@ async fn start_server(
         args: serde_json::from_value(row["args"].clone()).unwrap_or_default(),
         env: serde_json::from_value(row["env"].clone()).unwrap_or_default(),
         auto_start: true,
+        url: None,
+        headers: Default::default(),
     };
     registry
         .add_server(config)

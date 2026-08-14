@@ -225,23 +225,13 @@ impl HitlGate {
             None => sqlx::query_scalar("SELECT COALESCE(NULLIF(s.constraints->>'model_id','')::bigint,(SELECT id FROM ai.model_configs WHERE type='chat' AND status=0 ORDER BY id LIMIT 1)) FROM pent_agent_sessions s WHERE s.id=$1")
                 .bind(session_id).fetch_one(&self.pool).await?,
         };
-        let system = if policy.audit_system_prompt.trim().is_empty() {
-            DEFAULT_AUDIT_SYSTEM
-        } else {
-            &policy.audit_system_prompt
+        let custom_prompt = match policy.mode {
+            HitlMode::Approval => policy.audit_system_prompt.trim(),
+            HitlMode::ReviewEdit => policy.audit_user_prompt.trim(),
         };
-        let user = if policy.audit_user_prompt.trim().is_empty() {
-            format!(
-                "工具名称：{name}\n参数：{args}\n模式：{}",
-                policy.mode.as_str()
-            )
-        } else {
-            policy
-                .audit_user_prompt
-                .replace("{{tool_name}}", name)
-                .replace("{{arguments}}", args)
-                .replace("{{mode}}", policy.mode.as_str())
-        };
+        let system = if custom_prompt.is_empty() { default_audit_system(policy.mode) } else { custom_prompt };
+        let parsed_arguments = serde_json::from_str::<Value>(args).unwrap_or_else(|_| Value::String(args.into()));
+        let user = json!({"hitlMode":policy.mode.as_str(),"toolName":name,"arguments":args,"argumentsObj":parsed_arguments}).to_string();
         let response = AiModelFactory::new(self.pool.clone())
             .chat(
                 model_id,
@@ -307,9 +297,52 @@ struct AuditDecision {
     comment: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default, rename = "editedArguments")]
+    edited_arguments: Option<Value>,
 }
 
-const DEFAULT_AUDIT_SYSTEM: &str = "你是渗透测试工具调用的独立审计 Agent。检查目标范围、破坏性、参数和必要性。只输出 JSON：{\"decision\":\"approve|reject\",\"comment\":\"说明\",\"arguments\":\"可选的 JSON 参数字符串\"}。review_edit 模式可修订参数；approval 模式不得修订。";
+const DEFAULT_AUDIT_APPROVAL_SYSTEM: &str = r#"你是 DesRedTeam AI围栏审计 Agent。审查 Agent 即将执行的工具调用是否会对系统造成实质性损害。
+
+你会收到 JSON，包含 hitlMode、toolName、arguments/argumentsObj、userMessage、thinking、reasoningChain、planning 等字段。
+
+裁决基调（默认放行）：
+- 常规、低风险的渗透测试操作 → approve（如信息收集、端口/服务扫描、目录枚举、只读查询、无害探测命令）
+- 与用户授权、当前任务目标一致，且未见明确高危迹象 → approve
+- 仅在「可能对系统造成实质影响」时 → reject
+
+必须 reject 的高危情形（示例，非穷举）：
+- 删库、清表、批量删除数据、格式化磁盘、不可逆破坏
+- 修改/重置密码、创建或篡改管理员账号、持久化后门、开机自启
+- 向生产环境写入恶意载荷、勒索加密、停止关键服务、修改系统核心配置
+- 明显越权：与任务/授权目标无关的破坏性操作
+
+不应单独作为 reject 理由的情形：
+- 常规 nmap/curl/grep/读文件/枚举类命令本身
+- 参数略显宽泛但无明确破坏意图（审查编辑模式可收窄参数后 approve）
+- 仅因「信息不足」——若无上述高危迹象，应 approve 并可在 comment 中提示注意点
+
+仅输出一行 JSON，不要 markdown 代码块：
+{"decision":"approve"|"reject","comment":"简要理由"}"#;
+
+const DEFAULT_AUDIT_REVIEW_EDIT_SYSTEM: &str = r#"你是 DesRedTeam AI围栏审计 Agent。审查 Agent 即将执行的工具调用是否会对系统造成实质性损害。
+
+裁决基调为默认放行。常规信息收集、扫描、枚举、只读查询和无害探测应 approve；仅在删库清表、不可逆破坏、账号或权限篡改、持久化后门、停止关键服务、恶意载荷或明显越权等可能造成实质影响的情形 reject。信息不足不能单独作为 reject 理由。
+
+仅输出一行 JSON，不要 markdown 代码块：
+{"decision":"approve"|"reject","comment":"简要理由","editedArguments":{...}}
+
+editedArguments 规则（仅 approve 且需要改参时填写，否则省略该字段）：
+- 提供完整替换后的工具参数对象，键名与 argumentsObj 一致
+- 只做最小必要修改以收窄范围、消除风险（如限制 path、去掉危险 flag）
+- 禁止扩大攻击面：不得扩大目标范围、提升权限或引入破坏性参数
+- 无法安全改参时应 reject，不要勉强 approve"#;
+
+fn default_audit_system(mode: HitlMode) -> &'static str {
+    match mode {
+        HitlMode::Approval => DEFAULT_AUDIT_APPROVAL_SYSTEM,
+        HitlMode::ReviewEdit => DEFAULT_AUDIT_REVIEW_EDIT_SYSTEM,
+    }
+}
 
 fn parse_audit_decision(content: &str, mode: HitlMode) -> anyhow::Result<AuditDecision> {
     let trimmed = content
@@ -319,6 +352,9 @@ fn parse_audit_decision(content: &str, mode: HitlMode) -> anyhow::Result<AuditDe
         .trim_end_matches("```")
         .trim();
     let mut value: AuditDecision = serde_json::from_str(trimmed)?;
+    if value.arguments.is_none() {
+        value.arguments = value.edited_arguments.take().map(|arguments| arguments.to_string());
+    }
     value.decision = value.decision.trim().to_ascii_lowercase();
     if !matches!(value.decision.as_str(), "approve" | "reject") {
         anyhow::bail!("invalid audit decision")

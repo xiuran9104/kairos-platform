@@ -29,7 +29,7 @@ async fn get_settings(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant = security::tenant_id(&user)?;
-    let value = sqlx::query_scalar::<_, Value>("SELECT to_jsonb(p) || jsonb_build_object('inherited',p.tenant_id<>$1) FROM pent_runtime_policies p WHERE tenant_id IN ($1,0) ORDER BY (tenant_id=$1) DESC LIMIT 1")
+    let value = sqlx::query_scalar::<_, Value>("SELECT to_jsonb(p) || jsonb_build_object('inherited',p.tenant_id<>$1,'retention_days',COALESCE((p.agent_config->>'hitl_retention_days')::int,90)) FROM pent_runtime_policies p WHERE tenant_id IN ($1,0) ORDER BY (tenant_id=$1) DESC LIMIT 1")
         .bind(tenant).fetch_optional(&s.pool).await.map_err(internal)?
         .unwrap_or_else(|| json!({"hitl_enabled":false,"hitl_mode":"approval","hitl_reviewer":"human","hitl_tool_whitelist":[],"approval_ttl_seconds":1800,"inherited":true}));
     Ok(Json(ApiResponse::new(value)))
@@ -49,18 +49,20 @@ async fn update_settings(
         .cloned()
         .unwrap_or_else(|| json!([]));
     let ttl = body["approval_ttl_seconds"].as_i64().unwrap_or(1800);
+    let retention_days = body["retention_days"].as_i64().unwrap_or(90);
     if !matches!(mode, "approval" | "review_edit")
         || !matches!(reviewer, "human" | "audit_agent")
         || !whitelist.is_array()
         || !(60..=86400).contains(&ttl)
+        || !(0..=3650).contains(&retention_days)
     {
         return Err(AppError::bad_request("AI 围栏配置无效"));
     }
     let audit_model = body["hitl_audit_model_id"].as_i64();
     let system_prompt = body["hitl_audit_system_prompt"].as_str().unwrap_or("");
     let user_prompt = body["hitl_audit_user_prompt"].as_str().unwrap_or("");
-    sqlx::query("INSERT INTO pent_runtime_policies(tenant_id,hitl_enabled,hitl_mode,hitl_reviewer,hitl_tool_whitelist,hitl_audit_model_id,hitl_audit_system_prompt,hitl_audit_user_prompt,approval_ttl_seconds,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(tenant_id) DO UPDATE SET hitl_enabled=EXCLUDED.hitl_enabled,hitl_mode=EXCLUDED.hitl_mode,hitl_reviewer=EXCLUDED.hitl_reviewer,hitl_tool_whitelist=EXCLUDED.hitl_tool_whitelist,hitl_audit_model_id=EXCLUDED.hitl_audit_model_id,hitl_audit_system_prompt=EXCLUDED.hitl_audit_system_prompt,hitl_audit_user_prompt=EXCLUDED.hitl_audit_user_prompt,approval_ttl_seconds=EXCLUDED.approval_ttl_seconds,updated_by=EXCLUDED.updated_by,updated_at=now()")
-        .bind(tenant).bind(enabled).bind(mode).bind(reviewer).bind(whitelist).bind(audit_model).bind(system_prompt).bind(user_prompt).bind(ttl as i32).bind(&user.user_id)
+    sqlx::query("INSERT INTO pent_runtime_policies(tenant_id,hitl_enabled,hitl_mode,hitl_reviewer,hitl_tool_whitelist,hitl_audit_model_id,hitl_audit_system_prompt,hitl_audit_user_prompt,approval_ttl_seconds,agent_config,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,jsonb_build_object('hitl_retention_days',$10),$11) ON CONFLICT(tenant_id) DO UPDATE SET hitl_enabled=EXCLUDED.hitl_enabled,hitl_mode=EXCLUDED.hitl_mode,hitl_reviewer=EXCLUDED.hitl_reviewer,hitl_tool_whitelist=EXCLUDED.hitl_tool_whitelist,hitl_audit_model_id=EXCLUDED.hitl_audit_model_id,hitl_audit_system_prompt=EXCLUDED.hitl_audit_system_prompt,hitl_audit_user_prompt=EXCLUDED.hitl_audit_user_prompt,approval_ttl_seconds=EXCLUDED.approval_ttl_seconds,agent_config=pent_runtime_policies.agent_config || jsonb_build_object('hitl_retention_days',$10),updated_by=EXCLUDED.updated_by,updated_at=now()")
+        .bind(tenant).bind(enabled).bind(mode).bind(reviewer).bind(whitelist).bind(audit_model).bind(system_prompt).bind(user_prompt).bind(ttl as i32).bind(retention_days as i32).bind(&user.user_id)
         .execute(&s.pool).await.map_err(internal)?;
     Ok(Json(ApiResponse::new(
         json!({"message":"AI 围栏设置已保存"}),
@@ -79,6 +81,8 @@ async fn list_approvals(
     Query(q): Query<ApprovalQuery>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant = security::tenant_id(&user)?;
+    sqlx::query("DELETE FROM pent_approvals a USING pent_runs r WHERE a.run_id=r.id AND r.tenant_id=$1 AND a.status<>'pending' AND COALESCE((SELECT (p.agent_config->>'hitl_retention_days')::int FROM pent_runtime_policies p WHERE p.tenant_id IN ($1,0) ORDER BY (p.tenant_id=$1) DESC LIMIT 1),90)>0 AND a.updated_at < now() - make_interval(days=>COALESCE((SELECT (p.agent_config->>'hitl_retention_days')::int FROM pent_runtime_policies p WHERE p.tenant_id IN ($1,0) ORDER BY (p.tenant_id=$1) DESC LIMIT 1),90))")
+        .bind(tenant).execute(&s.pool).await.map_err(internal)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let rows = sqlx::query_scalar::<_, Value>("SELECT to_jsonb(a) FROM pent_approvals a JOIN pent_runs r ON r.id=a.run_id WHERE r.tenant_id=$1 AND ($2::text IS NULL OR a.status=$2) ORDER BY a.created_at DESC LIMIT $3")
         .bind(tenant).bind(q.status).bind(limit).fetch_all(&s.pool).await.map_err(internal)?;

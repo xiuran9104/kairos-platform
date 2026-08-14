@@ -1,7 +1,7 @@
 //! Project fact blackboard / attack path — `pent_facts` + `pent_fact_edges`
 //! CRUD, project statistics, fact graph and session-project binding.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
@@ -22,6 +22,7 @@ pub fn routes() -> Router<PentState> {
         .route("/pent/projects/{id}/stats", get(project_stats))
         .route("/pent/projects/{id}/facts", get(list_facts).post(create_fact))
         .route("/pent/projects/{id}/fact-graph", get(fact_graph))
+        .route("/pent/projects/{id}/attack-graph", get(project_attack_graph))
         .route(
             "/pent/projects/{id}/conversations",
             get(project_conversations),
@@ -38,6 +39,169 @@ pub fn routes() -> Router<PentState> {
             "/pent/conversations/{id}/project",
             put(bind_conversation_project),
         )
+}
+
+async fn project_attack_graph(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    ensure_project_access(&s.pool, &id, &user).await?;
+
+    let assets = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'id', id, 'name', COALESCE(host, domain, ip, target),
+             'target', target, 'host', host, 'ip', ip, 'domain', domain,
+             'risk_level', risk_level, 'kind', 'asset'
+         ) FROM pent_assets
+         WHERE tenant_id=$1 AND project_id=$2 AND status='active'
+         ORDER BY updated_at DESC LIMIT 200",
+    )
+    .bind(tenant_id)
+    .bind(&id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+
+    let findings = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'id', id, 'name', title, 'target', target, 'severity', severity,
+             'status', status, 'confidence', confidence, 'kind', 'vulnerability',
+             'evidence_ids', evidence_ids
+         ) FROM pent_findings
+         WHERE project_id=$1
+         ORDER BY created_at DESC LIMIT 200",
+    )
+    .bind(&id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+
+    let facts = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'id', id, 'fact_key', fact_key, 'name', summary, 'kind',
+             CASE category
+               WHEN 'auth' THEN 'credential'
+               WHEN 'exploit' THEN 'exploit'
+               WHEN 'poc' THEN 'exploit'
+               WHEN 'finding' THEN 'vulnerability'
+               ELSE 'context'
+             END,
+             'category', category, 'confidence', confidence, 'vuln_id', vuln_id
+         ) FROM pent_facts
+         WHERE tenant_id=$1 AND project_id=$2 AND deprecated=false
+           AND category IN ('target','auth','infra','finding','chain','exploit','poc')
+         ORDER BY pinned DESC, updated_at DESC LIMIT 200",
+    )
+    .bind(tenant_id)
+    .bind(&id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+
+    let fact_edges = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'id', id, 'source', source_fact_key, 'target', target_fact_key,
+             'kind', edge_type, 'label', edge_type
+         ) FROM pent_fact_edges WHERE tenant_id=$1 AND project_id=$2",
+    )
+    .bind(tenant_id)
+    .bind(&id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut asset_lookup: HashMap<String, String> = HashMap::new();
+    for asset in assets {
+        let asset_id = format!("asset:{}", asset["id"].as_str().unwrap_or_default());
+        for field in ["target", "host", "ip", "domain"] {
+            if let Some(value) = asset[field].as_str().filter(|value| !value.is_empty()) {
+                asset_lookup.insert(value.to_lowercase(), asset_id.clone());
+            }
+        }
+        let mut node = asset;
+        node["id"] = json!(asset_id);
+        nodes.push(node);
+    }
+
+    for finding in findings {
+        let finding_id = format!("finding:{}", finding["id"].as_str().unwrap_or_default());
+        let target = finding["target"].as_str().unwrap_or_default();
+        let source = asset_lookup
+            .iter()
+            .find(|(value, _)| !value.is_empty() && target.to_lowercase().contains(value.as_str()))
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| {
+                let target_id = format!("target:{}", target);
+                if !nodes.iter().any(|node| node["id"] == target_id) {
+                    nodes.push(json!({
+                        "id": target_id,
+                        "name": if target.is_empty() { "未知目标" } else { target },
+                        "kind": "asset",
+                        "risk_level": finding["severity"]
+                    }));
+                }
+                target_id
+            });
+        edges.push(json!({
+            "id": format!("asset-finding:{finding_id}"),
+            "source": source,
+            "target": finding_id,
+            "kind": "exposes",
+            "label": "发现漏洞"
+        }));
+        let mut node = finding;
+        node["id"] = json!(finding_id);
+        nodes.push(node);
+    }
+
+    let mut fact_ids = HashMap::new();
+    for fact in facts {
+        let fact_key = fact["fact_key"].as_str().unwrap_or_default().to_owned();
+        let fact_id = format!("fact:{}", fact["id"].as_str().unwrap_or_default());
+        fact_ids.insert(fact_key, fact_id.clone());
+        if let Some(vuln_id) = fact["vuln_id"].as_str().filter(|value| !value.is_empty()) {
+            edges.push(json!({
+                "id": format!("finding-fact:{vuln_id}:{fact_id}"),
+                "source": format!("finding:{vuln_id}"),
+                "target": fact_id,
+                "kind": "supports",
+                "label": "证据/利用"
+            }));
+        }
+        let mut node = fact;
+        node["id"] = json!(fact_id);
+        nodes.push(node);
+    }
+    for edge in fact_edges {
+        let Some(source) = edge["source"].as_str().and_then(|key| fact_ids.get(key)) else {
+            continue;
+        };
+        let Some(target) = edge["target"].as_str().and_then(|key| fact_ids.get(key)) else {
+            continue;
+        };
+        edges.push(json!({
+            "id": edge["id"],
+            "source": source,
+            "target": target,
+            "kind": edge["kind"],
+            "label": edge["label"]
+        }));
+    }
+
+    Ok(Json(ApiResponse::new(json!({
+        "nodes": nodes,
+        "edges": edges,
+        "summary": {
+            "assets": nodes.iter().filter(|node| node["kind"] == "asset").count(),
+            "vulnerabilities": nodes.iter().filter(|node| node["kind"] == "vulnerability").count(),
+            "credentials": nodes.iter().filter(|node| node["kind"] == "credential").count(),
+            "exploits": nodes.iter().filter(|node| node["kind"] == "exploit").count()
+        }
+    }))))
 }
 
 fn str_field<'a>(item: &'a Value, key: &str) -> Option<&'a str> {

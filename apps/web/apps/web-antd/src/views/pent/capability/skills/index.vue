@@ -9,6 +9,7 @@ import {
   getPentSkill,
   getPentSkills,
   updatePentSkill,
+  updatePentSkillStatus,
 } from '#/api/pent';
 
 // ── list state ─────────────────────────────────────────────────────────────
@@ -96,6 +97,30 @@ const statusLabel: Record<string, string> = {
   published: '已发布',
   disabled: '已停用',
 };
+
+// ── 生命周期流转（draft → reviewed → published → disabled）────────────────
+const TRANSITIONS: Record<string, { label: string; danger?: boolean; to: string }[]> = {
+  draft: [{ label: '审核通过', to: 'reviewed' }],
+  reviewed: [{ label: '发布', to: 'published' }, { label: '退回草稿', to: 'draft' }],
+  published: [{ label: '停用', danger: true, to: 'disabled' }],
+  disabled: [{ label: '退回草稿', to: 'draft' }],
+};
+
+const transitioning = ref<null | string>(null);
+
+async function doTransition(s: PentSkill, to: string) {
+  if (transitioning.value) return;
+  transitioning.value = s.id;
+  try {
+    await updatePentSkillStatus(s.id, to);
+    message.success('状态已更新');
+    s.status = to;
+  } catch {
+    message.error('状态流转失败');
+  } finally {
+    transitioning.value = null;
+  }
+}
 
 // ── view modal ─────────────────────────────────────────────────────────────
 const showView = ref(false);
@@ -275,6 +300,16 @@ onMounted(fetchSkills);
             <div style="flex-shrink: 0; display: flex; align-items: flex-start; gap: 8px">
               <a-button size="small" @click="openView(s)">查看</a-button>
               <a-button size="small" @click="openEdit(s)">编辑</a-button>
+              <a-button
+                v-for="tr in TRANSITIONS[s.status] || []"
+                :key="tr.to"
+                size="small"
+                :danger="tr.danger"
+                :loading="transitioning === s.id"
+                @click="doTransition(s, tr.to)"
+              >
+                {{ tr.label }}
+              </a-button>
             </div>
           </div>
         </a-card>

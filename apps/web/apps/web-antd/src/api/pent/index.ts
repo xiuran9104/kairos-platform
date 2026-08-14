@@ -14,6 +14,7 @@ export * from './workspace';
 export * from './capability-mcp';
 export * from './capability-skills';
 export * from './ops-assets';
+export * from './ops-attack-graph';
 export * from './ops-facts';
 export * from './ops-workflows';
 export * from './ops-files';
@@ -90,6 +91,28 @@ export function streamPentRunEvents(
   const accessStore = useAccessStore();
   const token = accessStore.accessToken;
   return fetchEventSource(`${apiURL}/pent/runs/${runId}/events/stream`, {
+    method: 'get',
+    headers: { Authorization: `Bearer ${token}` },
+    openWhenHidden: true,
+    onmessage: onMessage,
+    onerror: onError,
+    onclose: onClose,
+    signal: ctrl.signal,
+  });
+}
+
+/** Stream turn replies via SSE with proper Authorization header (no token in URL). */
+export function streamPentTurn(
+  turnId: string,
+  ctrl: AbortController,
+  onMessage: (event: any) => void,
+  onError: (err: any) => void,
+  onClose: () => void,
+) {
+  const { apiURL } = useAppConfig(import.meta.env, import.meta.env.PROD);
+  const accessStore = useAccessStore();
+  const token = accessStore.accessToken;
+  return fetchEventSource(`${apiURL}/pent/turns/${turnId}/stream`, {
     method: 'get',
     headers: { Authorization: `Bearer ${token}` },
     openWhenHidden: true,

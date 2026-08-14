@@ -6,14 +6,15 @@
 use axum::{
     Json, Router,
     http::StatusCode,
-    routing::{get, post},
+    extract::State,
+    routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
 use serde_json::{Value, json};
 
-use crate::{ApiResponse, PentState, security};
+use crate::{ApiResponse, PentState, infrastructure::secrets, security};
 
 const DEFAULT_FIELDS: [&str; 10] = [
     "host", "ip", "port", "domain", "title", "protocol", "country", "province", "city", "server",
@@ -24,6 +25,7 @@ pub fn routes() -> Router<PentState> {
     Router::new()
         .route("/pent/infocollect/search", post(search))
         .route("/pent/infocollect/providers", get(providers))
+        .route("/pent/infocollect/config", get(get_config).put(update_config))
 }
 
 fn clamp_size(size: Option<i64>) -> i64 {
@@ -53,21 +55,74 @@ fn fofa_rows_to_objects(fields: &[String], rows: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-async fn providers(user: CurrentUser) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let _tenant_id = security::tenant_id(&user)?;
+async fn stored_config(pool: &sqlx::PgPool, tenant_id: i64) -> Result<Value, AppError> {
+    Ok(sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT agent_config->'infocollect_providers' FROM pent_runtime_policies
+         WHERE tenant_id IN ($1,0) ORDER BY (tenant_id=$1) DESC LIMIT 1",
+    ).bind(tenant_id).fetch_optional(pool).await
+      .map_err(|e| AppError::internal(e.to_string()))?.flatten().unwrap_or_else(|| json!({})))
+}
+
+fn provider_secret(config: &Value, provider: &str, field: &str, env: &str) -> Option<String> {
+    config[provider][field].as_str().filter(|v| !v.is_empty())
+        .and_then(|v| secrets::decrypt_api_key(v).ok())
+        .or_else(|| std::env::var(env).ok().filter(|v| !v.is_empty()))
+}
+
+fn fofa_key(config: &Value) -> Option<String> {
+    provider_secret(config, "fofa", "api_key", "FOFA_API_KEY")
+        .or_else(|| std::env::var("FOFA_KEY").ok().filter(|v| !v.is_empty()))
+}
+
+async fn providers(State(s): State<PentState>, user: CurrentUser) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let config = stored_config(&s.pool, tenant_id).await?;
     Ok(Json(ApiResponse::new(json!([
-        {"id": "fofa", "name": "FOFA", "configured": env_configured("FOFA_EMAIL") && env_configured("FOFA_KEY")},
-        {"id": "quake", "name": "Quake", "configured": env_configured("QUAKE_KEY")},
-        {"id": "zoomeye", "name": "ZoomEye", "configured": false},
-        {"id": "shodan", "name": "Shodan", "configured": false},
+        {"id": "fofa", "name": "FOFA", "configured": fofa_key(&config).is_some()},
+        {"id": "quake", "name": "Quake", "configured": provider_secret(&config,"quake","api_key","QUAKE_KEY").is_some()},
+        {"id": "zoomeye", "name": "ZoomEye", "configured": provider_secret(&config,"zoomeye","api_key","ZOOMEYE_API_KEY").is_some()},
+        {"id": "shodan", "name": "Shodan", "configured": provider_secret(&config,"shodan","api_key","SHODAN_API_KEY").is_some()},
     ]))))
 }
 
+async fn get_config(State(s): State<PentState>, user: CurrentUser) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let stored = stored_config(&s.pool, tenant_id).await?;
+    let defaults = [("fofa","https://fofa.info/api/v1/search/all"),("zoomeye","https://api.zoomeye.org/v2/search"),("quake","https://quake.360.net/api/v3/search/quake_service"),("shodan","https://api.shodan.io")];
+    let rows: Vec<Value> = defaults.into_iter().map(|(id,url)| json!({
+        "id":id,"enabled":stored[id]["enabled"].as_bool().unwrap_or(true),
+        "base_url":stored[id]["base_url"].as_str().unwrap_or(url),
+        "configured":stored[id]["api_key"].as_str().is_some_and(|v| !v.is_empty()) || match id {"fofa"=>env_configured("FOFA_API_KEY") || env_configured("FOFA_KEY"),"quake"=>env_configured("QUAKE_KEY"),"zoomeye"=>env_configured("ZOOMEYE_API_KEY"),_=>env_configured("SHODAN_API_KEY")}
+    })).collect();
+    Ok(Json(ApiResponse::new(Value::Array(rows))))
+}
+
+async fn update_config(State(s): State<PentState>, user: CurrentUser, Json(body): Json<Value>) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let providers = body["providers"].as_array().ok_or_else(|| AppError::bad_request("providers 必须是数组"))?;
+    let old = stored_config(&s.pool, tenant_id).await?;
+    let mut saved = serde_json::Map::new();
+    for item in providers {
+        let id = item["id"].as_str().filter(|v| matches!(*v,"fofa"|"zoomeye"|"quake"|"shodan")).ok_or_else(|| AppError::bad_request("不支持的数据源"))?;
+        let base_url = item["base_url"].as_str().unwrap_or("");
+        if !base_url.starts_with("https://") { return Err(AppError::bad_request("Base URL 必须使用 HTTPS")); }
+        let new_key = item["api_key"].as_str().unwrap_or("");
+        let api_key = if new_key.is_empty() { old[id]["api_key"].clone() } else { Value::String(secrets::encrypt_api_key(new_key)) };
+        saved.insert(id.to_string(), json!({"enabled":item["enabled"].as_bool().unwrap_or(true),"base_url":base_url,"api_key":api_key}));
+    }
+    let config = Value::Object(saved);
+    sqlx::query("INSERT INTO pent_runtime_policies(tenant_id,agent_config,updated_by) VALUES($1,jsonb_build_object('infocollect_providers',$2),$3) ON CONFLICT(tenant_id) DO UPDATE SET agent_config=pent_runtime_policies.agent_config || jsonb_build_object('infocollect_providers',$2),updated_by=$3,updated_at=now()")
+        .bind(tenant_id).bind(&config).bind(&user.user_id).execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+    get_config(State(s), user).await
+}
+
 async fn search(
+    State(s): State<PentState>,
     user: CurrentUser,
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let _tenant_id = security::tenant_id(&user)?;
+    let tenant_id = security::tenant_id(&user)?;
+    let config = stored_config(&s.pool, tenant_id).await?;
     let provider = body["provider"]
         .as_str()
         .filter(|v| !v.is_empty())
@@ -93,8 +148,8 @@ async fn search(
         .unwrap_or_else(|| DEFAULT_FIELDS.iter().map(|field| field.to_string()).collect());
 
     match provider {
-        "fofa" => search_fofa(query, &fields, size, page, full).await,
-        "quake" => search_quake(query, &fields, size, page, full).await,
+        "fofa" => search_fofa(&config, query, &fields, size, page, full).await,
+        "quake" => search_quake(&config, query, &fields, size, page, full).await,
         _ => Err(AppError::bad_request("暂未接入该数据源")),
     }
 }
@@ -111,21 +166,20 @@ fn bad_gateway(message: impl Into<String>) -> AppError {
 }
 
 async fn search_fofa(
+    config: &Value,
     query: &str,
     fields: &[String],
     size: i64,
     page: i64,
     full: bool,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let email = std::env::var("FOFA_EMAIL").ok().filter(|v| !v.is_empty());
-    let key = std::env::var("FOFA_KEY").ok().filter(|v| !v.is_empty());
-    let (Some(email), Some(key)) = (email, key) else {
-        return Err(AppError::bad_request("未配置 FOFA 凭据（FOFA_EMAIL/FOFA_KEY）"));
+    let key = fofa_key(config);
+    let Some(key) = key else {
+        return Err(AppError::bad_request("未配置 FOFA API Key"));
     };
     let payload: Value = http_client()?
-        .get("https://fofa.info/api/v1/search/all")
+        .get(config["fofa"]["base_url"].as_str().unwrap_or("https://fofa.info/api/v1/search/all"))
         .query(&[
-            ("email", email),
             ("key", key),
             ("qbase64", BASE64.encode(query)),
             ("size", size.to_string()),
@@ -159,18 +213,19 @@ async fn search_fofa(
 }
 
 async fn search_quake(
+    config: &Value,
     query: &str,
     fields: &[String],
     size: i64,
     page: i64,
     full: bool,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let key = std::env::var("QUAKE_KEY").ok().filter(|v| !v.is_empty());
+    let key = provider_secret(config, "quake", "api_key", "QUAKE_KEY");
     let Some(key) = key else {
         return Err(AppError::bad_request("未配置 Quake 凭据（QUAKE_KEY）"));
     };
     let payload: Value = http_client()?
-        .post("https://quake.360.net/api/v3/search/quake_service")
+        .post(config["quake"]["base_url"].as_str().unwrap_or("https://quake.360.net/api/v3/search/quake_service"))
         .header("X-QuakeToken", key)
         .json(&json!({
             "query": query,

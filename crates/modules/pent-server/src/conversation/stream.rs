@@ -66,21 +66,25 @@ pub fn turn_sse(
             _ => {}
         }
 
-        // Poll for new messages (including intermediate tool messages)
-        let messages: Vec<(String, String, String, String, i32)> = sqlx::query_as(
+        // Read one message at a time. Advancing the cursor past an entire batch
+        // while emitting only its last row would silently drop intermediate
+        // assistant/tool events.
+        let message: Option<(String, String, String, String, i32)> = sqlx::query_as(
             "SELECT id, role, content, format, sequence
              FROM pent_conversation_messages
              WHERE turn_id=$1 AND sequence > $2
-             ORDER BY sequence ASC",
+             ORDER BY sequence ASC
+             LIMIT 1",
         )
         .bind(&state.turn_id)
         .bind(state.last_sequence)
-        .fetch_all(&state.pool)
+        .fetch_optional(&state.pool)
         .await
-        .unwrap_or_default();
+        .ok()
+        .flatten();
 
-        if let Some((_id, role, content, format, seq)) = messages.last() {
-            state.last_sequence = *seq;
+        if let Some((_id, role, content, format, seq)) = message {
+            state.last_sequence = seq;
 
             // Determine event type from role and format
             let event_type = match (role.as_str(), format.as_str()) {

@@ -3,11 +3,24 @@
 
 use super::client::McpClient;
 use super::protocol::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+/// Process-wide shared registry, initialized on first use.
+static SHARED: OnceLock<Arc<McpRegistry>> = OnceLock::new();
+
+/// Get or lazily initialize the shared registry.
+pub async fn shared() -> Arc<McpRegistry> {
+    if let Some(registry) = SHARED.get() {
+        return registry.clone();
+    }
+    let registry = Arc::new(McpRegistry::init().await);
+    let _ = SHARED.set(registry.clone());
+    registry
+}
 
 /// Load MCP server configs from the environment.
 pub fn load_configs() -> Vec<McpServerConfig> {
@@ -145,5 +158,39 @@ impl McpRegistry {
     /// Number of connected servers.
     pub async fn server_count(&self) -> usize {
         self.servers.read().await.len()
+    }
+
+    /// Connect and register a server at runtime (used by MCP 管理 start).
+    pub async fn add_server(&self, config: McpServerConfig) -> anyhow::Result<()> {
+        let entry = Self::connect(&config).await?;
+        self.servers
+            .write()
+            .await
+            .insert(config.id.clone(), Arc::new(entry));
+        info!(server_id = %config.id, "MCP server added at runtime");
+        Ok(())
+    }
+
+    /// Remove a server from the registry (drops the client connection).
+    pub async fn remove_server(&self, server_id: &str) {
+        if self.servers.write().await.remove(server_id).is_some() {
+            info!(server_id, "MCP server removed");
+        }
+    }
+
+    /// Runtime status snapshot for every registered server.
+    pub async fn snapshot(&self) -> Vec<Value> {
+        let servers = self.servers.read().await;
+        let mut result = Vec::with_capacity(servers.len());
+        for (server_id, entry) in servers.iter() {
+            let alive = entry.client.is_alive().await;
+            result.push(json!({
+                "server_id": server_id,
+                "status": if alive { "connected" } else { "error" },
+                "tool_count": entry.tools.len(),
+                "error": Value::Null,
+            }));
+        }
+        result
     }
 }
