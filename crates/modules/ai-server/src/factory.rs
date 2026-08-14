@@ -226,6 +226,61 @@ impl AiModelFactory {
             .await
             .map_err(AppError::bad_request)
     }
+    /// Vision analysis: send an image (data URL) plus a text prompt to a
+    /// vision-capable chat model, returning a text summary only. Used by the
+    /// Pent vision adapter so image bytes never pollute the agent context.
+    pub async fn vision(
+        &self,
+        id: i64,
+        image_data_url: &str,
+        prompt: &str,
+    ) -> Result<String, AppError> {
+        let config = self.typed(id, AiModelType::Chat).await?;
+        let platform = AiPlatform::parse(&config.platform)
+            .ok_or_else(|| AppError::bad_request("unsupported AI platform"))?;
+        let body = serde_json::json!({
+            "model": config.model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}}
+                ]
+            }],
+            "temperature": 0.2,
+            "max_tokens": 1024
+        });
+        let value = match platform {
+            AiPlatform::AzureOpenAI => {
+                let version = config
+                    .config
+                    .get("apiVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("2024-10-21");
+                let mut azure = config.clone();
+                azure.url = format!(
+                    "{}/openai/deployments/{}",
+                    config.url.trim_end_matches('/'),
+                    config.model
+                );
+                azure.config =
+                    serde_json::json!({"textPath":format!("/chat/completions?api-version={version}")});
+                OpenAiCompatibleProvider
+                    .raw_chat_with_header(&azure, body, "api-key")
+                    .await
+            }
+            _ => OpenAiCompatibleProvider
+                .raw_chat_with_header(&config, body, "authorization")
+                .await,
+        }
+        .map_err(AppError::bad_request)?;
+        value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| AppError::bad_request("视觉模型未返回文本"))
+    }
     pub async fn midjourney_imagine(
         &self,
         id: i64,

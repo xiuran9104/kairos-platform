@@ -58,6 +58,8 @@ pub struct CreateAgentSessionRequest {
     pub constraints: serde_json::Value,
     #[serde(default)]
     pub budget: serde_json::Value,
+    #[serde(default)]
+    pub role_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

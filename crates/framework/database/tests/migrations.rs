@@ -44,6 +44,7 @@ async fn applies_all_migrations_to_empty_postgres() {
         "pent_mcp_servers",
         "pent_knowledge_retrieval_logs",
         "pent_skill_stats_meta",
+        "pent_agent_roles",
         "pent_assets",
         "pent_facts",
         "pent_fact_edges",
@@ -155,14 +156,15 @@ async fn applies_all_migrations_to_empty_postgres() {
                'pent:project:create','pent:task:create','pent:task:cancel',
                'pent:run:execute','pent:evidence:read',
                'pent:artifact:download','pent:tool:manage',
-               'pent:rmos:feedback','pent:settings:manage'
+               'pent:rmos:feedback','pent:settings:manage',
+               'pent:role:manage'
            )",
     )
     .fetch_one(&pool)
     .await
     .expect("read Pent action permissions");
     assert_eq!(
-        pent_action_permissions, 9,
+        pent_action_permissions, 10,
         "all Pent action permissions must be seeded"
     );
 

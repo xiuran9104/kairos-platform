@@ -13,6 +13,7 @@ mod knowledge_logs;
 mod mcp_servers;
 mod monitor;
 mod runtime_policy;
+mod roles;
 mod terminal;
 mod security;
 mod session;
@@ -86,6 +87,7 @@ pub fn routes(state: PentState) -> Router {
         .route("/pent/tasks/{id}", get(get_task).delete(delete_task))
         .route("/pent/tasks/{id}/cancel", post(cancel_task))
         .route("/pent/runs", get(list_runs).post(create_run))
+        .route("/pent/runs/batch", post(create_batch_runs))
         .route("/pent/runs/{id}", get(get_run).delete(delete_run))
         .route("/pent/runs/{id}/cancel", post(cancel_run))
         .route("/pent/runs/{id}/pause", post(pause_run))
@@ -124,6 +126,7 @@ pub fn routes(state: PentState) -> Router {
         .merge(conversation::agent_http::routes())
         .merge(conversation::hitl_http::routes())
         .merge(skills::routes())
+        .merge(roles::routes())
         .merge(monitor::routes())
         .merge(infocollect::routes())
         .merge(mcp_servers::routes())
@@ -470,28 +473,61 @@ async fn cancel_task(
     Ok(Json(ApiResponse::new(json!({"message":"任务已取消"}))))
 }
 
+/// Extract an optional trimmed non-empty query parameter.
+fn opt_param<'a>(
+    params: &'a std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    params
+        .get(key)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 async fn list_runs(
     State(s): State<PentState>,
     user: CurrentUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
+    let status = opt_param(&params, "status");
+    let project_id = opt_param(&params, "project_id");
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT jsonb_build_object(
             'id', r.id, 'task_id', r.task_id, 'task_name', tk.name,
-            'status', r.status, 'session_id', r.session_id,
-            'objective_snapshot', r.objective_snapshot,
+            'status', r.status, 'session_id', r.session_id, 'worker_id', r.worker_id,
+            'project_id', r.project_id, 'project_name', p.name,
+            'objective', r.objective_snapshot,
             'scope_snapshot', r.scope_snapshot,
+            'targets', COALESCE(r.scope_snapshot->'targets', '[]'::jsonb),
+            'finding_count',
+                (SELECT count(*) FROM pent_findings f WHERE f.run_id = r.id),
+            'tool_call_count',
+                (SELECT count(*) FROM pent_tool_calls c WHERE c.run_id = r.id),
+            'failure_code', r.failure_code, 'failure_message', r.failure_message,
             'started_at', r.started_at, 'completed_at', r.completed_at,
             'created_at', r.created_at, 'updated_at', r.updated_at
          )
          FROM pent_runs r
          LEFT JOIN pent_tasks tk ON tk.id = r.task_id
+         LEFT JOIN pent_projects p ON p.id = r.project_id
          WHERE r.tenant_id=$1 AND ($2 OR r.user_id=$3)
-         ORDER BY r.created_at DESC LIMIT 100",
+           AND ($4::text IS NULL OR r.status = $4)
+           AND ($5::text IS NULL OR r.project_id = $5)
+         ORDER BY r.created_at DESC LIMIT $6",
     )
     .bind(tenant_id)
     .bind(security::tenant_wide(&user))
     .bind(&user.user_id)
+    .bind(status)
+    .bind(project_id)
+    .bind(limit)
     .fetch_all(&s.pool)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
@@ -506,14 +542,22 @@ async fn get_run(
     let v = sqlx::query_scalar::<_, Value>(
         "SELECT jsonb_build_object(
             'id', r.id, 'task_id', r.task_id, 'task_name', tk.name,
-            'status', r.status, 'session_id', r.session_id,
-            'objective_snapshot', r.objective_snapshot,
+            'status', r.status, 'session_id', r.session_id, 'worker_id', r.worker_id,
+            'project_id', r.project_id, 'project_name', p.name,
+            'objective', r.objective_snapshot,
             'scope_snapshot', r.scope_snapshot,
+            'targets', COALESCE(r.scope_snapshot->'targets', '[]'::jsonb),
+            'finding_count',
+                (SELECT count(*) FROM pent_findings f WHERE f.run_id = r.id),
+            'tool_call_count',
+                (SELECT count(*) FROM pent_tool_calls c WHERE c.run_id = r.id),
+            'failure_code', r.failure_code, 'failure_message', r.failure_message,
             'started_at', r.started_at, 'completed_at', r.completed_at,
             'created_at', r.created_at, 'updated_at', r.updated_at
          )
          FROM pent_runs r
          LEFT JOIN pent_tasks tk ON tk.id = r.task_id
+         LEFT JOIN pent_projects p ON p.id = r.project_id
          WHERE r.id=$1 AND r.tenant_id=$2 AND ($3 OR r.user_id=$4)",
     )
     .bind(&id)
@@ -592,6 +636,120 @@ async fn create_run(
     Ok(Json(ApiResponse::new(
         json!({"id":id,"message":"Run 创建成功"}),
     )))
+}
+async fn create_batch_runs(
+    State(s): State<PentState>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let project_id = body
+        .get("project_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("请选择所属项目"))?;
+    ensure_project_access(&s.pool, project_id, &user).await?;
+
+    let targets: Vec<String> = body
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Err(AppError::bad_request("至少需要一个目标"));
+    }
+    // Dedup preserving order, cap to avoid runaway enqueue.
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<String> = targets
+        .into_iter()
+        .filter(|target| seen.insert(target.to_owned()))
+        .take(200)
+        .collect();
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("批量测试");
+    let priority = body
+        .get("priority")
+        .and_then(Value::as_str)
+        .unwrap_or("medium");
+    let objective = body
+        .get("objective")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("对目标进行授权安全测试");
+
+    let mut created = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let task_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let scope = normalize_confirmed_scope(json!([target]), &user.user_id)?;
+        let mut tx = s.pool.begin().await.map_err(|e| AppError::internal(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO pent_tasks(
+                 id, tenant_id, name, description, target_scope, priority, project_id, created_by
+             ) VALUES($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&task_id)
+        .bind(tenant_id)
+        .bind(format!("{name} - {target}"))
+        .bind(objective)
+        .bind(&scope)
+        .bind(priority)
+        .bind(project_id)
+        .bind(&user.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO pent_runs(
+                 id,task_id,tenant_id,user_id,project_id,status,
+                 objective_snapshot,scope_snapshot,policy_snapshot,budget_snapshot
+             ) VALUES($1,$2,$3,$4,$5,'queued',$6,$7,$8,'{}'::jsonb)",
+        )
+        .bind(&run_id)
+        .bind(&task_id)
+        .bind(tenant_id)
+        .bind(&user.user_id)
+        .bind(project_id)
+        .bind(objective)
+        .bind(&scope)
+        .bind(json!({"tool_profile_id": Value::Null, "scope_confirmed": true}))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+        sqlx::query(
+            "UPDATE pent_tasks SET status='running', updated_at=now() WHERE id=$1",
+        )
+        .bind(&task_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+        tx.commit().await.map_err(|e| AppError::internal(e.to_string()))?;
+        if let Some(ref nats) = s.nats {
+            let payload =
+                serde_json::to_vec(&json!({"run_id": run_id, "task_id": task_id})).unwrap_or_default();
+            nats.publish("penta.run.requested", &payload).await;
+        }
+        created.push(json!({"target": target, "task_id": task_id, "run_id": run_id}));
+    }
+    Ok(Json(ApiResponse::new(json!({
+        "name": name,
+        "total": created.len(),
+        "runs": created,
+    }))))
 }
 async fn cancel_run(
     State(s): State<PentState>,
@@ -1514,31 +1672,108 @@ pub(crate) async fn append_run_event(
     Ok(())
 }
 
-// ── LLM Traffic ────────────────────────────────────────────────────────────
+// ── HTTP Traffic ───────────────────────────────────────────────────────────
 
 async fn traffic_list(
     State(s): State<PentState>,
     user: CurrentUser,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
+) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let project_id = params.get("project_id").filter(|v| !v.is_empty()).map(|v| v.as_str());
-    let rows = if let Some(pid) = project_id {
-        sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(c) FROM pent_model_calls c
-             JOIN pent_agent_sessions s ON s.id=c.session_id
-             JOIN pent_runs r ON r.session_id=s.id
-             WHERE r.project_id=$1 AND s.tenant_id=$2 AND ($3 OR s.created_by=$4)
-             ORDER BY c.started_at DESC LIMIT 200"
-        ).bind(pid).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-        .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
-    } else {
-        sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(c) FROM pent_model_calls c JOIN pent_agent_sessions s ON s.id=c.session_id WHERE s.tenant_id=$1 AND ($2 OR s.created_by=$3) ORDER BY c.started_at DESC LIMIT 200"
-        ).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-        .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
-    };
-    Ok(Json(ApiResponse::new(rows)))
+    let page = params
+        .get("page")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = params
+        .get("page_size")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 200);
+    let offset = (page - 1) * page_size;
+    let run_id = opt_param(&params, "run_id");
+    let project_id = opt_param(&params, "project_id");
+    let method = opt_param(&params, "method");
+    let source = opt_param(&params, "source");
+    let url_contains = opt_param(&params, "url");
+    let status_code = params
+        .get("status_code")
+        .and_then(|value| value.parse::<i32>().ok());
+    let duration_max_ms = params
+        .get("duration_max_ms")
+        .and_then(|value| value.parse::<i64>().ok());
+
+    let items = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'id', t.id, 'run_id', t.run_id, 'tool_call_id', t.tool_call_id,
+             'tool_name', t.tool_name, 'method', t.method, 'url', t.url,
+             'response_status', t.response_status, 'duration_ms', t.duration_ms,
+             'replay_of', t.replay_of, 'created_at', t.created_at,
+             'request_size_bytes', octet_length(coalesce(t.request_body,'')),
+             'response_size_bytes', octet_length(coalesce(t.response_body,''))
+         )
+         FROM pent_http_traffic t
+         JOIN pent_runs r ON r.id = t.run_id
+         WHERE r.tenant_id=$1 AND ($2 OR r.user_id=$3)
+           AND ($4::text IS NULL OR t.run_id = $4)
+           AND ($5::text IS NULL OR r.project_id = $5)
+           AND ($6::text IS NULL OR upper(t.method) = upper($6))
+           AND ($7::text IS NULL OR t.tool_name = $7)
+           AND ($8::text IS NULL OR t.url ILIKE '%'||$8||'%')
+           AND ($9::int IS NULL OR t.response_status = $9)
+           AND ($10::bigint IS NULL OR t.duration_ms <= $10)
+         ORDER BY t.created_at DESC
+         LIMIT $11 OFFSET $12",
+    )
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(run_id)
+    .bind(project_id)
+    .bind(method)
+    .bind(source)
+    .bind(url_contains)
+    .bind(status_code)
+    .bind(duration_max_ms)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+         FROM pent_http_traffic t
+         JOIN pent_runs r ON r.id = t.run_id
+         WHERE r.tenant_id=$1 AND ($2 OR r.user_id=$3)
+           AND ($4::text IS NULL OR t.run_id = $4)
+           AND ($5::text IS NULL OR r.project_id = $5)
+           AND ($6::text IS NULL OR upper(t.method) = upper($6))
+           AND ($7::text IS NULL OR t.tool_name = $7)
+           AND ($8::text IS NULL OR t.url ILIKE '%'||$8||'%')
+           AND ($9::int IS NULL OR t.response_status = $9)
+           AND ($10::bigint IS NULL OR t.duration_ms <= $10)",
+    )
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(run_id)
+    .bind(project_id)
+    .bind(method)
+    .bind(source)
+    .bind(url_contains)
+    .bind(status_code)
+    .bind(duration_max_ms)
+    .fetch_one(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok(Json(ApiResponse::new(json!({
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }))))
 }
 
 // ── M2-F14: Cross-project global memory search ──────────────────────
@@ -1599,6 +1834,11 @@ async fn rmos_global_search(
 }
 
 // ── RMOS Memory ────────────────────────────────────────────────────────────
+//
+// Memory entries are written by the conversation runtime into
+// `pent_knowledge_documents` with `source='conversation-memory'` and
+// `tags = ["conversation-memory", <run_id>, <tool_name>]`. Tenancy is derived
+// from the referenced run so cross-tenant reads/writes are impossible.
 
 async fn rmos_memories(
     State(s): State<PentState>,
@@ -1606,39 +1846,95 @@ async fn rmos_memories(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let project_id = params.get("project_id").filter(|v| !v.is_empty()).map(|v| v.as_str());
-    let rows = if let Some(pid) = project_id {
-        sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(t) FROM pent_knowledge_documents t
-             WHERE tags ? $1
-             ORDER BY created_at DESC LIMIT 200"
-        ).bind(pid).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
-    } else {
-        sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(t) FROM pent_knowledge_documents t ORDER BY created_at DESC LIMIT 200"
-        ).fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
-    };
+    let project_id = opt_param(&params, "project_id");
+    let run_id = opt_param(&params, "run_id");
+    let query = opt_param(&params, "q");
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(200)
+        .clamp(1, 500);
+
+    let rows = sqlx::query_scalar::<_, Value>(
+        "SELECT jsonb_build_object(
+             'id', kd.id::text,
+             'title', kd.title,
+             'memory_type', COALESCE(kd.answer_type, kd.doc_type),
+             'source', kd.source,
+             'run_id', r.id,
+             'session_id', r.session_id,
+             'project_id', r.project_id,
+             'project_name', p.name,
+             'tool_name', kd.tags->>2,
+             'content', kd.content,
+             'summary', left(coalesce(kd.content,''), 300),
+             'tags', kd.tags,
+             'feedback', CASE
+                 WHEN kd.tags ? 'useful' THEN 'useful'
+                 WHEN kd.tags ? 'useless' THEN 'useless'
+                 ELSE NULL END,
+             'created_at', kd.created_at,
+             'updated_at', kd.updated_at
+         )
+         FROM pent_knowledge_documents kd
+         JOIN pent_runs r ON r.id = kd.tags->>1
+         LEFT JOIN pent_projects p ON p.id = r.project_id
+         WHERE kd.source = 'conversation-memory'
+           AND r.tenant_id=$1 AND ($2 OR r.user_id=$3)
+           AND ($4::text IS NULL OR r.project_id = $4)
+           AND ($5::text IS NULL OR r.id = $5)
+           AND ($6::text IS NULL
+                OR kd.title ILIKE '%'||$6||'%'
+                OR kd.content ILIKE '%'||$6||'%')
+         ORDER BY kd.created_at DESC LIMIT $7",
+    )
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(project_id)
+    .bind(run_id)
+    .bind(query)
+    .bind(limit)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
 }
 
 async fn rmos_feedback(
     State(s): State<PentState>,
     Path(id): Path<String>,
+    user: CurrentUser,
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
     let feedback = body["feedback"].as_str().unwrap_or("");
-    let tags = if feedback == "useful" {
-        "[\"useful\"]"
-    } else {
-        "[\"useless\"]"
+    let tag = match feedback {
+        "useful" | "useless" => feedback,
+        other => return Err(AppError::bad_request(format!("不支持的反馈类型: {other}"))),
     };
-    sqlx::query(&format!(
-        "UPDATE pent_knowledge_documents SET tags = tags || '{tags}'::jsonb WHERE id = $1::uuid"
-    ))
+    let affected = sqlx::query(
+        "UPDATE pent_knowledge_documents kd
+         SET tags = COALESCE(kd.tags, '[]'::jsonb) || $2::jsonb,
+             updated_at = now()
+         FROM pent_runs r
+         WHERE kd.id = $1::uuid
+           AND kd.source = 'conversation-memory'
+           AND r.id = kd.tags->>1
+           AND r.tenant_id = $3 AND ($4 OR r.user_id = $5)",
+    )
     .bind(&id)
+    .bind(json!([tag]))
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
     .execute(&s.pool)
     .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::not_found("记忆不存在或无权访问"));
+    }
     Ok(Json(ApiResponse::new(
         json!({"status":"ok","feedback":feedback}),
     )))
@@ -1649,34 +1945,92 @@ async fn rmos_feedback(
 async fn attack_graph(
     State(s): State<PentState>,
     user: CurrentUser,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
+    let project_id = opt_param(&params, "project_id");
     let findings: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT f.id, f.title, f.severity, f.target FROM pent_findings f JOIN pent_runs r ON r.id=f.run_id WHERE r.tenant_id=$1 AND ($2 OR r.user_id=$3) ORDER BY f.created_at DESC LIMIT 100"
-    ).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-    .fetch_all(&s.pool).await.unwrap_or_default();
+        "SELECT f.id, f.title, f.severity, f.target
+         FROM pent_findings f
+         JOIN pent_runs r ON r.id = f.run_id
+         WHERE r.tenant_id=$1 AND ($2 OR r.user_id=$3)
+           AND ($4::text IS NULL OR r.project_id = $4)
+         ORDER BY f.created_at DESC LIMIT 200",
+    )
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(project_id)
+    .fetch_all(&s.pool)
+    .await
+    .unwrap_or_default();
+
     let mut nodes: Vec<Value> = Vec::new();
     let mut edges: Vec<Value> = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
-    for (id, title, sev, target) in &findings {
-        let category = match sev.as_str() {
+    let mut summary_critical = 0usize;
+    let mut summary_high = 0usize;
+    let mut summary_other = 0usize;
+
+    for (id, title, severity, target) in &findings {
+        let category = match severity.as_str() {
             "critical" => 0,
             "high" => 1,
             _ => 2,
         };
-        let size = match sev.as_str() {
+        let size = match severity.as_str() {
             "critical" => 35,
             "high" => 28,
             _ => 22,
         };
-        nodes.push(json!({"id":id,"name":title,"category":category,"symbolSize":size}));
-        if !seen_targets.contains(target) {
-            seen_targets.insert(target.clone());
-            nodes.push(json!({"id":target,"name":target,"category":3,"symbolSize":45,"symbol":"roundRect"}));
+        match severity.as_str() {
+            "critical" => summary_critical += 1,
+            "high" => summary_high += 1,
+            _ => summary_other += 1,
         }
-        edges.push(json!({"source":target,"target":id}));
+        nodes.push(json!({
+            "id": id,
+            "name": title,
+            "kind": "vulnerability",
+            "severity": severity,
+            "category": category,
+            "symbolSize": size,
+        }));
+        let target_name = if target.trim().is_empty() {
+            "未知目标"
+        } else {
+            target.as_str()
+        };
+        if !seen_targets.contains(target_name) {
+            seen_targets.insert(target_name.to_string());
+            nodes.push(json!({
+                "id": target_name,
+                "name": target_name,
+                "kind": "asset",
+                "severity": null,
+                "category": 3,
+                "symbolSize": 45,
+                "symbol": "roundRect",
+            }));
+        }
+        edges.push(json!({
+            "source": target_name,
+            "target": id,
+            "kind": "exposes",
+            "label": "发现漏洞",
+        }));
     }
-    Ok(Json(ApiResponse::new(json!({"nodes":nodes,"edges":edges}))))
+    Ok(Json(ApiResponse::new(json!({
+        "nodes": nodes,
+        "edges": edges,
+        "summary": {
+            "assets": seen_targets.len(),
+            "vulnerabilities": findings.len(),
+            "critical": summary_critical,
+            "high": summary_high,
+            "medium_low": summary_other,
+        },
+    }))))
 }
 
 // ── Platform Settings ──────────────────────────────────────────────────────

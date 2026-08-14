@@ -167,6 +167,11 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
     }) {
         definitions.push(knowledge_search_definition());
     }
+    if !definitions.iter().any(|definition| {
+        definition.pointer("/function/name").and_then(Value::as_str) == Some("vision_analyze")
+    }) {
+        definitions.push(vision_analyze_definition());
+    }
     for definition in evidence_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
         if !definitions
@@ -482,6 +487,24 @@ fn knowledge_search_definition() -> Value {
                         "type": "string",
                         "description": "具体漏洞类型、技术栈、观察或验证目标，例如 CSP bypass DVWA、weak session ID validation"
                     }
+                }
+            }
+        }
+    })
+}
+
+fn vision_analyze_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "vision_analyze",
+            "description": "用视觉模型分析截图/验证码图片，返回文字摘要。截图需以 data:image/...;base64, 数据 URL 传入；分析结果入 Evidence，不污染主模型上下文。",
+            "parameters": {
+                "type": "object",
+                "required": ["image_data_url"],
+                "properties": {
+                    "image_data_url": {"type": "string", "description": "图片 data URL，如 data:image/png;base64,..."},
+                    "question": {"type": "string", "description": "针对图片的具体问题，如识别验证码、登录状态、错误信息"}
                 }
             }
         }
@@ -824,6 +847,11 @@ pub async fn load_routed_tool_definitions(
     }) {
         definitions.push(knowledge_search_definition());
     }
+    if !definitions.iter().any(|definition| {
+        definition.pointer("/function/name").and_then(Value::as_str) == Some("vision_analyze")
+    }) {
+        definitions.push(vision_analyze_definition());
+    }
     for definition in evidence_tool_definitions()
         .into_iter()
         .chain(traffic_tool_definitions())
@@ -881,14 +909,6 @@ fn descriptor_from_row(row: DescriptorRow) -> anyhow::Result<ToolDescriptor> {
         supported_target_types: string_list(&supported_target_types),
         executor: ToolExecutorSpec {
             kind: descriptor_source(&source, &executor)?,
-            image: executor
-                .get("image")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            image_digest: executor
-                .get("image_digest")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
             endpoint: executor
                 .get("endpoint")
                 .and_then(Value::as_str)
@@ -958,7 +978,7 @@ fn parse_tool_source(value: &str) -> anyhow::Result<ToolSource> {
         // The host backend is a local-process executor (test-only); the
         // descriptor enum has no Host variant, so it maps to Builtin.
         "host" => Ok(ToolSource::Builtin),
-        "container" => Ok(ToolSource::Container),
+        "container" => Ok(ToolSource::Builtin),
         "mcp" => Ok(ToolSource::Mcp),
         "http" => Ok(ToolSource::Http),
         other => anyhow::bail!("未知工具执行类型: {other}"),

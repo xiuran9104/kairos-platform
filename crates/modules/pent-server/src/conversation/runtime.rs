@@ -1366,6 +1366,10 @@ impl ConversationRuntime {
                 )
                 .await
             }
+            "vision_analyze" => {
+                self.execute_vision_analyze(&tc.id, &tc.arguments, context.run_id.as_deref())
+                    .await
+            }
             "skill_list" | "skill_load" => {
                 let content = self
                     .repository
@@ -1502,21 +1506,47 @@ impl ConversationRuntime {
                 success: false,
             };
         }
-        // ── M3: hybrid search — wiki guides + pgvector semantic search ──
-        let wiki_fut = self.knowledge_source.search_guides(query, 3);
-        let vector_fut = search_vector_memories(&self.pool, query, 3);
-        let (wiki_result, vector_result) = tokio::join!(wiki_fut, vector_fut);
-        let mut guides = wiki_result.unwrap_or_default();
-        if let Ok(memories) = vector_result {
-            for m in memories {
+        // ── M3 + D-07: multi-query hybrid search + deterministic rerank ──
+        let multi_query_max = std::env::var("PENTA_MULTI_QUERY_MAX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 8);
+        let queries =
+            crate::tooling::reranker::knowledge::expand_queries(query, multi_query_max);
+        let mut guides: Vec<super::ports::KnowledgeGuide> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for variant in &queries {
+            if let Ok(mut result) = self.knowledge_source.search_guides(variant, 3).await {
+                for guide in result.drain(..) {
+                    let key = format!("{}|{}", guide.id, guide.title);
+                    if seen.insert(key) {
+                        guides.push(guide);
+                    }
+                }
+            }
+        }
+        if let Ok(memories) = search_vector_memories(&self.pool, query, 3).await {
+            for memory in memories {
                 guides.push(super::ports::KnowledgeGuide {
                     id: format!("vec-{}", uuid::Uuid::new_v4()),
                     title: "向量记忆匹配".into(),
                     source: Some("pgvector".into()),
-                    content: m,
+                    content: memory,
                 });
             }
         }
+        // Rerank by term overlap against the original query (title 3x body).
+        guides.sort_by(|left, right| {
+            crate::tooling::reranker::knowledge::score_guide(query, &right.title, &right.content)
+                .partial_cmp(&crate::tooling::reranker::knowledge::score_guide(
+                    query,
+                    &left.title,
+                    &left.content,
+                ))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        guides.truncate(5);
         let success = !guides.is_empty();
         if success {
             self.log_knowledge_retrieval(query, &guides, session_id, run_id)
@@ -1533,6 +1563,62 @@ impl ConversationRuntime {
             })
             .to_string(),
             success,
+        }
+    }
+
+    /// Vision analysis (D-10): analyze a screenshot/data URL with a vision
+    /// model and return only the text summary. The image never enters the
+    /// main agent context; the summary is persisted as evidence upstream.
+    async fn execute_vision_analyze(
+        &self,
+        tool_call_id: &str,
+        arguments: &str,
+        _run_id: Option<&str>,
+    ) -> super::tool_executor::ConversationToolResult {
+        let parsed = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
+        let image = parsed
+            .get("image_data_url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if image.is_empty() {
+            return super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "vision_analyze".into(),
+                content: serde_json::json!({"error": "image_data_url 不能为空"}).to_string(),
+                success: false,
+            };
+        }
+        if !image.starts_with("data:image/") {
+            return super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "vision_analyze".into(),
+                content: serde_json::json!({
+                    "error": "image_data_url 必须是 data:image/...;base64, 数据 URL"
+                })
+                .to_string(),
+                success: false,
+            };
+        }
+        let question = parsed.get("question").and_then(serde_json::Value::as_str);
+        let prompt = crate::infrastructure::vision::screenshot_prompt(question);
+        match crate::infrastructure::vision::analyze_image(&self.pool, image, &prompt).await {
+            Ok(summary) => super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "vision_analyze".into(),
+                content: serde_json::json!({
+                    "summary": summary,
+                    "instruction": "视觉摘要仅作辅助线索，需用当前可用工具继续验证。"
+                })
+                .to_string(),
+                success: true,
+            },
+            Err(error) => super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "vision_analyze".into(),
+                content: serde_json::json!({"error": error, "retryable": false}).to_string(),
+                success: false,
+            },
         }
     }
 

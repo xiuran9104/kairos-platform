@@ -2,6 +2,8 @@
 
 use kairos_platform_pent_api::ToolRouteCandidate;
 
+pub mod knowledge;
+
 pub struct SmallModelReranker;
 
 impl SmallModelReranker {

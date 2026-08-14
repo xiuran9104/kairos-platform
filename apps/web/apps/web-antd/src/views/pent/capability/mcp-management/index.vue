@@ -229,6 +229,7 @@ const form = ref({
   argsText: '',
   envText: '',
   url: '',
+  headersText: '',
   timeout_secs: 30,
   description: '',
 });
@@ -242,6 +243,7 @@ function openCreate() {
     argsText: '',
     envText: '',
     url: '',
+    headersText: '',
     timeout_secs: 30,
     description: '',
   };
@@ -257,6 +259,7 @@ function openEdit(s: PentMcpServer) {
     argsText: (s.args || []).join(','),
     envText: s.env ? JSON.stringify(s.env, null, 2) : '',
     url: s.url || '',
+    headersText: s.headers ? JSON.stringify(s.headers, null, 2) : '',
     timeout_secs: s.timeout_secs ?? 30,
     description: s.description || '',
   };
@@ -290,6 +293,14 @@ async function doSave() {
     }
   } else {
     payload.url = form.value.url;
+    if (form.value.headersText.trim()) {
+      try {
+        payload.headers = JSON.parse(form.value.headersText);
+      } catch {
+        message.error('请求头必须是合法 JSON');
+        return;
+      }
+    }
   }
   saving.value = true;
   try {
@@ -621,6 +632,9 @@ onDeactivated(() => {
         </template>
         <a-form-item v-else label="URL" required>
           <a-input v-model:value="form.url" placeholder="http://127.0.0.1:3000/mcp" />
+        </a-form-item>
+        <a-form-item v-if="form.transport !== 'stdio'" label="请求头（JSON）">
+          <a-textarea v-model:value="form.headersText" :rows="3" placeholder='{"Authorization": "Bearer ..."}' />
         </a-form-item>
         <a-form-item label="超时时间（秒）">
           <a-input-number v-model:value="form.timeout_secs" :min="1" :max="3600" style="width: 100%" />

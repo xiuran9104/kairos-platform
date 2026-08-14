@@ -61,14 +61,51 @@ pub struct Recipe {
     pub lifecycle_status: String,
     #[serde(default)]
     pub embedding_document: String,
+    /// DesRed-style declarative parameter mapping. When present, the executor
+    /// renders the command from the model's structured JSON arguments using
+    /// each parameter's flag/position/format/template instead of the legacy
+    /// `{{target}}`/`{{argN}}` template.
+    #[serde(default)]
+    pub parameters: Vec<ParameterConfig>,
+}
+
+/// One named parameter of a tool recipe, mirroring DesRed's `ParameterConfig`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ParameterConfig {
+    pub name: String,
+    #[serde(rename = "type", default = "default_param_type")]
+    pub type_: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    #[serde(default)]
+    pub item_type: Option<String>,
+    #[serde(default)]
+    pub flag: Option<String>,
+    #[serde(default)]
+    pub position: Option<usize>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Marks the parameter that carries the network target (scope-validated).
+    #[serde(default)]
+    pub target: bool,
+}
+
+fn default_param_type() -> String {
+    "string".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecipeExecutor {
     #[serde(rename = "type", default = "default_executor_type")]
     pub kind: String,
-    #[serde(default)]
-    pub image: Option<String>,
     #[serde(default)]
     pub program: Option<String>,
     #[serde(default)]
@@ -77,6 +114,8 @@ pub struct RecipeExecutor {
     pub target_position: TargetPosition,
     #[serde(default)]
     pub normalize_target: NormalizeTarget,
+    #[serde(default)]
+    pub target_type: TargetType,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +133,17 @@ pub enum NormalizeTarget {
     None,
     /// Trim a trailing slash and add `https://` when no scheme is present.
     UrlHttps,
+}
+
+/// What kind of value the recipe's `{{target}}` represents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetType {
+    /// A network endpoint (host/IP/URL) subject to Scope/NetworkPolicy checks.
+    #[default]
+    Network,
+    /// A local file path; only basic safety checks apply, no network policy.
+    File,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -122,7 +172,7 @@ fn default_approval_policy() -> String {
     "conditional".into()
 }
 fn default_executor_type() -> String {
-    "container".into()
+    "host".into()
 }
 fn default_lifecycle_status() -> String {
     "active".into()
@@ -142,7 +192,7 @@ fn default_timeout_seconds() -> u64 {
 const RISK_LEVELS: &[&str] = &["low", "medium", "high", "critical"];
 const APPROVAL_POLICIES: &[&str] = &["never", "conditional", "always"];
 const SOURCES: &[&str] = &["builtin", "external"];
-const EXECUTOR_TYPES: &[&str] = &["container", "host", "builtin"];
+const EXECUTOR_TYPES: &[&str] = &["host", "builtin"];
 const LIFECYCLE_STATUSES: &[&str] = &["draft", "active", "disabled", "deprecated"];
 
 fn allowed_program_prefixes() -> Vec<String> {
@@ -157,7 +207,13 @@ fn allowed_program_prefixes() -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .filter(|prefixes: &Vec<String>| !prefixes.is_empty())
-        .unwrap_or_else(|| vec!["/usr/bin/".into(), "/usr/local/bin/".into()])
+        .unwrap_or_else(|| {
+            vec![
+                "/usr/bin/".into(),
+                "/usr/local/bin/".into(),
+                "/usr/sbin/".into(),
+            ]
+        })
 }
 
 fn validate_tool_id(tool_id: &str) -> Result<(), String> {
@@ -252,7 +308,7 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
         .as_deref()
         .ok_or_else(|| format!("{}: 可执行配方缺少 program", recipe.tool_id))?;
     validate_program(program).map_err(|e| format!("{}: {e}", recipe.tool_id))?;
-    if recipe.executor.args.is_empty() {
+    if recipe.executor.args.is_empty() && recipe.parameters.is_empty() {
         return Err(format!("{}: 可执行配方缺少 args", recipe.tool_id));
     }
     for arg in &recipe.executor.args {
@@ -281,10 +337,11 @@ pub fn parse_recipe_file(content: &str) -> Result<Vec<Recipe>, String> {
 #[derive(Debug, Clone)]
 pub struct ExecutableRecipe {
     pub program: &'static str,
-    pub container_image: String,
     pub args: Vec<String>,
     pub target_position: TargetPosition,
     pub normalize_target: NormalizeTarget,
+    pub target_type: TargetType,
+    pub parameters: Vec<ParameterConfig>,
 }
 
 impl ExecutableRecipe {
@@ -293,39 +350,37 @@ impl ExecutableRecipe {
             return None;
         }
         let program = recipe.executor.program.as_deref()?;
-        if recipe.executor.args.is_empty() {
+        if recipe.executor.args.is_empty() && recipe.parameters.is_empty() {
             return None;
         }
         Some(Self::new(
             program,
-            recipe
-                .executor
-                .image
-                .clone()
-                .filter(|image| !image.is_empty())
-                .unwrap_or_else(super::tool_registry::toolkit_image),
             recipe.executor.args.clone(),
             recipe.executor.target_position,
             recipe.executor.normalize_target,
+            recipe.executor.target_type,
+            recipe.parameters.clone(),
         ))
     }
 
     fn new(
         program: &str,
-        container_image: String,
         args: Vec<String>,
         target_position: TargetPosition,
         normalize_target: NormalizeTarget,
+        target_type: TargetType,
+        parameters: Vec<ParameterConfig>,
     ) -> Self {
         // Program strings come from validated recipes; the set is bounded, so
         // leaking to obtain a &'static str for PreparedTool is acceptable.
         let program: &'static str = Box::leak(program.to_owned().into_boxed_str());
         Self {
             program,
-            container_image,
             args,
             target_position,
             normalize_target,
+            target_type,
+            parameters,
         }
     }
 
@@ -334,12 +389,20 @@ impl ExecutableRecipe {
     pub fn from_executor_json(executor: &serde_json::Value) -> Option<Self> {
         let program = executor.get("command")?.as_str()?;
         let args: Vec<String> = executor
-            .get("args")?
-            .as_array()?
-            .iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect();
-        if args.is_empty() {
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let parameters: Vec<ParameterConfig> = executor
+            .get("parameters")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if args.is_empty() && parameters.is_empty() {
             return None;
         }
         let target_position = match executor.get("target_position").and_then(|v| v.as_str()) {
@@ -350,17 +413,17 @@ impl ExecutableRecipe {
             Some("url_https") => NormalizeTarget::UrlHttps,
             _ => NormalizeTarget::None,
         };
+        let target_type = match executor.get("target_type").and_then(|v| v.as_str()) {
+            Some("file") => TargetType::File,
+            _ => TargetType::Network,
+        };
         Some(Self::new(
             program,
-            executor
-                .get("image")
-                .and_then(|v| v.as_str())
-                .filter(|image| !image.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(super::tool_registry::toolkit_image),
             args,
             target_position,
             normalize_target,
+            target_type,
+            parameters,
         ))
     }
 }
@@ -462,6 +525,18 @@ fn normalize_url_target(target: &str) -> String {
     }
 }
 
+/// Basic safety check for a local file target (no network policy applies).
+fn validate_file_target(target: &str) -> Result<(), String> {
+    if target.is_empty()
+        || target.starts_with('-')
+        || target.chars().any(char::is_whitespace)
+        || target.contains('\0')
+    {
+        return Err("文件路径不安全".into());
+    }
+    Ok(())
+}
+
 /// Render an executable recipe into a `PreparedTool`, applying target
 /// extraction, normalization, scope validation and template substitution.
 pub fn render_recipe(
@@ -469,6 +544,26 @@ pub fn render_recipe(
     request: &[String],
     network_policy: &NetworkPolicy,
 ) -> Result<PreparedTool, String> {
+    // Recipes with a `parameters` mapping render from structured arguments.
+    // The flattened `request` only carries the target, so reconstruct a minimal
+    // JSON object and delegate to the structured renderer.
+    if !recipe.parameters.is_empty() {
+        let raw_target = match recipe.target_position {
+            TargetPosition::First => request.first(),
+            TargetPosition::Last => request.last(),
+        }
+        .map(String::as_str)
+        .ok_or_else(|| "工具调用缺少目标".to_string())?;
+        let target_name = recipe
+            .parameters
+            .iter()
+            .find(|p| p.target)
+            .map(|p| p.name.clone())
+            .or_else(|| recipe.parameters.first().map(|p| p.name.clone()))
+            .unwrap_or_else(|| "target".to_string());
+        let args = serde_json::json!({ target_name: raw_target });
+        return render_recipe_from_json(recipe, &args, network_policy);
+    }
     let raw_target = match recipe.target_position {
         TargetPosition::First => request.first(),
         TargetPosition::Last => request.last(),
@@ -479,7 +574,10 @@ pub fn render_recipe(
         NormalizeTarget::None => raw_target.to_string(),
         NormalizeTarget::UrlHttps => normalize_url_target(raw_target),
     };
-    validate_target(&target, network_policy)?;
+    match recipe.target_type {
+        TargetType::File => validate_file_target(&target)?,
+        TargetType::Network => validate_target(&target, network_policy)?,
+    }
     let args = recipe
         .args
         .iter()
@@ -487,9 +585,191 @@ pub fn render_recipe(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(PreparedTool {
         program: recipe.program,
-        container_image: recipe.container_image.clone(),
         args,
     })
+}
+
+/// Render a recipe from the model's *structured* JSON arguments using the
+/// recipe's `parameters` declarative mapping (DesRed-style). Each parameter is
+/// mapped to the command via its `format` (`flag` / `positional` / `combined` /
+/// `template`). The parameter marked `target: true` (or conventionally named
+/// `target`/`url`/`host`) is scope-validated.
+pub fn render_recipe_from_json(
+    recipe: &ExecutableRecipe,
+    args: &serde_json::Value,
+    network_policy: &NetworkPolicy,
+) -> Result<PreparedTool, String> {
+    let fixed: Vec<String> = recipe
+        .args
+        .iter()
+        .filter(|arg| !arg.contains("{{"))
+        .cloned()
+        .collect();
+    let mut command: Vec<String> = fixed;
+    let mut positional: Vec<(usize, String)> = Vec::new();
+    let mut target: Option<String> = None;
+
+    for param in &recipe.parameters {
+        let value = match param_value(param, args)? {
+            Some(value) => value,
+            None => continue,
+        };
+        if param.target
+            || matches!(
+                param.name.as_str(),
+                "target" | "url" | "host" | "domain" | "ip" | "hostname"
+            )
+        {
+            target = Some(value.clone());
+        }
+        match param.format.as_deref().unwrap_or("flag") {
+            "positional" => {
+                let position = param.position.unwrap_or(command.len());
+                positional.push((position, value));
+            }
+            "combined" => {
+                let flag = param.flag.as_deref().unwrap_or("");
+                command.push(format!("{flag}={value}"));
+            }
+            "template" => {
+                let template = param.template.as_deref().unwrap_or("{value}");
+                let rendered = template
+                    .replace("{value}", &value)
+                    .replace("{flag}", param.flag.as_deref().unwrap_or(""))
+                    .replace("{name}", &param.name);
+                for part in rendered.split_whitespace() {
+                    command.push(part.to_string());
+                }
+            }
+            _ => {
+                if let Some(flag) = param.flag.as_deref() {
+                    if !flag.is_empty() {
+                        command.push(flag.to_string());
+                    }
+                }
+                command.push(value);
+            }
+        }
+    }
+    for (position, value) in positional {
+        let position = position.min(command.len());
+        command.insert(position, value);
+    }
+
+    match recipe.target_type {
+        TargetType::File => {
+            if let Some(target) = &target {
+                validate_file_target(target)?;
+            }
+        }
+        TargetType::Network => {
+            let target = target
+                .as_deref()
+                .ok_or_else(|| "参数映射缺少网络目标".to_string())?;
+            let normalized = match recipe.normalize_target {
+                NormalizeTarget::None => target.to_string(),
+                NormalizeTarget::UrlHttps => normalize_url_target(target),
+            };
+            validate_target(&normalized, network_policy)?;
+        }
+    }
+
+    Ok(PreparedTool {
+        program: recipe.program,
+        args: command,
+    })
+}
+
+fn param_value(
+    param: &ParameterConfig,
+    args: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let value = args.get(&param.name);
+    let rendered = match value {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(serde_json::Value::Bool(b)) => Some(b.to_string()),
+        Some(serde_json::Value::Array(items)) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        Some(other) => Some(other.to_string()),
+        None | Some(serde_json::Value::Null) => match &param.default {
+            Some(default) => Some(value_to_string(default)),
+            None if param.required => {
+                return Err(format!("缺少必需参数: {}", param.name));
+            }
+            None => None,
+        },
+    };
+    Ok(rendered.filter(|s| !s.is_empty()))
+}
+
+fn value_to_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Derive an OpenAI-style JSON Schema from the recipe's `parameters`, so the
+/// model knows the structured arguments to pass.
+pub fn parameters_to_input_schema(parameters: &[ParameterConfig]) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<serde_json::Value> = Vec::new();
+    for param in parameters {
+        let mut schema = serde_json::Map::new();
+        schema.insert(
+            "type".into(),
+            serde_json::json!(json_param_type(&param.type_)),
+        );
+        if !param.description.is_empty() {
+            schema.insert("description".into(), serde_json::json!(param.description));
+        }
+        if !param.options.is_empty() {
+            schema.insert("enum".into(), serde_json::json!(param.options));
+        }
+        if let Some(default) = &param.default {
+            schema.insert("default".into(), default.clone());
+        }
+        properties.insert(param.name.clone(), serde_json::Value::Object(schema));
+        if param.required {
+            required.push(serde_json::json!(param.name));
+        }
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    })
+}
+
+fn json_param_type(type_: &str) -> &str {
+    match type_ {
+        "int" | "integer" | "number" | "float" => "number",
+        "bool" | "boolean" => "boolean",
+        "array" | "list" => "array",
+        _ => "string",
+    }
+}
+
+/// Load the shipped recipes into the global store. Test-only: unit tests that
+/// exercise `prepare_tool` rely on the recipe store instead of the (removed)
+/// hardcoded fallback branches.
+#[cfg(test)]
+pub(crate) fn load_recipes_for_tests() {
+    let content = include_str!("../../tools/recipes.yaml");
+    let recipes = parse_recipe_file(content).expect("recipes.yaml is valid");
+    let map: std::collections::HashMap<String, ExecutableRecipe> = recipes
+        .iter()
+        .filter_map(|recipe| {
+            ExecutableRecipe::from_recipe(recipe).map(|executable| (recipe.tool_id.clone(), executable))
+        })
+        .collect();
+    set_global_recipes(map);
 }
 
 #[cfg(test)]
@@ -513,8 +793,7 @@ mod tests {
             approval_policy: "conditional".into(),
             supported_target_types: vec!["hostname".into(), "ipv4".into()],
             executor: RecipeExecutor {
-                kind: "container".into(),
-                image: None,
+                kind: "host".into(),
                 program: Some("/usr/bin/nmap".into()),
                 args: vec![
                     "-sT".into(),
@@ -525,10 +804,12 @@ mod tests {
                 ],
                 target_position: TargetPosition::Last,
                 normalize_target: NormalizeTarget::None,
+                target_type: TargetType::Network,
             },
             resource_profile: RecipeResourceProfile::default(),
             lifecycle_status: "active".into(),
             embedding_document: String::new(),
+            parameters: vec![],
         }
     }
 
@@ -541,7 +822,7 @@ recipes:
     name: Nmap 端口扫描
     description: 基于 Nmap 执行端口扫描
     executor:
-      type: container
+      type: host
       program: /usr/bin/nmap
       args: ["-sT", "--", "{{target}}"]
 "#;
@@ -572,12 +853,12 @@ recipes:
     namespace: scanner
     name: a
     description: a
-    executor: {type: container, program: /usr/bin/nmap, args: ["{{target}}"]}
+    executor: {type: host, program: /usr/bin/nmap, args: ["{{target}}"]}
   - tool_id: nmap_scan
     namespace: scanner
     name: b
     description: b
-    executor: {type: container, program: /usr/bin/nmap, args: ["{{target}}"]}
+    executor: {type: host, program: /usr/bin/nmap, args: ["{{target}}"]}
 "#;
         assert!(parse_recipe_file(yaml).is_err());
     }
@@ -607,10 +888,11 @@ recipes:
         let args = vec!["{{arg0}}".into(), "x-{{arg1}}".into()];
         let recipe = ExecutableRecipe::new(
             "/usr/bin/nmap",
-            "img".into(),
             args,
             TargetPosition::Last,
             NormalizeTarget::None,
+            TargetType::Network,
+            vec![],
         );
         let policy = NetworkPolicy::Full;
         let prepared = render_recipe(&recipe, &["scan".into(), "t".into()], &policy).unwrap();
@@ -621,10 +903,11 @@ recipes:
     fn rejects_out_of_range_arg_placeholder() {
         let recipe = ExecutableRecipe::new(
             "/usr/bin/nmap",
-            "img".into(),
             vec!["{{arg5}}".into()],
             TargetPosition::Last,
             NormalizeTarget::None,
+            TargetType::Network,
+            vec![],
         );
         let policy = NetworkPolicy::Full;
         assert!(render_recipe(&recipe, &["t".into()], &policy).is_err());
@@ -638,6 +921,142 @@ recipes:
         recipe.executor.args = vec![];
         assert!(validate_recipe(&recipe).is_ok());
         assert!(ExecutableRecipe::from_recipe(&recipe).is_none());
+    }
+
+    #[test]
+    fn file_target_skips_network_policy() {
+        let recipe = ExecutableRecipe::new(
+            "/usr/bin/binwalk",
+            vec!["{{target}}".into()],
+            TargetPosition::First,
+            NormalizeTarget::None,
+            TargetType::File,
+            vec![],
+        );
+        // A file path is accepted even under a restrictive target-only policy.
+        let policy = NetworkPolicy::TargetOnly("example.com".into());
+        let prepared = render_recipe(&recipe, &["/tmp/firmware.bin".into()], &policy).unwrap();
+        assert_eq!(prepared.args, vec!["/tmp/firmware.bin".to_string()]);
+
+        // Unsafe file paths are still rejected.
+        assert!(render_recipe(&recipe, &["-bad".into()], &policy).is_err());
+    }
+
+    fn param_recipe(parameters: Vec<ParameterConfig>) -> ExecutableRecipe {
+        ExecutableRecipe::new(
+            "/usr/bin/nmap",
+            vec!["-sT".into()],
+            TargetPosition::Last,
+            NormalizeTarget::None,
+            TargetType::Network,
+            parameters,
+        )
+    }
+
+    fn p(name: &str, format: &str) -> ParameterConfig {
+        ParameterConfig {
+            name: name.into(),
+            type_: "string".into(),
+            description: String::new(),
+            required: false,
+            default: None,
+            item_type: None,
+            flag: None,
+            position: None,
+            format: Some(format.into()),
+            template: None,
+            options: vec![],
+            target: false,
+        }
+    }
+
+    #[test]
+    fn json_rendering_maps_flag_positional_combined_template() {
+        let mut target = p("target", "positional");
+        target.position = Some(1);
+        target.target = true;
+        let mut ports = p("ports", "flag");
+        ports.flag = Some("-p".into());
+        let mut timing = p("timing", "template");
+        timing.template = Some("-T{value}".into());
+        let mut proto = p("proto", "combined");
+        proto.flag = Some("--proto".into());
+        let recipe = param_recipe(vec![target, ports, timing, proto]);
+
+        let args = serde_json::json!({
+            "target": "example.com", "ports": "80", "timing": "4", "proto": "tcp"
+        });
+        let prepared = render_recipe_from_json(&recipe, &args, &NetworkPolicy::Full).unwrap();
+        assert_eq!(
+            prepared.args,
+            vec![
+                "-sT".to_string(),
+                "example.com".to_string(),
+                "-p".to_string(),
+                "80".to_string(),
+                "-T4".to_string(),
+                "--proto=tcp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_rendering_enforces_scope_on_target() {
+        let mut target = p("target", "positional");
+        target.position = Some(0);
+        target.target = true;
+        let recipe = param_recipe(vec![target]);
+        let policy = NetworkPolicy::TargetOnly("example.com".into());
+        let ok = render_recipe_from_json(
+            &recipe,
+            &serde_json::json!({"target": "example.com"}),
+            &policy,
+        );
+        assert!(ok.is_ok());
+        let bad = render_recipe_from_json(
+            &recipe,
+            &serde_json::json!({"target": "other.com"}),
+            &policy,
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn json_rendering_rejects_missing_required() {
+        let mut target = p("target", "positional");
+        target.required = true;
+        let recipe = param_recipe(vec![target]);
+        assert!(render_recipe_from_json(&recipe, &serde_json::json!({}), &NetworkPolicy::Full)
+            .is_err());
+    }
+
+    #[test]
+    fn parameters_generate_input_schema() {
+        let mut target = p("target", "positional");
+        target.required = true;
+        target.description = "目标".into();
+        let schema = parameters_to_input_schema(&[target]);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["target"]["type"], "string");
+        assert!(schema["required"].as_array().unwrap().iter().any(|v| v == "target"));
+    }
+
+    #[test]
+    fn json_template_with_flag_splits_into_arguments() {
+        let mut target = p("target", "template");
+        target.template = Some("-u {value}/FUZZ".into());
+        target.target = true;
+        let recipe = param_recipe(vec![target]);
+        let prepared = render_recipe_from_json(
+            &recipe,
+            &serde_json::json!({"target": "http://example.com"}),
+            &NetworkPolicy::Full,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.args,
+            vec!["-sT".to_string(), "-u".to_string(), "http://example.com/FUZZ".to_string()]
+        );
     }
 
     #[test]
@@ -691,8 +1110,7 @@ recipes:
     #[test]
     fn executor_json_round_trip() {
         let executor = serde_json::json!({
-            "type": "container",
-            "image": "img",
+            "type": "host",
             "command": "/usr/bin/nmap",
             "args": ["--", "{{target}}"],
             "target_position": "last",

@@ -40,4 +40,31 @@ pub(crate) fn parse(path: &Path, fallback_id: &str) -> anyhow::Result<AgentProfi
 }
 
 #[cfg(test)]
-mod tests { use super::*; #[test] fn rejects_path_traversal_role() { assert!(load("../secret").unwrap().is_none()); } }
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_path_traversal_role() {
+        assert!(load("../secret").unwrap().is_none());
+    }
+
+    #[test]
+    fn all_shipped_profiles_parse() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../agents");
+        assert!(dir.is_dir(), "agents dir missing: {}", dir.display());
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            let profile = parse(&path, id).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(!profile.id.is_empty(), "{}: missing id", path.display());
+            assert!(!profile.name.is_empty(), "{}: missing name", path.display());
+            assert!(!profile.instruction.is_empty(), "{}: empty body", path.display());
+            count += 1;
+        }
+        assert!(count >= 12, "expected at least 12 shipped profiles, got {count}");
+    }
+}

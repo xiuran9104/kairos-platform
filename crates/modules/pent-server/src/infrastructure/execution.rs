@@ -41,6 +41,7 @@ pub enum ExecutionState {
 /// Record held for every tracked execution.
 struct ExecutionRecord {
     state: ExecutionState,
+    tool_name: String,
     cancel: CancellationToken,
     result_tx: Option<oneshot::Sender<ExecutionState>>,
     result_rx: Option<oneshot::Receiver<ExecutionState>>,
@@ -103,6 +104,7 @@ impl ExecutionRegistry {
                 id.clone(),
                 ExecutionRecord {
                     state: ExecutionState::Pending,
+                    tool_name: tool_name.clone(),
                     cancel: cancel.clone(),
                     result_tx: Some(tx),
                     result_rx: Some(rx),
@@ -183,6 +185,12 @@ impl ExecutionRegistry {
     pub async fn state(&self, id: &ExecutionId) -> Option<ExecutionState> {
         let execs = self.executions.lock().await;
         execs.get(id).map(|r| r.state.clone())
+    }
+
+    /// Tool name recorded for an execution, if known.
+    pub async fn tool_name(&self, id: &ExecutionId) -> Option<String> {
+        let execs = self.executions.lock().await;
+        execs.get(id).map(|r| r.tool_name.clone())
     }
 
     /// Wait for an execution to finish and return its final state.
@@ -378,21 +386,41 @@ impl ElasticExecutor {
         arguments: &[String],
         limits: &ToolExecutionLimits,
     ) -> Result<ToolOutput, String> {
+        let id = self.start(tool_name, arguments, limits).await?;
+        self.collect(&id).await
+    }
+
+    /// Start a tool execution asynchronously, returning its id immediately.
+    /// The caller may poll `collect` or `ExecutionRegistry::state` in later
+    /// turns instead of blocking the current agent turn.
+    pub async fn start(
+        &self,
+        tool_name: &str,
+        arguments: &[String],
+        limits: &ToolExecutionLimits,
+    ) -> Result<ExecutionId, String> {
         self.breaker.check(tool_name).await?;
-
-        let id = Arc::clone(&self.registry)
+        Ok(Arc::clone(&self.registry)
             .start(tool_name.to_string(), arguments.to_vec(), limits.clone())
-            .await;
-        let state = self.registry.wait(&id).await;
-        self.registry.remove(&id).await;
+            .await)
+    }
 
+    /// Wait for a previously started execution and record breaker state.
+    pub async fn collect(&self, id: &ExecutionId) -> Result<ToolOutput, String> {
+        let tool_name = self
+            .registry
+            .tool_name(id)
+            .await
+            .unwrap_or_else(|| "unknown".to_string());
+        let state = self.registry.wait(id).await;
+        self.registry.remove(id).await;
         match state {
             Some(ExecutionState::Completed(output)) => {
-                self.breaker.record_success(tool_name).await;
+                self.breaker.record_success(&tool_name).await;
                 Ok(output)
             }
             Some(ExecutionState::Failed(error)) => {
-                self.breaker.record_failure(tool_name).await;
+                self.breaker.record_failure(&tool_name).await;
                 Err(error)
             }
             Some(ExecutionState::Cancelled) => Err("execution cancelled".into()),
@@ -454,5 +482,24 @@ mod tests {
         breaker.record_failure("nmap").await;
         assert!(breaker.check("nmap").await.is_err());
         assert!(breaker.check("nuclei").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn start_returns_id_before_collect_completes() {
+        let executor = ElasticExecutor::new(10, 5, 60);
+        let limits = ToolExecutionLimits {
+            timeout_seconds: 5,
+            ..Default::default()
+        };
+        let id = executor
+            .start("tcp_scan", &["scan".into(), "127.0.0.1".into()], &limits)
+            .await
+            .unwrap();
+        assert!(!id.0.is_empty());
+        // collect blocks until the execution finishes (success or failure).
+        let outcome = executor.collect(&id).await;
+        assert!(outcome.is_ok() || outcome.is_err());
+        // The execution is removed from the registry after collect.
+        assert!(executor.registry().state(&id).await.is_none());
     }
 }

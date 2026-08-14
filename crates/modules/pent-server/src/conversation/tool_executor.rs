@@ -22,14 +22,15 @@ fn direct_network_tools_enabled() -> bool {
             && std::env::var("PENTA_ALLOW_DIRECT_NETWORK_TOOLS").as_deref() == Ok("true"))
 }
 
-fn docker_conversation_tool(tool_name: &str) -> bool {
+fn conversation_native_tool(tool_name: &str) -> bool {
     matches!(tool_name, "http_probe" | "http_request")
 }
 
 /// Whether this process has a real conversation-mode handler for a registry
 /// tool. The database remains the source of truth for which tools are active;
 /// this predicate prevents the model from being offered catalog entries whose
-/// worker executors are not implemented yet.
+/// worker executors are not implemented yet. Any recipe-backed tool is
+/// executable (via `prepare_tool` / `execute_tool_json`), so it qualifies.
 pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
     let implemented = matches!(
         tool_name,
@@ -43,6 +44,7 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "js_analyze"
             | "js_collect"
             | "knowledge_search"
+            | "vision_analyze"
             | "evidence_list"
             | "evidence_search"
             | "evidence_view"
@@ -131,7 +133,7 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
         || crate::infrastructure::recipe::has_executable(tool_name);
     implemented
         && (!NETWORK_TOOLS.contains(&tool_name)
-            || docker_conversation_tool(tool_name)
+            || conversation_native_tool(tool_name)
             || direct_network_tools_enabled())
 }
 
@@ -153,7 +155,7 @@ pub async fn execute_tool(
     session_id: &str,
 ) -> ConversationToolResult {
     if NETWORK_TOOLS.contains(&name)
-        && !docker_conversation_tool(name)
+        && !conversation_native_tool(name)
         && !direct_network_tools_enabled()
     {
         return ConversationToolResult {
@@ -210,16 +212,59 @@ pub async fn execute_tool(
         }
 
         // ── Fallback ────────────────────────────────────────────
-        other => ConversationToolResult {
+        other => {
+            // Recipe-backed host tools with a `parameters` mapping render from
+            // the model's structured JSON arguments (DesRed-style) and run
+            // through the sandboxed host executor with scope-derived policy.
+            if let Some(recipe) = crate::infrastructure::recipe::lookup(other) {
+                if !recipe.parameters.is_empty() {
+                    return execute_recipe_tool(other, arguments, scope_snapshot).await;
+                }
+            }
+            ConversationToolResult {
+                tool_call_id: String::new(),
+                tool_name: other.into(),
+                content: serde_json::json!({
+                    "error": format!("工具 '{}' 在对话模式中不可用，请通过 Run 方式执行", other),
+                    "suggestion": "如需使用此工具，请创建渗透任务并在 Run 中执行"
+                })
+                .to_string(),
+                success: false,
+            }
+        }
+    }
+}
+
+/// Execute a recipe-backed host tool from structured JSON arguments.
+async fn execute_recipe_tool(
+    name: &str,
+    arguments: &str,
+    scope_snapshot: &serde_json::Value,
+) -> ConversationToolResult {
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(error) => return tool_error(name, format!("参数解析失败: {error}")),
+    };
+    let policy = crate::infrastructure::process::NetworkPolicy::derive_from_scope(scope_snapshot);
+    let limits = crate::infrastructure::process::ToolExecutionLimits {
+        timeout_seconds: 300,
+        network_access: policy,
+        ..Default::default()
+    };
+    match crate::infrastructure::process::execute_tool_json(name, &args, &limits).await {
+        Ok(output) => ConversationToolResult {
             tool_call_id: String::new(),
-            tool_name: other.into(),
+            tool_name: name.into(),
             content: serde_json::json!({
-                "error": format!("工具 '{}' 在对话模式中不可用，请通过 Run 方式执行", other),
-                "suggestion": "如需使用此工具，请创建渗透任务并在 Run 中执行"
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+                "exit_code": output.exit_code,
+                "duration_ms": output.duration_ms,
             })
             .to_string(),
-            success: false,
+            success: output.exit_code == 0,
         },
+        Err(error) => tool_error(name, error),
     }
 }
 

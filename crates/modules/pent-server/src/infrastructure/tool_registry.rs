@@ -5,8 +5,24 @@ use super::process::NetworkPolicy;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTool {
     pub program: &'static str,
-    pub container_image: String,
     pub args: Vec<String>,
+}
+
+/// DesRed-style structured rendering: render a recipe from the model's JSON
+/// arguments using its `parameters` declarative mapping. Only recipes that
+/// declare `parameters` are eligible; others return an error instructing the
+/// caller to use the legacy `{{target}}` path.
+pub fn prepare_tool_from_json(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    network_policy: &NetworkPolicy,
+) -> Result<PreparedTool, String> {
+    let recipe = super::recipe::lookup(tool_name)
+        .ok_or_else(|| format!("工具 {tool_name} 未在配方中注册"))?;
+    if recipe.parameters.is_empty() {
+        return Err(format!("工具 {tool_name} 未声明 parameters，无法结构化渲染"));
+    }
+    super::recipe::render_recipe_from_json(&recipe, arguments, network_policy)
 }
 
 pub fn prepare_tool(
@@ -14,50 +30,37 @@ pub fn prepare_tool(
     request: &[String],
     network_policy: &NetworkPolicy,
 ) -> Result<PreparedTool, String> {
-    // Executable recipes loaded from pent_tool_definitions take precedence;
-    // the hardcoded whitelist below remains the fallback for builtin and
-    // not-yet-migrated tools.
+    // Executable recipes loaded from pent_tool_definitions are the single
+    // source of truth for host-native tools.
     if let Some(recipe) = super::recipe::lookup(tool_name) {
         return super::recipe::render_recipe(&recipe, request, network_policy);
     }
-    let target = if tool_name == "http_request" {
-        request.first()
-    } else {
-        request.last()
-    }
-    .map(String::as_str)
-    .ok_or_else(|| "工具调用缺少目标".to_string())?;
-    validate_target(target, network_policy)?;
-
+    // Stateful builtin handlers remain only when a static template cannot
+    // capture the required session state (cookie jar, headers, form).
     match tool_name {
-        "tcp_scan" | "nmap" => Ok(PreparedTool {
-            program: "/usr/bin/nmap",
-            container_image: toolkit_image(),
-            args: vec![
-                "-sT".into(),
-                "-Pn".into(),
-                "--reason".into(),
-                "--".into(),
-                target.into(),
-            ],
-        }),
-        "http_probe" => Ok(PreparedTool {
-            program: "/usr/bin/curl",
-            container_image: toolkit_image(),
-            args: vec![
-                "--silent".into(),
-                "--show-error".into(),
-                "--insecure".into(),
-                "--dump-header".into(),
-                "-".into(),
-                "--max-redirs".into(),
-                "0".into(),
-                "--max-time".into(),
-                "30".into(),
-                "--url".into(),
-                normalize_http_probe_target(target),
-            ],
-        }),
+        "http_probe" => {
+            let target = request
+                .last()
+                .map(String::as_str)
+                .ok_or_else(|| "工具调用缺少目标".to_string())?;
+            validate_target(target, network_policy)?;
+            Ok(PreparedTool {
+                program: "/usr/bin/curl",
+                args: vec![
+                    "--silent".into(),
+                    "--show-error".into(),
+                    "--insecure".into(),
+                    "--dump-header".into(),
+                    "-".into(),
+                    "--max-redirs".into(),
+                    "0".into(),
+                    "--max-time".into(),
+                    "30".into(),
+                    "--url".into(),
+                    normalize_http_probe_target(target),
+                ],
+            })
+        }
         "http_request" => {
             let url = request.first().ok_or("http_request 缺少 URL")?;
             let method = request.get(1).map(String::as_str).unwrap_or("GET");
@@ -115,402 +118,11 @@ pub fn prepare_tool(
             args.extend(["--url".into(), url.clone()]);
             Ok(PreparedTool {
                 program: "/usr/bin/curl",
-                container_image: toolkit_image(),
                 args,
             })
         }
-        "nuclei" => Ok(PreparedTool {
-            program: "/usr/bin/nuclei",
-            container_image: toolkit_image(),
-            args: vec![
-                "-u".into(),
-                target.into(),
-                "-jsonl".into(),
-                "-silent".into(),
-                "-no-interactsh".into(),
-            ],
-        }),
-        "sqli_validate"
-        | "xss_validate"
-        | "csrf_validate"
-        | "command_injection_validate"
-        | "file_inclusion_validate"
-        | "file_upload_validate" => {
-            let tag = match tool_name {
-                "sqli_validate" => "sqli",
-                "xss_validate" => "xss",
-                "csrf_validate" => "csrf",
-                "command_injection_validate" => "cmdi",
-                "file_inclusion_validate" => "lfi",
-                "file_upload_validate" => "file-upload",
-                _ => unreachable!(),
-            };
-            Ok(PreparedTool {
-                program: "/usr/bin/nuclei",
-                container_image: toolkit_image(),
-                args: vec![
-                    "-u".into(),
-                    target.into(),
-                    "-tags".into(),
-                    tag.into(),
-                    "-jsonl".into(),
-                    "-silent".into(),
-                    "-rate-limit".into(),
-                    "5".into(),
-                    "-bulk-size".into(),
-                    "1".into(),
-                    "-no-interactsh".into(),
-                ],
-            })
-        }
-        "afrog" => Ok(PreparedTool {
-            program: "/usr/local/bin/afrog",
-            container_image: toolkit_image(),
-            args: vec!["-t".into(), target.into(), "-json".into()],
-        }),
-        "dns_lookup" => Ok(PreparedTool {
-            program: "/usr/bin/dig",
-            container_image: toolkit_image(),
-            args: vec!["+short".into(), target.into()],
-        }),
-        "ssh_exec" => Ok(PreparedTool {
-            program: "/usr/bin/ssh",
-            container_image: toolkit_image(),
-            args: vec![
-                "-o".into(),
-                "ConnectTimeout=5".into(),
-                "-o".into(),
-                "StrictHostKeyChecking=no".into(),
-                target.into(),
-                "id; uptime; uname -a".into(),
-            ],
-        }),
-        "sql_query" => Ok(PreparedTool {
-            program: "/usr/bin/psql",
-            container_image: toolkit_image(),
-            args: vec![
-                "-h".into(),
-                target.into(),
-                "-c".into(),
-                "SELECT version()".into(),
-            ],
-        }),
-        // ── Reconnaissance ──────────────────────────────────────────────
-        "subfinder" => Ok(PreparedTool {
-            program: "/usr/bin/subfinder",
-            container_image: toolkit_image(),
-            args: vec!["-d".into(), target.into(), "-silent".into()],
-        }),
-        "amass" => Ok(PreparedTool {
-            program: "/usr/bin/amass",
-            container_image: toolkit_image(),
-            args: vec!["enum".into(), "-d".into(), target.into()],
-        }),
-        "dnsx" => Ok(PreparedTool {
-            program: "/usr/bin/dnsx",
-            container_image: toolkit_image(),
-            args: vec!["-d".into(), target.into(), "-silent".into()],
-        }),
-        "masscan" => Ok(PreparedTool {
-            program: "/usr/bin/masscan",
-            container_image: toolkit_image(),
-            args: vec![
-                target.into(),
-                "-p".into(),
-                "1-65535".into(),
-                "--rate".into(),
-                "1000".into(),
-            ],
-        }),
-        "naabu" => Ok(PreparedTool {
-            program: "/usr/bin/naabu",
-            container_image: toolkit_image(),
-            args: vec!["-host".into(), target.into(), "-silent".into()],
-        }),
-        // ── Web discovery ──────────────────────────────────────────────
-        "ffuf" => Ok(PreparedTool {
-            program: "/usr/bin/ffuf",
-            container_image: toolkit_image(),
-            args: vec![
-                "-u".into(),
-                format!("{target}/FUZZ"),
-                "-w".into(),
-                "/usr/share/wordlists/dirb/common.txt".into(),
-                "-mc".into(),
-                "200,204,301,302,307,401,403,405,500".into(),
-            ],
-        }),
-        "gobuster" => Ok(PreparedTool {
-            program: "/usr/bin/gobuster",
-            container_image: toolkit_image(),
-            args: vec![
-                "dir".into(),
-                "-u".into(),
-                target.into(),
-                "-w".into(),
-                "/usr/share/wordlists/dirb/common.txt".into(),
-                "-q".into(),
-            ],
-        }),
-        "nikto" => Ok(PreparedTool {
-            program: "/usr/bin/nikto",
-            container_image: toolkit_image(),
-            args: vec!["-h".into(), target.into(), "-Format".into(), "json".into()],
-        }),
-        "whatweb" => Ok(PreparedTool {
-            program: "/usr/bin/whatweb",
-            container_image: toolkit_image(),
-            args: vec![target.into(), "--no-errors".into()],
-        }),
-        "wafw00f" => Ok(PreparedTool {
-            program: "/usr/bin/wafw00f",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        "httpx" => Ok(PreparedTool {
-            program: "/usr/bin/httpx",
-            container_image: toolkit_image(),
-            args: vec![
-                "-u".into(),
-                target.into(),
-                "-silent".into(),
-                "-json".into(),
-                "-no-color".into(),
-            ],
-        }),
-        "wpscan" => Ok(PreparedTool {
-            program: "/usr/bin/wpscan",
-            container_image: toolkit_image(),
-            args: vec![
-                "--url".into(),
-                target.into(),
-                "--no-update".into(),
-                "--format".into(),
-                "json".into(),
-            ],
-        }),
-        // ── Injection ──────────────────────────────────────────────────
-        "sqlmap" => Ok(PreparedTool {
-            program: "/usr/bin/sqlmap",
-            container_image: toolkit_image(),
-            args: vec!["-u".into(), target.into(), "--batch".into()],
-        }),
-        "xsser" => Ok(PreparedTool {
-            program: "/usr/bin/xsser",
-            container_image: toolkit_image(),
-            args: vec!["--url".into(), target.into(), "--auto".into()],
-        }),
-        "commix" => Ok(PreparedTool {
-            program: "/usr/bin/commix",
-            container_image: toolkit_image(),
-            args: vec!["--url".into(), target.into(), "--batch".into()],
-        }),
-        // ── TLS ────────────────────────────────────────────────────────
-        "testssl" | "web_tls_scan" => Ok(PreparedTool {
-            program: "/usr/bin/testssl",
-            container_image: toolkit_image(),
-            args: vec!["--quiet".into(), target.into()],
-        }),
-        // ── Web discovery / crawling ──────────────────────────────────────
-        "dir_fuzz" | "dirsearch" => Ok(PreparedTool {
-            program: "/usr/bin/dirsearch",
-            container_image: toolkit_image(),
-            args: vec!["-u".into(), target.into(), "--quiet".into()],
-        }),
-        "dirb" => Ok(PreparedTool {
-            program: "/usr/bin/dirb",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        "feroxbuster" => Ok(PreparedTool {
-            program: "/usr/bin/feroxbuster",
-            container_image: toolkit_image(),
-            args: vec!["-u".into(), target.into(), "--quiet".into()],
-        }),
-        "wfuzz" => Ok(PreparedTool {
-            program: "/usr/bin/wfuzz",
-            container_image: toolkit_image(),
-            args: vec!["-u".into(), target.into()],
-        }),
-        "hakrawler" => Ok(PreparedTool {
-            program: "/usr/bin/hakrawler",
-            container_image: toolkit_image(),
-            args: vec!["-url".into(), target.into()],
-        }),
-        "katana" => Ok(PreparedTool {
-            program: "/usr/bin/katana",
-            container_image: toolkit_image(),
-            args: vec![
-                "-u".into(),
-                target.into(),
-                "-silent".into(),
-                "-json".into(),
-            ],
-        }),
-        "gau" => Ok(PreparedTool {
-            program: "/usr/bin/gau",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        "httrack" => Ok(PreparedTool {
-            program: "/usr/bin/httrack",
-            container_image: toolkit_image(),
-            args: vec![target.into(), "-O".into(), "/tmp/httrack-out".into(), "--quiet".into()],
-        }),
-        "arjun" => Ok(PreparedTool {
-            program: "/usr/bin/arjun",
-            container_image: toolkit_image(),
-            args: vec!["-u".into(), target.into()],
-        }),
-        // ── DNS enumeration ────────────────────────────────────────────────
-        "dnsrecon" => Ok(PreparedTool {
-            program: "/usr/bin/dnsrecon",
-            container_image: toolkit_image(),
-            args: vec!["-d".into(), target.into()],
-        }),
-        "dnsenum" => Ok(PreparedTool {
-            program: "/usr/bin/dnsenum",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        "fierce" => Ok(PreparedTool {
-            program: "/usr/bin/fierce",
-            container_image: toolkit_image(),
-            args: vec!["--domain".into(), target.into()],
-        }),
-        // ── OSINT ──────────────────────────────────────────────────────────
-        "dmitry" => Ok(PreparedTool {
-            program: "/usr/bin/dmitry",
-            container_image: toolkit_image(),
-            args: vec!["-s".into(), target.into()],
-        }),
-        "theharvester" => Ok(PreparedTool {
-            program: "/usr/bin/theharvester",
-            container_image: toolkit_image(),
-            args: vec!["-d".into(), target.into()],
-        }),
-        // ── Service enumeration ────────────────────────────────────────────
-        "enum4linux" => Ok(PreparedTool {
-            program: "/usr/bin/enum4linux",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        "smbmap" => Ok(PreparedTool {
-            program: "/usr/bin/smbmap",
-            container_image: toolkit_image(),
-            args: vec!["-H".into(), target.into()],
-        }),
-        "smtp-user-enum" => Ok(PreparedTool {
-            program: "/usr/bin/smtp-user-enum",
-            container_image: toolkit_image(),
-            args: vec!["-M".into(), "VRFY".into(), "-t".into(), target.into()],
-        }),
-        "swaks" => Ok(PreparedTool {
-            program: "/usr/bin/swaks",
-            container_image: toolkit_image(),
-            args: vec!["--server".into(), target.into(), "--quit-after".into(), "CONNECT".into()],
-        }),
-        "davtest" => Ok(PreparedTool {
-            program: "/usr/bin/davtest",
-            container_image: toolkit_image(),
-            args: vec!["-url".into(), target.into()],
-        }),
-        "nbtscan" => Ok(PreparedTool {
-            program: "/usr/bin/nbtscan",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        "netdiscover" => Ok(PreparedTool {
-            program: "/usr/bin/netdiscover",
-            container_image: toolkit_image(),
-            args: vec!["-r".into(), target.into()],
-        }),
-        // ── TLS scanners ────────────────────────────────────────────────────
-        "sslscan" => Ok(PreparedTool {
-            program: "/usr/bin/sslscan",
-            container_image: toolkit_image(),
-            args: vec!["--no-colour".into(), target.into()],
-        }),
-        "sslyze" => Ok(PreparedTool {
-            program: "/usr/bin/sslyze",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        "qsslcaudit" => Ok(PreparedTool {
-            program: "/usr/bin/qsslcaudit",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        // ── Web vulnerability scanners ──────────────────────────────────────
-        "web_vuln_scan" => Ok(PreparedTool {
-            program: "/usr/bin/nuclei",
-            container_image: toolkit_image(),
-            args: vec![
-                "-u".into(),
-                target.into(),
-                "-jsonl".into(),
-                "-silent".into(),
-                "-no-interactsh".into(),
-            ],
-        }),
-        "web_wordpress_scan" => Ok(PreparedTool {
-            program: "/usr/bin/wpscan",
-            container_image: toolkit_image(),
-            args: vec![
-                "--url".into(),
-                target.into(),
-                "--no-update".into(),
-                "--format".into(),
-                "json".into(),
-            ],
-        }),
-        "wapiti" => Ok(PreparedTool {
-            program: "/usr/bin/wapiti",
-            container_image: toolkit_image(),
-            args: vec!["-u".into(), target.into()],
-        }),
-        "skipfish" => Ok(PreparedTool {
-            program: "/usr/bin/skipfish",
-            container_image: toolkit_image(),
-            args: vec!["-o".into(), "/tmp/skipfish-out".into(), target.into()],
-        }),
-        "lbd" => Ok(PreparedTool {
-            program: "/usr/bin/lbd",
-            container_image: toolkit_image(),
-            args: vec![target.into()],
-        }),
-        // ── Web XSS scan ────────────────────────────────────────────────────
-        "web_xss_scan" | "dalfox" => Ok(PreparedTool {
-            program: "/usr/local/bin/dalfox",
-            container_image: toolkit_image(),
-            args: vec!["url".into(), target.into(), "--silence".into()],
-        }),
-        // ── Aliases ─────────────────────────────────────────────────────────
-        "sqlmap_scan" => Ok(PreparedTool {
-            program: "/usr/bin/sqlmap",
-            container_image: toolkit_image(),
-            args: vec!["-u".into(), target.into(), "--batch".into()],
-        }),
-        "nmap_scan" => Ok(PreparedTool {
-            program: "/usr/bin/nmap",
-            container_image: toolkit_image(),
-            args: vec![
-                "-sT".into(),
-                "-Pn".into(),
-                "--reason".into(),
-                "--".into(),
-                target.into(),
-            ],
-        }),
-        // tlssled — not available in Kali apt; excluded
-        "tlssled" => Err("tlssled 在 Kali 包仓库中不可用".into()),
-        _ => Err(format!("工具 {tool_name} 未进入允许列表")),
+        _ => Err(format!("工具 {tool_name} 未在配方中注册")),
     }
-}
-
-pub(crate) fn toolkit_image() -> String {
-    std::env::var("PENTA_TOOLKIT_IMAGE")
-        .unwrap_or_else(|_| "kairos-platform/pent-toolkit:kali-2026.1".to_string())
 }
 
 fn normalize_http_probe_target(target: &str) -> String {
@@ -602,19 +214,17 @@ mod tests {
 
     #[test]
     fn binds_command_to_authorized_target() {
+        crate::infrastructure::recipe::load_recipes_for_tests();
         let policy = NetworkPolicy::TargetOnly("example.test".into());
         let prepared =
             prepare_tool("tcp_scan", &["scan".into(), "example.test".into()], &policy).unwrap();
         assert_eq!(prepared.program, "/usr/bin/nmap");
-        assert_eq!(
-            prepared.container_image,
-            "kairos-platform/pent-toolkit:kali-2026.1"
-        );
         assert_eq!(prepared.args.last().unwrap(), "example.test");
     }
 
     #[test]
-    fn every_external_tool_uses_the_unified_toolkit_image() {
+    fn every_external_tool_resolves_a_program() {
+        crate::infrastructure::recipe::load_recipes_for_tests();
         let policy = NetworkPolicy::Full;
         for tool in [
             // Core tools
@@ -651,11 +261,7 @@ mod tests {
         ] {
             let prepared =
                 prepare_tool(tool, &["https://example.test".into()], &policy).unwrap();
-            assert_eq!(
-                prepared.container_image,
-                "kairos-platform/pent-toolkit:kali-2026.1",
-                "{tool} did not use the unified toolkit"
-            );
+            assert!(!prepared.program.is_empty(), "{tool} did not resolve a program");
         }
     }
 

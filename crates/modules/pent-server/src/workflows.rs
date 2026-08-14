@@ -26,6 +26,7 @@ pub fn routes() -> Router<PentState> {
         )
         .route("/pent/workflows/validate", post(validate_handler))
         .route("/pent/workflows/dry-run", post(dry_run_handler))
+        .route("/pent/workflows/execute", post(execute_handler))
 }
 
 /// Workflow ids follow `^[a-z0-9][a-z0-9-]{0,99}$`.
@@ -486,6 +487,267 @@ async fn dry_run_handler(
     Ok(Json(ApiResponse::new(simulate_graph(graph, &inputs))))
 }
 
+/// Evaluate a `condition` node expression against the accumulated context.
+/// Supported forms: `true`/`false`, `success`, `success == true|false`,
+/// `output contains "x"`, `output == "x"`, `last_tool == "name"`.
+pub(crate) fn evaluate_condition(expression: &str, context: &Value) -> Result<bool, String> {
+    let expr = expression.trim();
+    let success = context.get("success").and_then(Value::as_bool).unwrap_or(false);
+    let output = context.get("output").and_then(Value::as_str).unwrap_or("");
+    let last_tool = context.get("last_tool").and_then(Value::as_str).unwrap_or("");
+    let needle = |rest: &str| -> String {
+        rest.trim().trim_matches('"').trim_matches('\'').to_string()
+    };
+    match expr {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        "success" => Ok(success),
+        "success == true" | "success == 1" => Ok(success),
+        "success == false" | "success == 0" => Ok(!success),
+        _ => {
+            if let Some(rest) = expr.strip_prefix("output contains ") {
+                return Ok(output.contains(&needle(rest)));
+            }
+            if let Some(rest) = expr.strip_prefix("output == ") {
+                return Ok(output == needle(rest));
+            }
+            if let Some(rest) = expr.strip_prefix("output != ") {
+                return Ok(output != needle(rest));
+            }
+            if let Some(rest) = expr.strip_prefix("last_tool == ") {
+                return Ok(last_tool == needle(rest));
+            }
+            Err(format!("不支持的表达式: {expr}"))
+        }
+    }
+}
+
+/// Execute a workflow graph for real: tool nodes run through the sandboxed
+/// executor, condition nodes branch on accumulated context, output nodes
+/// collect results. `agent`/`hitl` nodes are recorded but not yet executed by
+/// the conversation runtime. Returns `{trace, outputs, status}`.
+pub(crate) async fn execute_workflow_graph(
+    graph: &Value,
+    inputs: &Value,
+    pool: &kairos_platform_framework_database::PgPool,
+) -> Value {
+    let errors = validate_graph(graph);
+    if !errors.is_empty() {
+        return json!({"trace": [], "outputs": {}, "errors": errors, "status": "invalid"});
+    }
+    let target = inputs.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
+    let edges = graph["edges"].as_array().cloned().unwrap_or_default();
+    let by_id: HashMap<String, Value> = nodes
+        .iter()
+        .map(|n| (node_id(n).to_string(), n.clone()))
+        .collect();
+    let out_edges = |id: &str| {
+        edges
+            .iter()
+            .filter(|e| edge_endpoint(e, "source") == id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let mut context = json!({"target": target, "success": false, "output": "", "last_tool": ""});
+    let mut outputs = serde_json::Map::new();
+    let mut trace: Vec<Value> = Vec::new();
+    let mut visited = HashSet::new();
+    let mut status = "completed";
+    let mut current = nodes.iter().find(|n| node_type(n) == "start").cloned();
+
+    while let Some(node) = current {
+        let id = node_id(&node).to_string();
+        if !visited.insert(id.clone()) {
+            status = "looped";
+            break;
+        }
+        let ty = node_type(&node).to_string();
+        let label = node
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or(&id)
+            .to_string();
+        let config = node.get("config").cloned().unwrap_or_else(|| json!({}));
+
+        let mut next: Option<String> = None;
+        let mut detail = String::new();
+        let mut node_status = "completed";
+
+        match ty.as_str() {
+            "start" => {
+                detail = "工作流开始".to_string();
+            }
+            "tool" => {
+                let tool_name = config
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let node_target = config
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        context
+                            .get("target")
+                            .and_then(Value::as_str)
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_owned)
+                    });
+                match node_target {
+                    Some(target) => {
+                        let limits = crate::infrastructure::process::ToolExecutionLimits {
+                            timeout_seconds: 300,
+                            network_access: crate::infrastructure::process::NetworkPolicy::TargetOnly(
+                                target.clone(),
+                            ),
+                            ..Default::default()
+                        };
+                        match crate::infrastructure::process::execute_tool(
+                            &tool_name,
+                            &[target.clone()],
+                            &limits,
+                        )
+                        .await
+                        {
+                            Ok(output) => {
+                                let stdout = output.stdout;
+                                context["success"] = json!(output.exit_code == 0);
+                                context["last_tool"] = json!(tool_name);
+                                context["output"] = json!(stdout.chars().take(2_000).collect::<String>());
+                                detail = format!(
+                                    "执行 {tool_name} 完成（exit {}）",
+                                    output.exit_code
+                                );
+                                if output.exit_code != 0 {
+                                    node_status = "failed";
+                                }
+                            }
+                            Err(error) => {
+                                context["success"] = json!(false);
+                                context["last_tool"] = json!(tool_name);
+                                context["output"] = json!("");
+                                detail = format!("执行 {tool_name} 失败: {error}");
+                                node_status = "failed";
+                            }
+                        }
+                    }
+                    None => {
+                        detail = format!("工具 {tool_name} 缺少目标，跳过");
+                        node_status = "skipped";
+                    }
+                }
+            }
+            "agent" => {
+                detail = format!("Agent 节点 {label} 需由对话运行时执行，本次未接入");
+                node_status = "skipped";
+            }
+            "condition" => {
+                let expression = config
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match evaluate_condition(expression, &context) {
+                    Ok(decision) => {
+                        detail = format!("条件 [{expression}] → {decision}");
+                        let branch = if decision { "true" } else { "false" };
+                        let node_edges = out_edges(&id);
+                        next = node_edges
+                            .iter()
+                            .find(|e| {
+                                e.get("config")
+                                    .and_then(|c| c.get("branch"))
+                                    .and_then(Value::as_str)
+                                    == Some(branch)
+                            })
+                            .or_else(|| {
+                                node_edges.iter().find(|e| {
+                                    e.get("config").and_then(|c| c.get("branch")).is_none()
+                                })
+                            })
+                            .map(|e| edge_endpoint(e, "target").to_string());
+                    }
+                    Err(error) => {
+                        detail = format!("条件求值失败: {error}");
+                        node_status = "failed";
+                    }
+                }
+            }
+            "hitl" => {
+                detail = "人工确认节点（本次执行记录为待确认）".to_string();
+                node_status = "pending";
+            }
+            "output" => {
+                let output_key = config
+                    .get("output_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                outputs.insert(
+                    output_key.to_string(),
+                    context.get("output").cloned().unwrap_or(Value::Null),
+                );
+                detail = format!("输出 {output_key}");
+            }
+            "end" => {
+                detail = "工作流结束".to_string();
+            }
+            other => {
+                detail = format!("节点类型 {other}");
+            }
+        }
+
+        trace.push(json!({
+            "node_id": id,
+            "label": label,
+            "type": ty,
+            "status": node_status,
+            "detail": detail,
+        }));
+
+        if matches!(ty.as_str(), "output" | "end") {
+            break;
+        }
+        if node_status == "failed" {
+            status = "failed";
+            break;
+        }
+        if let Some(target_id) = next {
+            current = by_id.get(&target_id).cloned();
+        } else {
+            current = out_edges(&id)
+                .first()
+                .and_then(|e| by_id.get(edge_endpoint(e, "target")).cloned());
+        }
+    }
+
+    let _ = pool;
+    json!({
+        "trace": trace,
+        "outputs": outputs,
+        "status": status,
+    })
+}
+
+async fn execute_handler(
+    State(s): State<PentState>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    security::tenant_id(&user)?;
+    let graph = body
+        .get("graph")
+        .ok_or_else(|| AppError::bad_request("graph 不能为空"))?;
+    let inputs = body.get("inputs").cloned().unwrap_or_else(|| json!({}));
+    Ok(Json(ApiResponse::new(
+        execute_workflow_graph(graph, &inputs, &s.pool).await,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +859,18 @@ mod tests {
         assert!(!valid_workflow_id("-bad"));
         assert!(!valid_workflow_id("Bad"));
         assert!(!valid_workflow_id(&"a".repeat(101)));
+    }
+
+    #[test]
+    fn condition_evaluates_supported_forms() {
+        let ctx = json!({"success": true, "output": "Nmap scan report", "last_tool": "nmap"});
+        assert_eq!(evaluate_condition("success == true", &ctx).unwrap(), true);
+        assert_eq!(evaluate_condition("success == false", &ctx).unwrap(), false);
+        assert!(evaluate_condition("output contains \"Nmap\"", &ctx).unwrap());
+        assert!(!evaluate_condition("output contains \"nginx\"", &ctx).unwrap());
+        assert!(evaluate_condition("output == \"Nmap scan report\"", &ctx).unwrap());
+        assert!(evaluate_condition("last_tool == \"nmap\"", &ctx).unwrap());
+        assert!(evaluate_condition("true", &ctx).unwrap());
+        assert!(evaluate_condition("bogus expr", &ctx).is_err());
     }
 }

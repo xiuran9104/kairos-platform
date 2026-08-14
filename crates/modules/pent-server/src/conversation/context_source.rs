@@ -128,12 +128,43 @@ impl ConversationContextSource for PgContextSource {
         let authorization_context =
             authorization_context_instruction(&scope_snapshot, scope_confirmed);
 
+        // Bound agent role: prompt preset + tool whitelist. The tool whitelist
+        // is surfaced to the model gateway; the prompt preset becomes a role
+        // section in the system instruction.
+        let role: Option<(String, String, serde_json::Value)> =
+            match session.3.get("role_id").and_then(serde_json::Value::as_str) {
+                Some(role_id) => sqlx::query_as(
+                    "SELECT r.name, r.user_prompt, r.tool_whitelist
+                     FROM pent_agent_roles r
+                     JOIN pent_agent_sessions s ON s.id = $2
+                       AND (r.tenant_id = s.tenant_id OR r.tenant_id = 0)
+                     WHERE r.id = $1 AND r.enabled = true",
+                )
+                .bind(role_id)
+                .bind(&req.session_id)
+                .fetch_optional(&self.pool)
+                .await?,
+                None => None,
+            };
+        if let Some((role_name, role_prompt, role_tools)) = &role {
+            policy_snapshot["_role"] = serde_json::json!({
+                "name": role_name,
+                "tool_whitelist": role_tools,
+            });
+        }
+        let role_context = match &role {
+            Some((role_name, role_prompt, _)) if !role_prompt.trim().is_empty() => {
+                format!("\n\n## 当前角色：{role_name}\n{role_prompt}")
+            }
+            _ => String::new(),
+        };
+
         Ok(ConversationContext {
             context_version: 1,
             session_id: req.session_id.clone(),
             run_id: session.4,
             system_instruction: format!(
-                "{}\n\n{}",
+                "{}{}\n\n{}",
                 r#"你是 Pent 的模型主导安全测试 Agent。你在用户确认的授权范围内自主选择下一步，
 平台负责 Scope、策略、审批、预算、执行隔离和审计。
 
@@ -171,6 +202,7 @@ impl ConversationContextSource for PgContextSource {
 4. 如果目标超出 Scope，停止该动作并说明边界，不能自行扩大授权。
 5. 只用中文回复用户；工具参数按工具 Schema 填写。
 6. 最终结果区分已验证发现、未验证线索、正常观察、阻塞项和修复建议。"#,
+                role_context,
                 authorization_context
             ),
             objective_snapshot: session.0,

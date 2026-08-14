@@ -157,8 +157,8 @@ async fn create_server(
     sqlx::query(
         "INSERT INTO pent_mcp_servers(
              id, tenant_id, name, transport, command, args, env, url,
-             enabled, timeout_secs, description
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+             headers, enabled, timeout_secs, description
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
     )
     .bind(&id)
     .bind(tenant_id)
@@ -168,6 +168,7 @@ async fn create_server(
     .bind(body.get("args").cloned().unwrap_or_else(|| json!([])))
     .bind(body.get("env").cloned().unwrap_or_else(|| json!({})))
     .bind(body.get("url").and_then(Value::as_str))
+    .bind(body.get("headers").cloned().unwrap_or_else(|| json!({})))
     .bind(
         body.get("enabled")
             .and_then(Value::as_bool)
@@ -228,9 +229,10 @@ async fn update_server(
              args=COALESCE($6, args),
              env=COALESCE($7, env),
              url=COALESCE($8, url),
-             enabled=COALESCE($9, enabled),
-             timeout_secs=COALESCE($10, timeout_secs),
-             description=COALESCE($11, description),
+             headers=COALESCE($9, headers),
+             enabled=COALESCE($10, enabled),
+             timeout_secs=COALESCE($11, timeout_secs),
+             description=COALESCE($12, description),
              updated_at=now()
          WHERE id=$1 AND tenant_id=$2",
     )
@@ -242,6 +244,7 @@ async fn update_server(
     .bind(body.get("args").cloned())
     .bind(body.get("env").cloned())
     .bind(body.get("url").and_then(Value::as_str))
+    .bind(body.get("headers").cloned())
     .bind(body.get("enabled").and_then(Value::as_bool))
     .bind(
         body.get("timeout_secs")
@@ -297,28 +300,43 @@ async fn start_server(
     .map_err(|error| AppError::internal(error.to_string()))?
     .ok_or_else(|| AppError::not_found("MCP 服务器不存在"))?;
     let transport = row["transport"].as_str().unwrap_or("stdio");
-    if transport != "stdio" {
-        return Err(AppError::bad_request(
-            "当前 MCP 客户端仅支持 stdio 传输，http/sse 暂不支持启动",
-        ));
-    }
     let registry = s
         .mcp_registry
         .as_ref()
         .ok_or_else(|| AppError::bad_request("MCP 运行时未启用"))?;
-    let command = row["command"]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::bad_request("stdio 传输缺少 command"))?;
-    let config = McpServerConfig {
-        id: id.clone(),
-        command: command.to_string(),
-        args: serde_json::from_value(row["args"].clone()).unwrap_or_default(),
-        env: serde_json::from_value(row["env"].clone()).unwrap_or_default(),
-        auto_start: true,
-        url: None,
-        headers: Default::default(),
+    let config = match transport {
+        "http" | "sse" => {
+            let url = row["url"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::bad_request("http/sse 传输缺少 url"))?;
+            McpServerConfig {
+                id: id.clone(),
+                command: String::new(),
+                args: vec![],
+                env: Default::default(),
+                auto_start: true,
+                url: Some(url.to_string()),
+                headers: serde_json::from_value(row["headers"].clone()).unwrap_or_default(),
+            }
+        }
+        _ => {
+            let command = row["command"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::bad_request("stdio 传输缺少 command"))?;
+            McpServerConfig {
+                id: id.clone(),
+                command: command.to_string(),
+                args: serde_json::from_value(row["args"].clone()).unwrap_or_default(),
+                env: serde_json::from_value(row["env"].clone()).unwrap_or_default(),
+                auto_start: true,
+                url: None,
+                headers: Default::default(),
+            }
+        }
     };
     registry
         .add_server(config)

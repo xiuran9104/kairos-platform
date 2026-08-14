@@ -188,6 +188,13 @@ fn required_permission(method: &str, path: &str) -> &'static str {
             permission_codes::RMOS_FEEDBACK
         };
     }
+    if path.starts_with("/pent/roles") {
+        return if method == "GET" {
+            permission_codes::ROLE_READ
+        } else {
+            permission_codes::ROLE_MANAGE
+        };
+    }
     if path.starts_with("/pent/settings") {
         return if method == "GET" {
             permission_codes::SETTINGS_READ

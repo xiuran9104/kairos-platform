@@ -5,6 +5,7 @@ import { useAppConfig } from '@vben/hooks';
 
 export * from './guard';
 export * from './rmos';
+export * from './roles';
 export * from './settings';
 export * from './hitl';
 export * from './agent-settings';
@@ -69,8 +70,9 @@ export function getPentTasks() { return requestClient.get('/pent/tasks'); }
 export function createPentTask(data: any) { return requestClient.post('/pent/tasks', data); }
 export function cancelPentTask(id: string) { return requestClient.post(`/pent/tasks/${id}/cancel`); }
 export function deletePentTask(id: string) { return requestClient.delete(`/pent/tasks/${id}`); }
-export function getPentRuns() { return requestClient.get('/pent/runs'); }
+export function getPentRuns(params?: Record<string, any>) { return requestClient.get('/pent/runs', { params }); }
 export function createPentRun(data: any) { return requestClient.post('/pent/runs', data); }
+export function createPentBatchRuns(data: { project_id: string; targets: string[]; name?: string; priority?: string; objective?: string }) { return requestClient.post('/pent/runs/batch', data); }
 export function cancelPentRun(id: string) { return requestClient.post(`/pent/runs/${id}/cancel`); }
 export function pausePentRun(id: string) { return requestClient.post(`/pent/runs/${id}/pause`); }
 export function resumePentRun(id: string) { return requestClient.post(`/pent/runs/${id}/resume`); }

@@ -163,8 +163,13 @@ impl ConversationToolBus {
     async fn execute_one(task: &ToolTask) -> ToolResult {
         let start = std::time::Instant::now();
         let policy = match task.network_policy.as_str() {
-            "full" => NetworkPolicy::Full,
-            "none" => NetworkPolicy::Full,
+            "none" | "deny" => NetworkPolicy::None,
+            "target_only" => task
+                .arguments
+                .iter()
+                .find(|argument| !argument.starts_with('-'))
+                .map(|target| NetworkPolicy::TargetOnly(target.clone()))
+                .unwrap_or(NetworkPolicy::Full),
             _ => NetworkPolicy::Full,
         };
         let limits = ToolExecutionLimits {

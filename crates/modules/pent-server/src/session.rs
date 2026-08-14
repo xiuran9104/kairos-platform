@@ -28,6 +28,7 @@ pub(crate) fn routes() -> Router<PentState> {
         )
         .route("/pent/sessions/{id}/scope/confirm", post(confirm_scope))
         .route("/pent/sessions/{id}/runs", post(create_session_run))
+        .route("/pent/sessions/{id}/role", axum::routing::put(update_session_role))
         .route("/pent/runs/{id}/instructions", post(create_instruction))
 }
 
@@ -170,6 +171,53 @@ async fn update_session_model(
     Ok(Json(ApiResponse::new(json!({"model_id": model_id}))))
 }
 
+async fn update_session_role(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+    Json(request): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    crate::security::ensure_session_access(&state.pool, &id, &user).await?;
+    let tenant_id = security::tenant_id(&user)?;
+    let role_id = request
+        .get("role_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("请选择角色"))?;
+    let visible: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM pent_agent_roles
+             WHERE id=$1 AND (tenant_id=$2 OR tenant_id=0) AND enabled=true
+         )",
+    )
+    .bind(role_id)
+    .bind(tenant_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(internal)?;
+    if !visible {
+        return Err(AppError::bad_request("角色不存在或未启用"));
+    }
+    let affected = sqlx::query(
+        "UPDATE pent_agent_sessions
+         SET constraints=jsonb_set(
+             constraints, '{role_id}', to_jsonb($2::text), true
+         ), updated_at=now()
+         WHERE id=$1 AND active_run_id IS NULL",
+    )
+    .bind(&id)
+    .bind(role_id)
+    .execute(&state.pool)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::bad_request("会话运行中，暂时不能切换角色"));
+    }
+    Ok(Json(ApiResponse::new(json!({"role_id": role_id}))))
+}
+
 async fn create_session(
     State(state): State<PentState>,
     user: CurrentUser,
@@ -194,6 +242,28 @@ async fn create_session(
         "confirmed_at": confirmed_at,
         "confirmed_by": user.user_id
     });
+    let mut constraints = request.constraints.clone();
+    if let Some(role_id) = request.role_id.as_deref().filter(|value| !value.trim().is_empty()) {
+        let visible: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pent_agent_roles
+                 WHERE id=$1 AND (tenant_id=$2 OR tenant_id=0) AND enabled=true
+             )",
+        )
+        .bind(role_id)
+        .bind(tenant_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(internal)?;
+        if !visible {
+            return Err(AppError::bad_request("角色不存在或未启用"));
+        }
+        if let Some(object) = constraints.as_object_mut() {
+            object.insert("role_id".into(), json!(role_id));
+        } else {
+            constraints = json!({"role_id": role_id});
+        }
+    }
     let message_id = Uuid::new_v4().to_string();
     let assistant_message_id = Uuid::new_v4().to_string();
     let mut tx = state.pool.begin().await.map_err(internal)?;
@@ -226,7 +296,7 @@ async fn create_session(
     .bind(tenant_id)
     .bind(request.project_id)
     .bind(objective)
-    .bind(&request.constraints)
+    .bind(&constraints)
     .bind(&request.budget)
     .bind(&proposal)
     .bind(&user.user_id)

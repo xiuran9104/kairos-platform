@@ -10,6 +10,7 @@ pub mod tool_lifecycle;
 pub mod tool_registry;
 pub mod tool_search_postgres;
 pub mod vector;
+pub mod vision;
 pub mod observability;
 pub mod secrets;
 pub mod cgroup;

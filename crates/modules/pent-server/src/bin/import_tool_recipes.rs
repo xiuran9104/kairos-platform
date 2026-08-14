@@ -17,11 +17,6 @@ fn default_recipes_path() -> String {
     format!("{}/tools/recipes.yaml", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn toolkit_image() -> String {
-    std::env::var("PENTA_TOOLKIT_IMAGE")
-        .unwrap_or_else(|_| "kairos-platform/pent-toolkit:kali-2026.1".to_string())
-}
-
 fn executor_json(recipe: &Recipe) -> Value {
     if recipe.executor.kind == "builtin" {
         return json!({
@@ -29,15 +24,8 @@ fn executor_json(recipe: &Recipe) -> Value {
             "handler": recipe.tool_id,
         });
     }
-    let image = recipe
-        .executor
-        .image
-        .clone()
-        .filter(|image| !image.is_empty())
-        .unwrap_or_else(toolkit_image);
     json!({
         "type": recipe.executor.kind,
-        "image": image,
         "command": recipe.executor.program,
         "args": recipe.executor.args,
         "target_position": match recipe.executor.target_position {
@@ -48,6 +36,11 @@ fn executor_json(recipe: &Recipe) -> Value {
             kairos_platform_pent_server::infrastructure::recipe::NormalizeTarget::UrlHttps => "url_https",
             kairos_platform_pent_server::infrastructure::recipe::NormalizeTarget::None => "none",
         },
+        "target_type": match recipe.executor.target_type {
+            kairos_platform_pent_server::infrastructure::recipe::TargetType::File => "file",
+            kairos_platform_pent_server::infrastructure::recipe::TargetType::Network => "network",
+        },
+        "parameters": recipe.parameters,
     })
 }
 
@@ -57,6 +50,17 @@ fn resource_profile_json(recipe: &Recipe) -> Value {
         "memory_mb": recipe.resource_profile.memory_mb,
         "timeout_seconds": recipe.resource_profile.timeout_seconds,
     })
+}
+
+/// Use the explicit `input_schema` when present; otherwise derive it from the
+/// recipe's `parameters` so the model knows the structured arguments.
+fn input_schema_for(recipe: &Recipe) -> Value {
+    if !recipe.input_schema.is_null() && recipe.input_schema != json!({}) {
+        return recipe.input_schema.clone();
+    }
+    kairos_platform_pent_server::infrastructure::recipe::parameters_to_input_schema(
+        &recipe.parameters,
+    )
 }
 
 #[tokio::main]
@@ -128,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         .bind(json!(recipe.capabilities))
         .bind(json!(recipe.tags))
         .bind(&recipe.source)
-        .bind(&recipe.input_schema)
+        .bind(input_schema_for(recipe))
         .bind(&recipe.output_schema)
         .bind(&recipe.risk_level)
         .bind(&recipe.approval_policy)

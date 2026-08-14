@@ -24,6 +24,8 @@ pub mod permission_codes {
     pub const TOOL_READ: &str = "pent:tool:read";
     pub const TOOL_MANAGE: &str = "pent:tool:manage";
     pub const TRAFFIC_READ: &str = "pent:traffic:read";
+    pub const ROLE_READ: &str = "pent:role:read";
+    pub const ROLE_MANAGE: &str = "pent:role:manage";
 }
 
 /// Tool execution risk levels for approval gating.

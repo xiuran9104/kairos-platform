@@ -174,6 +174,29 @@ impl ConversationModelGateway for AiModelGateway {
         };
         // Filter out tools that have exceeded their consecutive failure limit.
         let tools: Vec<Value> = {
+            // Apply the bound agent role's tool whitelist first (empty = all).
+            let role_whitelist: Option<std::collections::HashSet<String>> = context
+                .policy_snapshot
+                .pointer("/_role/tool_whitelist")
+                .and_then(Value::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .filter(|set: &std::collections::HashSet<String>| !set.is_empty());
+            let tools = tools
+                .into_iter()
+                .filter(|tool| match &role_whitelist {
+                    Some(whitelist) => tool
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| whitelist.contains(name)),
+                    None => true,
+                })
+                .collect::<Vec<_>>();
             let exhausted = self
                 .exhausted_tools
                 .lock()

@@ -7,7 +7,7 @@ use std::{process::Stdio, time::Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use super::tool_registry::prepare_tool;
+use super::tool_registry::{PreparedTool, prepare_tool, prepare_tool_from_json};
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
@@ -34,6 +34,42 @@ impl NetworkPolicy {
             Self::None => "none",
             Self::TargetOnly(_) => "target_only",
             Self::Full => "full",
+        }
+    }
+
+    /// Derive the network policy for a Run from its confirmed scope snapshot.
+    ///
+    /// Precedence:
+    /// 1. An explicit `network_policy` string (`none` / `full`) on the snapshot wins.
+    /// 2. Otherwise, if the scope declares confirmed targets, restrict access to
+    ///    the first target (`TargetOnly`). This mirrors the per-target isolation
+    ///    already used by `http_probe` / `http_request`.
+    /// 3. Otherwise fall back to `Full`.
+    ///
+    /// A `none` policy means every network tool is rejected upstream by
+    /// `tool_registry::validate_target`, and the audit trail records `none`.
+    pub fn derive_from_scope(scope_snapshot: &serde_json::Value) -> Self {
+        if let Some(policy) = scope_snapshot
+            .get("network_policy")
+            .or_else(|| scope_snapshot.get("network"))
+            .and_then(|value| value.as_str())
+        {
+            match policy.trim() {
+                "none" | "deny" | "off" => return Self::None,
+                "full" | "any" | "on" => return Self::Full,
+                _ => {}
+            }
+        }
+        let target = scope_snapshot
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|targets| targets.first())
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|target| !target.is_empty());
+        match target {
+            Some(target) => Self::TargetOnly(target.to_owned()),
+            None => Self::Full,
         }
     }
 }
@@ -70,7 +106,25 @@ pub(crate) async fn execute_tool_direct(
     limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
     let prepared = prepare_tool(tool_name, command, &limits.network_access)?;
+    execute_prepared_tool(tool_name, &prepared, limits).await
+}
 
+/// Execute a recipe from the model's structured JSON arguments using the
+/// DesRed-style `parameters` declarative mapping.
+pub async fn execute_tool_json(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    limits: &ToolExecutionLimits,
+) -> Result<ToolOutput, String> {
+    let prepared = prepare_tool_from_json(tool_name, arguments, &limits.network_access)?;
+    execute_prepared_tool(tool_name, &prepared, limits).await
+}
+
+async fn execute_prepared_tool(
+    tool_name: &str,
+    prepared: &PreparedTool,
+    limits: &ToolExecutionLimits,
+) -> Result<ToolOutput, String> {
     // ── Pre-flight: ensure the binary exists ──────────────────────────
     if !path_is_executable(prepared.program) {
         if auto_install_enabled() {
@@ -128,8 +182,8 @@ pub(crate) async fn execute_tool_direct(
         "executing allow-listed security tool"
     );
 
-    let audit = execution_audit(&prepared, limits)?;
-    let (runner, args) = build_runner(&prepared, limits)?;
+    let audit = execution_audit(prepared, limits)?;
+    let (runner, args) = build_runner(prepared, limits)?;
     ensure_host_state_dir()?;
 
     let capture = std::env::var("PENTA_TRAFFIC_CAPTURE")
@@ -364,6 +418,7 @@ mod tests {
         {
             return;
         }
+        crate::infrastructure::recipe::load_recipes_for_tests();
         let limits = ToolExecutionLimits {
             memory_mb: 512,
             timeout_seconds: 15,
@@ -380,6 +435,7 @@ mod tests {
 
     #[test]
     fn host_runner_uses_prlimit_and_direct_tool() {
+        crate::infrastructure::recipe::load_recipes_for_tests();
         let prepared = super::prepare_tool(
             "tcp_scan",
             &["scan".into(), "127.0.0.1".into()],
@@ -394,5 +450,31 @@ mod tests {
         assert_eq!(runner, "/usr/bin/prlimit");
         assert!(args.contains(&"--".to_string()));
         assert!(args.contains(&"/usr/bin/nmap".to_string()));
+    }
+
+    #[test]
+    fn network_policy_derives_from_scope() {
+        let none = NetworkPolicy::derive_from_scope(&serde_json::json!({
+            "targets": ["example.com"], "network_policy": "none"
+        }));
+        assert!(matches!(none, NetworkPolicy::None));
+
+        let full = NetworkPolicy::derive_from_scope(&serde_json::json!({
+            "targets": ["example.com"], "network_policy": "full"
+        }));
+        assert!(matches!(full, NetworkPolicy::Full));
+
+        let target = NetworkPolicy::derive_from_scope(&serde_json::json!({
+            "targets": ["example.com", "other.com"]
+        }));
+        assert!(matches!(target, NetworkPolicy::TargetOnly(ref t) if t == "example.com"));
+
+        let empty = NetworkPolicy::derive_from_scope(&serde_json::json!({}));
+        assert!(matches!(empty, NetworkPolicy::Full));
+
+        let empty_targets = NetworkPolicy::derive_from_scope(&serde_json::json!({
+            "targets": []
+        }));
+        assert!(matches!(empty_targets, NetworkPolicy::Full));
     }
 }

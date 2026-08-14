@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ToolSource {
     Builtin,
-    Container,
     Mcp,
     Http,
 }
@@ -33,8 +32,6 @@ pub enum ToolHealthStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolExecutorSpec {
     pub kind: ToolSource,
-    pub image: Option<String>,
-    pub image_digest: Option<String>,
     pub endpoint: Option<String>,
     pub server_id: Option<String>,
     pub handler: Option<String>,

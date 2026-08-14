@@ -94,6 +94,7 @@ export interface PentMcpServer {
   args?: string[];
   env?: Record<string, string>;
   url?: string;
+  headers?: Record<string, string>;
   enabled: boolean;
   timeout_secs?: number;
   description?: string;
