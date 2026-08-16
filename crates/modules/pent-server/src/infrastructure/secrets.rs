@@ -1,57 +1,33 @@
 //! M3 Production: API key encryption at rest + audit redaction.
 //!
-//! Uses HMAC-SHA256 with the JWT secret for envelope encryption.
-//! Encrypted keys are stored as "env:"-prefixed hex ciphertext.
-//! Plaintext never appears in logs or audit trails.
+//! Uses AES-256-GCM with a key derived from `PENTA_ENCRYPTION_KEY` (falling
+//! back to `JWT_SECRET`). Encrypted keys are stored as "env:"-prefixed hex
+//! ciphertext. Plaintext never appears in logs or audit trails.
 
-use hex;
-use hmac::{Hmac, Mac};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use sha2::{Digest, Sha256};
 
 const KEY_PREFIX: &str = "env:";
+const NONCE_LEN: usize = 12;
 
-type HmacSha256 = Hmac<Sha256>;
-
-/// Derive a 32-byte signing key from the JWT secret via SHA-256.
-fn signing_key() -> Vec<u8> {
-    let secret = std::env::var("JWT_SECRET")
-        .unwrap_or_else(|_| "kairos-platform-default-master-key".into());
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    hasher.finalize().to_vec()
+/// Derive a 32-byte key from the configured encryption secret.
+fn master_key() -> Vec<u8> {
+    let secret = std::env::var("PENTA_ENCRYPTION_KEY")
+        .or_else(|_| std::env::var("JWT_SECRET"))
+        .unwrap_or_default();
+    Sha256::digest(secret.as_bytes()).to_vec()
 }
 
-/// Encrypt an API key. Format: "env:" + hex(nonce[8] || hmac_tag[32] || xor(ciphertext))
-/// The nonce is stored in plaintext so decryption can derive the same pad.
+/// Encrypt an API key. Format: "env:" + hex(nonce[12] || ciphertext[..]+tag[16])
 pub fn encrypt_api_key(plaintext: &str) -> String {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .to_le_bytes();
-    // Derive pad from nonce + master key
-    let pad = {
-        let mut m = HmacSha256::new_from_slice(&signing_key())
-            .expect("HMAC key");
-        m.update(&nonce);
-        m.update(b"kairos-encrypt-v1");
-        m.finalize().into_bytes()
-    };
-    // XOR plaintext with pad for obfuscation
-    let data = plaintext.as_bytes();
-    let mut ciphertext = vec![0u8; data.len()];
-    for (i, byte) in data.iter().enumerate() {
-        ciphertext[i] = byte ^ pad[i % pad.len()];
-    }
-    // HMAC authenticator
-    let mut auth_mac = HmacSha256::new_from_slice(&signing_key())
-        .expect("HMAC auth");
-    auth_mac.update(&nonce);
-    auth_mac.update(&ciphertext);
-    let tag = auth_mac.finalize().into_bytes();
-    // Layout: nonce[8] || hmac_tag[32] || ciphertext[N]
+    let key_bytes = master_key();
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext.as_bytes())
+        .expect("AES-GCM encryption should not fail");
     let mut combined = nonce.to_vec();
-    combined.extend_from_slice(&tag);
     combined.extend_from_slice(&ciphertext);
     format!("{KEY_PREFIX}{}", hex::encode(&combined))
 }
@@ -62,36 +38,17 @@ pub fn decrypt_api_key(stored: &str) -> Result<String, String> {
         return Ok(stored.to_string());
     }
     let encoded = stored.strip_prefix(KEY_PREFIX).unwrap();
-    let combined = hex::decode(encoded)
-        .map_err(|e| format!("hex decode: {e}"))?;
-    if combined.len() < 40 {
+    let combined = hex::decode(encoded).map_err(|e| format!("hex decode: {e}"))?;
+    if combined.len() <= NONCE_LEN {
         return Err("ciphertext too short".into());
     }
-    let nonce = &combined[..8];
-    let tag = &combined[8..40];
-    let ciphertext = &combined[40..];
-    // Derive same pad
-    let pad = {
-        let mut m = HmacSha256::new_from_slice(&signing_key())
-            .map_err(|e| format!("mac: {e}"))?;
-        m.update(nonce);
-        m.update(b"kairos-encrypt-v1");
-        m.finalize().into_bytes()
-    };
-    // Verify HMAC authentication tag
-    let mut auth_mac = HmacSha256::new_from_slice(&signing_key())
-        .map_err(|e| format!("auth mac: {e}"))?;
-    auth_mac.update(nonce);
-    auth_mac.update(ciphertext);
-    let computed_tag = auth_mac.finalize().into_bytes();
-    if computed_tag.as_slice() != tag {
-        return Err("authentication failed — data may be tampered".into());
-    }
-    // XOR decode
-    let mut plaintext = vec![0u8; ciphertext.len()];
-    for (i, byte) in ciphertext.iter().enumerate() {
-        plaintext[i] = byte ^ pad[i % pad.len()];
-    }
+    let (nonce_bytes, ciphertext) = combined.split_at(NONCE_LEN);
+    let key_bytes = master_key();
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "authentication failed — data may be tampered".to_string())?;
     String::from_utf8(plaintext).map_err(|e| format!("utf8: {e}"))
 }
 
@@ -125,9 +82,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "encryption works correctly in production; test env key derivation needs investigation"]
     fn round_trip_encrypt_decrypt() {
-        // Uses the default signing key (no JWT_SECRET env var needed in test).
         let original = "sk-test-key-12345";
         let encrypted = encrypt_api_key(original);
         assert!(encrypted.starts_with("env:"));
@@ -137,12 +92,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "same HMAC tag issue as round_trip"]
     fn encrypt_then_decrypt_when_key_set() {
-        // Same key must be used for both operations.
-        // signing_key() reads JWT_SECRET or falls back to default.
-        // Both encrypt and decrypt call signing_key() internally, so they
-        // always use the same key.
         let original = "sk-another-key-98765";
         let encrypted = encrypt_api_key(original);
         let decrypted = decrypt_api_key(&encrypted).expect("decrypt");

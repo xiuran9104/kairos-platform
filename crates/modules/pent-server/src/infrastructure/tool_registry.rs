@@ -184,6 +184,11 @@ fn is_forbidden_infrastructure_host(host: &str) -> bool {
     use std::net::{IpAddr, Ipv4Addr};
     if let Ok(ip) = host.parse::<IpAddr>() {
         return match ip {
+            // Loopback and private ranges are intentionally NOT blocked:
+            // authorized internal/self-host testing is a core use case, and the
+            // scope confirmation is the real boundary. Only addresses that can
+            // never be a legitimate target (link-local incl. cloud metadata,
+            // unspecified, multicast, broadcast) are rejected.
             IpAddr::V4(v4) => {
                 v4.is_link_local()
                     || v4.is_unspecified()

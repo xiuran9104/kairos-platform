@@ -26,6 +26,26 @@ pub mod permission_codes {
     pub const TRAFFIC_READ: &str = "pent:traffic:read";
     pub const ROLE_READ: &str = "pent:role:read";
     pub const ROLE_MANAGE: &str = "pent:role:manage";
+    pub const MCP_READ: &str = "pent:mcp:read";
+    pub const MCP_MANAGE: &str = "pent:mcp:manage";
+    pub const SKILL_READ: &str = "pent:skill:read";
+    pub const SKILL_MANAGE: &str = "pent:skill:manage";
+    pub const WORKFLOW_READ: &str = "pent:workflow:read";
+    pub const WORKFLOW_MANAGE: &str = "pent:workflow:manage";
+    pub const AGENT_READ: &str = "pent:agent:read";
+    pub const AGENT_MANAGE: &str = "pent:agent:manage";
+    pub const ASSET_READ: &str = "pent:asset:read";
+    pub const ASSET_MANAGE: &str = "pent:asset:manage";
+    pub const FACT_READ: &str = "pent:fact:read";
+    pub const FACT_MANAGE: &str = "pent:fact:manage";
+    pub const FILE_READ: &str = "pent:file:read";
+    pub const FILE_MANAGE: &str = "pent:file:manage";
+    pub const MONITOR_READ: &str = "pent:monitor:read";
+    pub const INFOCOLLECT_READ: &str = "pent:infocollect:read";
+    pub const INFOCOLLECT_MANAGE: &str = "pent:infocollect:manage";
+    pub const KNOWLEDGE_LOG_READ: &str = "pent:knowledge-log:read";
+    pub const NODE_READ: &str = "pent:node:read";
+    pub const NODE_MANAGE: &str = "pent:node:manage";
 }
 
 /// Tool execution risk levels for approval gating.

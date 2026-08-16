@@ -225,20 +225,32 @@ pub async fn execute_write(args: Value) -> anyhow::Result<Value> {
             json!({"written": true, "file_path": canonical.to_string_lossy(), "bytes": content.len()}),
         )
     } else {
-        // New file: resolve against working directory
+        // New file: normalize the parent directory so `..` cannot escape the
+        // allowed roots, then verify the canonical parent is still within one.
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir()?.join(path)
         };
+        let file_name = absolute
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("无效文件路径: {file_path}"))?;
+        let parent = absolute.parent().unwrap_or_else(|| Path::new("/"));
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("创建父目录失败")?;
+        let canonical_parent = parent.canonicalize().context("解析父目录失败")?;
         let allowed_roots = allowed_filesystem_roots();
         anyhow::ensure!(
-            allowed_roots.iter().any(|root| absolute.starts_with(root)),
+            allowed_roots
+                .iter()
+                .any(|root| canonical_parent.starts_with(root)),
             "文件路径不在允许的根目录中: {file_path}"
         );
-        tokio::fs::write(&absolute, &content).await?;
+        let target = canonical_parent.join(file_name);
+        tokio::fs::write(&target, &content).await?;
         Ok(
-            json!({"written": true, "file_path": absolute.to_string_lossy(), "bytes": content.len()}),
+            json!({"written": true, "file_path": target.to_string_lossy(), "bytes": content.len()}),
         )
     }
 }
@@ -320,4 +332,33 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
         .user_agent("Kairos-Pent-Agent/1.0")
         .build()
         .context("创建 HTTP 客户端失败")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn write_rejects_parent_directory_traversal() {
+        let cwd = std::env::current_dir().expect("current dir");
+
+        // Attempting to escape the allowed root via `..` must fail.
+        let escape = cwd.join("..").join("kairos-escape-test.txt");
+        let result = execute_write(json!({
+            "file_path": escape.to_string_lossy(),
+            "content": "evil"
+        }))
+        .await;
+        assert!(result.is_err(), "父目录穿越应该被拒绝");
+
+        // A normal write inside the allowed root must succeed.
+        let inside = cwd.join("kairos-inside-test.txt");
+        let result = execute_write(json!({
+            "file_path": inside.to_string_lossy(),
+            "content": "ok"
+        }))
+        .await;
+        assert!(result.is_ok());
+        let _ = std::fs::remove_file(&inside);
+    }
 }

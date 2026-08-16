@@ -141,6 +141,75 @@ fn required_permission(method: &str, path: &str) -> &'static str {
             permission_codes::TOOL_MANAGE
         };
     }
+    if path.starts_with("/pent/mcp/servers") {
+        return if method == "GET" {
+            permission_codes::MCP_READ
+        } else {
+            permission_codes::MCP_MANAGE
+        };
+    }
+    if path.starts_with("/pent/skills") {
+        return if method == "GET" {
+            permission_codes::SKILL_READ
+        } else {
+            permission_codes::SKILL_MANAGE
+        };
+    }
+    if path.starts_with("/pent/workflows") {
+        return if method == "GET" {
+            permission_codes::WORKFLOW_READ
+        } else {
+            permission_codes::WORKFLOW_MANAGE
+        };
+    }
+    if path.starts_with("/pent/agents") {
+        return if method == "GET" {
+            permission_codes::AGENT_READ
+        } else {
+            permission_codes::AGENT_MANAGE
+        };
+    }
+    if path.starts_with("/pent/assets") {
+        return if method == "GET" {
+            permission_codes::ASSET_READ
+        } else {
+            permission_codes::ASSET_MANAGE
+        };
+    }
+    if path.starts_with("/pent/facts") {
+        return if method == "GET" {
+            permission_codes::FACT_READ
+        } else {
+            permission_codes::FACT_MANAGE
+        };
+    }
+    if path.starts_with("/pent/files") {
+        return if method == "GET" {
+            permission_codes::FILE_READ
+        } else {
+            permission_codes::FILE_MANAGE
+        };
+    }
+    if path.starts_with("/pent/monitor") {
+        return permission_codes::MONITOR_READ;
+    }
+    if path.starts_with("/pent/infocollect") {
+        return if method == "GET" {
+            permission_codes::INFOCOLLECT_READ
+        } else {
+            permission_codes::INFOCOLLECT_MANAGE
+        };
+    }
+    if path.starts_with("/pent/knowledge-logs") {
+        return permission_codes::KNOWLEDGE_LOG_READ;
+    }
+    if path.starts_with("/pent/nodes") {
+        return if method == "GET" {
+            permission_codes::NODE_READ
+        } else {
+            permission_codes::NODE_MANAGE
+        };
+    }
     if path.starts_with("/pent/artifacts") {
         return permission_codes::ARTIFACT_DOWNLOAD;
     }
@@ -202,7 +271,13 @@ fn required_permission(method: &str, path: &str) -> &'static str {
             permission_codes::SETTINGS_MANAGE
         };
     }
-    permission_codes::DASHBOARD_READ
+    // Fallback: reads default to dashboard access; mutations require management
+    // privileges so unmapped management routes are never reachable with the
+    // lowest permission.
+    match method {
+        "GET" | "HEAD" => permission_codes::DASHBOARD_READ,
+        _ => permission_codes::SETTINGS_MANAGE,
+    }
 }
 
 #[cfg(test)]
