@@ -6,3 +6,6 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_loop;
+pub mod context_compaction;
+pub mod context_guard;
+pub mod ports;

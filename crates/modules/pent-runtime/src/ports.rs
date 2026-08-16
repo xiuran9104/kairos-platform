@@ -1,3 +1,5 @@
+//! Runtime ports implemented by server-side adapters.
+
 use async_trait::async_trait;
 use kairos_platform_pent_api::{
     AgentTurnRequest, AgentTurnResult, ConversationContext, ConversationIntent, ModelUsage,

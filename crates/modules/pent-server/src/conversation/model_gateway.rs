@@ -6,6 +6,7 @@ use kairos_platform_ai_server::AiModelFactory;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::{ConversationContext, ConversationIntent, ModelUsage};
 use kairos_platform_pent_core::conversation::DEFAULT_CONTEXT_TOKEN_BUDGET;
+use kairos_platform_pent_runtime::context_compaction;
 use serde_json::Value;
 
 use std::collections::HashSet;
@@ -229,8 +230,8 @@ impl ConversationModelGateway for AiModelGateway {
         // Context trimming or an interrupted turn can leave either side of the
         // tool protocol without its pair. Validate every group by tool_call_id.
         sanitize_tool_message_groups(&mut api_messages);
-        if let Some(compaction) = super::context_compaction::prepare(&api_messages, context_token_budget) {
-            let fallback = super::context_compaction::fallback_summary(&compaction.older);
+        if let Some(compaction) = context_compaction::prepare(&api_messages, context_token_budget) {
+            let fallback = context_compaction::fallback_summary(&compaction.older);
             let transcript = serde_json::to_string(&compaction.older).unwrap_or_default();
             let summary = self.factory.chat(model_id, ChatRequest {
                 model: String::new(),
@@ -240,7 +241,7 @@ impl ConversationModelGateway for AiModelGateway {
                 ],
                 temperature: Some(0.0), max_tokens: Some(4000),
             }).await.ok().map(|response| response.content).filter(|v| !v.trim().is_empty()).unwrap_or(fallback);
-            api_messages = super::context_compaction::merge(summary, compaction);
+            api_messages = context_compaction::merge(summary, compaction);
             sanitize_tool_message_groups(&mut api_messages);
         }
         trim_api_messages_preserving_tool_groups(&mut api_messages, context_token_budget);

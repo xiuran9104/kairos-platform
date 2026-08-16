@@ -1788,6 +1788,10 @@ dependencies = [
 name = "kairos-platform-pent-runtime"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "kairos-platform-pent-api",
+ "serde",
  "serde_json",
 ]
 

@@ -1,9 +1,14 @@
 //! Conversation runtime ports and orchestration.
 
-mod ports;
 mod runtime;
 
-pub use ports::*;
+/// Compatibility facade for callers that still import runtime ports through
+/// `pent_server::conversation::ports`.
+pub mod ports {
+    pub use kairos_platform_pent_runtime::ports::*;
+}
+
+pub use kairos_platform_pent_runtime::ports::*;
 pub use runtime::*;
 use std::sync::Arc;
 
@@ -43,9 +48,11 @@ pub(crate) mod agent_profiles;
 pub(crate) mod claim_gate;
 mod checkpoint;
 pub(crate) mod plan_board;
-pub mod context_guard;
+/// Compatibility facade; context budgeting now belongs to `pent-runtime`.
+pub mod context_guard {
+    pub use kairos_platform_pent_runtime::context_guard::*;
+}
 pub mod context_source;
-pub(crate) mod context_compaction;
 pub mod error_codes;
 pub mod file_cache;
 pub mod http;

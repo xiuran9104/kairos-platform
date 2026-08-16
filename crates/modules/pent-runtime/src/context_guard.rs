@@ -1,4 +1,4 @@
-//! Context budget guard — prevents token overflow with smart summarization.
+//! Context budget guard that prevents token overflow with smart summarization.
 //!
 //! When the conversation history approaches the token budget, instead of
 //! blindly truncating, older messages are summarized via the model itself.
@@ -73,11 +73,7 @@ pub fn summarization_instruction(budget: &ContextBudget) -> String {
 
 /// Trim conversation messages to fit within a token budget while preserving
 /// tool call/result pairs. Older turns are dropped first.
-pub fn trim_messages_budget(
-    messages: &mut Vec<Value>,
-    max_tokens: usize,
-    preserve_last_n: usize,
-) {
+pub fn trim_messages_budget(messages: &mut Vec<Value>, max_tokens: usize, preserve_last_n: usize) {
     if messages.is_empty() {
         return;
     }

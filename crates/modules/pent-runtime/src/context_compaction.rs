@@ -1,4 +1,4 @@
-//! Context compaction policy and immutable user-intent ledger.
+//! Context compaction policy and immutable user-intent ledger for agent runtimes.
 
 use serde_json::{Value, json};
 
