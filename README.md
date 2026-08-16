@@ -93,7 +93,7 @@ Pent 主动检测工具走宿主机本地二进制，不走 Docker 工具镜像�
 ## 文档
 
 - [AI 启动交接指南](AGENTS.md)
-- [技术架构](docs/technical-solution.md)
+- [技术架构](docs/architecture.md)
+- [实现现状盘点](docs/status.md)
 - [配置与模型接入](docs/configuration.md)
 - [启动、部署与运维](docs/deployment.md)
-- [功能范围与验收口径](docs/parity-roadmap.md)

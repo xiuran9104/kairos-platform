@@ -1,0 +1,121 @@
+# Kairos Platform 架构
+
+本文档是平台当前真实架构的唯一权威说明。随代码演进维护，其余历史设计文档已并入本文与 `status.md`。
+
+## 1. 定位
+
+启元智能中台（Kairos Platform）是面向智能业务研发与运营的一体化技术平台：以 Rust/Axum 作为统一服务底座，以 Vue 3 + Vben + Ant Design Vue 提供管理控制面，通过模块化能力承载系统治理、AI 模型与 Agent、资产运营、自动化扫描和授权渗透测试等业务域。
+
+## 2. 技术栈
+
+| 层 | 选型 |
+| --- | --- |
+| 后端 | Rust（edition 2024）+ Axum 0.8 + Tokio 1.44 + SQLx 0.8 |
+| 前端 | Vue 3 + TypeScript + Ant Design Vue + Vben Admin（`@vben/web-antd`），端口 5666 |
+| 主数据库 | PostgreSQL 18（`sql/postgresql/0001_initial.sql` 为唯一初始化快照） |
+| 缓存 | Redis 8（缓存、限流） |
+| 消息 | NATS（工具执行结果、事件总线） |
+| 对象存储 | MinIO（报告、证据、流量 body 归档） |
+| 证书 | rustls + rcgen（MITM 代理动态签发） |
+
+## 3. 目录结构
+
+```text
+crates/
+  framework/               # 公共能力：common/database/web/security/redis/mq/tenant/telemetry
+  modules/
+    system-api|server      # 认证、用户、角色、权限、菜单、租户
+    infra-api|server       # 配置、文件、任务、日志、数据源
+    ai-api|server          # 模型管理、聊天/SSE、工具调用、知识库、图片/音乐/语音/Embedding
+    media-api|server       # 素材上传与媒体能力
+    pent-api               # Pent 契约：模型、事件、工具注册表、认知
+    pent-core              # Pent 领域：工具归一化、路由、认知图、规划
+    pent-server            # Pent 服务：会话、工具执行、MCP、流量落库、报告
+    mitm-proxy             # 进程内 MITM 代理：CA、TLS 终止、HTTP 转发、流量捕获
+    scan-api|server        # 扫描器、扫描任务、资产发现与归一化
+services/
+  gateway/                 # 统一入口（8080），组合各模块路由与横切中间件
+  pent-agent/              # 独立安全自动化微服务（8081）：Agent 运行时、工具执行、MITM
+  scan-agent/              # 扫描执行节点
+apps/web/                  # Vben Admin 前端 monorepo
+sql/postgresql/            # 0001_initial.sql 全量初始化快照
+script/                    # docker-compose、数据库导出/备份/迁移测试
+```
+
+依赖方向：`gateway -> module-server -> module-api`，`framework/*` 不依赖业务模块。`pent-server` 依赖 `mitm-proxy`（实现流量落库并内嵌启动代理）。
+
+## 4. 业务域
+
+- **System**：认证、用户、角色、权限、菜单、租户及后台管理。
+- **Infra**：配置、文件、任务、日志、数据源。
+- **AI**：统一模型管理、聊天/SSE、工具调用、知识库、图片、Midjourney、音乐、语音、Embedding、写作。
+- **Pent**：授权渗透任务、Agent 会话、工具路由、安全护栏、运行时编排与结果追踪。
+- **Scan**：扫描器、扫描任务、资产发现及异构扫描结果归一化。
+- **Asset Ops**：资产、机房、区域、端点、指纹与风险运营。
+- **Media**：素材上传及媒体基础能力。
+
+## 5. Pent 关键机制
+
+### 5.1 工具执行链路
+
+```text
+pent_tool_definitions 表（初始化快照）
+  -> tool_catalog 加载 active 工具定义与 JSON Schema
+  -> 模型工具清单（动态披露 + 常驻证据/流量工具）
+  -> 对话模式：http_request/http_probe/dns_lookup 等原生 handler 或 MCP
+  -> Run 模式：tool_registry::prepare_tool 按 YAML 配方渲染命令
+  -> 白名单 + Scope 校验 + 网络策略 + prlimit + cgroup v2 资源限额
+  -> execute_tool（经 ElasticExecutor：并发限制 + 熔断 + 取消）
+```
+
+安全边界：无 shell（execve 数组）、`program` 前缀白名单、目标 Scope 校验、保留地址/换行/`-` 注入拦截、输出字节上限。
+
+### 5.2 工具通道
+
+| 工具性质 | 通道 |
+| --- | --- |
+| 纯 CLI 工具 | YAML 配方（`tools/recipes.yaml`）驱动 `prepare_tool` |
+| 有状态/外部服务 | 真实 MCP（stdio / HTTP / SSE） |
+| 低延迟确定性逻辑 | builtin Rust handler（js_analyze、knowledge_search、证据/流量检索） |
+| 内部工具 | 内部 MCP server `kairos-local`（进程内、协议形状） |
+
+### 5.3 MITM 流量抓取
+
+架构决策：**代理为主，不升级为 eBPF 主层**。Burp 式明文记录依赖 TLS 中间人，eBPF 只能拿到密文与连接元数据。
+
+```text
+工具进程（注入 http_proxy/https_proxy + 平台 CA 信任）
+  -> mitm-proxy（127.0.0.1:8085）
+     普通 HTTP：absolute-form 转发
+     CONNECT 443：TLS 终止（CA 动态签发叶子证书）-> 解密后转发
+  -> 捕获 request/response -> TrafficSink
+  -> pent_http_traffic（元数据 + body，PG）
+```
+
+- 模块：`crates/modules/mitm-proxy`（`ca.rs` / `tls.rs` / `proxy.rs` / `lib.rs`）。
+- CA 持久化于 `PENTA_MITM_CA_DIR`（默认 `storage/mitm/`，已 gitignore，私钥不入库）。
+- 落库：`pent-server/src/infrastructure/mitm_sink.rs` 实现 `TrafficSink`，写入 `pent_http_traffic`（body 受 `PENTA_MITM_BODY_LIMIT` 限制）。
+- 注入：`infrastructure/process.rs` 在 `PENTA_TRAFFIC_CAPTURE=true` 时注入代理地址与 `SSL_CERT_FILE`/`CURL_CA_BUNDLE`/`REQUESTS_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS`。
+- 启动：`pent-agent` 调 `mitm_sink::spawn_mitm_proxy`。
+
+### 5.4 对话运行时与护栏
+
+- 自主循环：FINAL / ASK_USER / NO_PATH / REPLAN，预算、空转抑制、检查点、上下文压缩。
+- HITL：审批模式、全局+会话白名单、审批 TTL、审计 Agent 复核。
+- 多代理：`agent_spawn`/`agent_collect`，子代理并发与轮次上限。
+- 结果治理：进程沙箱、输出上限、审计字段、电路熔断。
+
+## 6. 数据库
+
+`sql/postgresql/0001_initial.sql` 是完整 `pg_dump` 快照，为 PostgreSQL 数据卷的唯一初始化来源。schema 变更流程见 `AGENTS.md`：改参考库 → `script/export-database-bootstrap.sh` 重导出 → 删除临时增量脚本 → `script/test-database-migrations.sh` 验证空库初始化。
+
+## 7. 服务入口
+
+| 服务 | 端口 | 职责 |
+| --- | --- | --- |
+| gateway | 8080 | 统一路由、鉴权、限流、审计，组合各模块 |
+| pent-agent | 8081 | Agent 运行时、工具执行、MCP、MITM 代理 |
+| scan-agent | — | 扫描执行节点 |
+| mitm-proxy | 8085（内嵌） | 流量抓取代理 |
+
+本地基础设施（PostgreSQL/Redis/NATS/MinIO）由 `script/docker/docker-compose.yml` 启动。
