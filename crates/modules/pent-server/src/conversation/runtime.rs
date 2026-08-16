@@ -15,8 +15,8 @@ use super::{
     ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
     ConversationToolExecutor, FindingRecorder, ModelTurnOutput, PlanStore, RoleResolver,
-    RuntimeAgentStatus, RuntimeToolCall, SkillStore, ToolApprovalGate, ToolApprovalOutcome,
-    ToolApprovalRequest, ToolExecutionContext,
+    RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall, SkillStore, ToolApprovalGate,
+    ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
@@ -166,10 +166,10 @@ pub struct ConversationRuntime {
     plan_store: Arc<dyn PlanStore>,
     role_resolver: Arc<dyn RoleResolver>,
     skill_store: Arc<dyn SkillStore>,
+    enrichment: Arc<dyn RuntimeEnrichment>,
     agent_sessions: Arc<dyn AgentSessionFactory>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
-    pool: kairos_platform_framework_database::PgPool,
 }
 
 impl ConversationRuntime {
@@ -186,9 +186,9 @@ impl ConversationRuntime {
         plan_store: Arc<dyn PlanStore>,
         role_resolver: Arc<dyn RoleResolver>,
         skill_store: Arc<dyn SkillStore>,
+        enrichment: Arc<dyn RuntimeEnrichment>,
         agent_sessions: Arc<dyn AgentSessionFactory>,
         events: Arc<dyn ConversationEventSink>,
-        pool: kairos_platform_framework_database::PgPool,
     ) -> Self {
         Self {
             repository,
@@ -203,10 +203,10 @@ impl ConversationRuntime {
             plan_store,
             role_resolver,
             skill_store,
+            enrichment,
             agent_sessions,
             events,
             nats: None,
-            pool,
         }
     }
 
@@ -328,12 +328,10 @@ impl ConversationRuntime {
         // 交互式会话路径也要在 Run 完成后提取并落库已确认漏洞。
         // 自主 Worker 路径由 `execute_session_run` 负责提取，这里只兜底 UI 路径。
         if let Some(run_id) = result.run_id.as_deref() {
-            match super::run_bridge::extract_and_persist_findings(
-                &self.pool,
-                run_id,
-                &request.session_id,
-            )
-            .await
+            match self
+                .finding_recorder
+                .reconcile(run_id, &request.session_id)
+                .await
             {
                 Ok(count) if count > 0 => {
                     if let Err(error) = self
@@ -602,7 +600,7 @@ impl ConversationRuntime {
 
             // ── RMOS: inject memory + knowledge + attack chain ──
             let injection = prepare_injection(
-                &self.pool,
+                self.enrichment.as_ref(),
                 &pentest_memory,
                 &mut knowledge_cache,
                 &attack_graph,
@@ -1649,7 +1647,7 @@ impl ConversationRuntime {
                 }
             }
         }
-        if let Ok(memories) = search_vector_memories(&self.pool, query, 3).await {
+        if let Ok(memories) = self.enrichment.search_memories(query, 3).await {
             for memory in memories {
                 guides.push(super::ports::KnowledgeGuide {
                     id: format!("vec-{}", uuid::Uuid::new_v4()),
@@ -1724,8 +1722,7 @@ impl ConversationRuntime {
             };
         }
         let question = parsed.get("question").and_then(serde_json::Value::as_str);
-        let prompt = crate::infrastructure::vision::screenshot_prompt(question);
-        match crate::infrastructure::vision::analyze_image(&self.pool, image, &prompt).await {
+        match self.enrichment.analyze_image(image, question).await {
             Ok(summary) => super::tool_executor::ConversationToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 tool_name: "vision_analyze".into(),
@@ -1739,7 +1736,8 @@ impl ConversationRuntime {
             Err(error) => super::tool_executor::ConversationToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 tool_name: "vision_analyze".into(),
-                content: serde_json::json!({"error": error, "retryable": false}).to_string(),
+                content: serde_json::json!({"error": error.to_string(), "retryable": false})
+                    .to_string(),
                 success: false,
             },
         }
@@ -1753,43 +1751,10 @@ impl ConversationRuntime {
         session_id: &str,
         run_id: Option<&str>,
     ) {
-        let retrieved_items: Vec<serde_json::Value> = guides
-            .iter()
-            .map(|guide| {
-                serde_json::json!({
-                    "id": if guide.id.is_empty() { guide.title.as_str() } else { guide.id.as_str() },
-                    "title": guide.title,
-                })
-            })
-            .collect();
-        let result = async {
-            let tenant_id: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(
-                     (SELECT tenant_id FROM pent_runs WHERE id=$1),
-                     (SELECT tenant_id FROM pent_agent_sessions WHERE id=$2),
-                     0
-                 )",
-            )
-            .bind(run_id)
-            .bind(session_id)
-            .fetch_one(&self.pool)
-            .await?;
-            sqlx::query(
-                "INSERT INTO pent_knowledge_retrieval_logs(
-                     id, tenant_id, query, risk_type, conversation_id, message_id, retrieved_items
-                 ) VALUES($1,$2,$3,'',$4,$5,$6)",
-            )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(tenant_id)
-            .bind(query)
-            .bind(session_id)
-            .bind(Option::<String>::None)
-            .bind(serde_json::json!(retrieved_items))
-            .execute(&self.pool)
-            .await?;
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
+        let result = self
+            .enrichment
+            .log_knowledge_retrieval(query, guides, session_id, run_id)
+            .await;
         if let Err(error) = result {
             tracing::warn!(%error, query, "knowledge retrieval log write failed");
         }
@@ -2266,31 +2231,6 @@ fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     } else {
         value.trim()
     }
-}
-
-/// M3: Vector semantic search on pent_knowledge_documents via pgvector.
-/// Falls back gracefully if no embedding provider is configured.
-async fn search_vector_memories(
-    pool: &kairos_platform_framework_database::PgPool,
-    query: &str,
-    top_k: usize,
-) -> anyhow::Result<Vec<String>> {
-    let mut embedder = crate::infrastructure::embedding::EmbeddingProvider::new(pool.clone());
-    if !embedder.try_configure().await.unwrap_or(false) {
-        return Ok(Vec::new());
-    }
-    let Some(embedding) = embedder.embed(query).await else {
-        return Ok(Vec::new());
-    };
-    let index = crate::infrastructure::vector::PgVectorIndex::new(pool.clone());
-    let results = index
-        .search(&embedding, None, top_k)
-        .await
-        .unwrap_or_default();
-    Ok(results
-        .into_iter()
-        .map(|r| format!("{} v{} (score: {:.2})", r.tool_id, r.version, r.score))
-        .collect())
 }
 
 fn compact_runtime_error(error: &str) -> String {

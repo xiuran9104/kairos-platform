@@ -12,52 +12,12 @@
 //! hasn't been loaded before, avoiding redundant token consumption.
 
 use kairos_platform_framework_database::PgPool;
+use kairos_platform_pent_runtime::ports::RuntimeKnowledgeLayer as KnowledgeLayer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
 /// Which wiki layer to search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum KnowledgeLayer {
-    Technology,
-    Vulnerability,
-    Methodology,
-    ToolUsage,
-    ExploitCase,
-    Remediation,
-}
-
-impl KnowledgeLayer {
-    fn table_filter(&self) -> &'static str {
-        match self {
-            Self::Technology => "technology",
-            Self::Vulnerability => "vulnerability",
-            Self::Methodology => "methodology",
-            Self::ToolUsage => "tool_usage",
-            Self::ExploitCase => "exploit_case",
-            Self::Remediation => "remediation",
-        }
-    }
-
-    /// All layers that should be searched for a given trigger type.
-    pub fn layers_for_technology() -> Vec<Self> {
-        vec![Self::Technology, Self::ExploitCase]
-    }
-
-    pub fn layers_for_vulnerability() -> Vec<Self> {
-        vec![Self::Vulnerability, Self::ExploitCase, Self::Remediation]
-    }
-
-    pub fn layers_for_tool(tool_name: &str) -> Vec<Self> {
-        let _ = tool_name;
-        vec![Self::ToolUsage]
-    }
-
-    pub fn layers_for_methodology() -> Vec<Self> {
-        vec![Self::Methodology]
-    }
-}
-
 /// Cache entry tracking what knowledge has been loaded.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KnowledgeCache {
@@ -120,6 +80,17 @@ pub struct KnowledgeResult {
     pub content: String,
 }
 
+fn layer_tag(layer: KnowledgeLayer) -> &'static str {
+    match layer {
+        KnowledgeLayer::Technology => "technology",
+        KnowledgeLayer::Vulnerability => "vulnerability",
+        KnowledgeLayer::Methodology => "methodology",
+        KnowledgeLayer::ToolUsage => "tool_usage",
+        KnowledgeLayer::ExploitCase => "exploit_case",
+        KnowledgeLayer::Remediation => "remediation",
+    }
+}
+
 /// Search the wiki for a specific topic across specified layers.
 /// Returns formatted knowledge fragments ready for system prompt injection.
 pub async fn search_wiki(
@@ -134,7 +105,7 @@ pub async fn search_wiki(
 
     let layer_filters: Vec<String> = layers
         .iter()
-        .map(|l| format!("tags ? '{}'", l.table_filter()))
+        .map(|layer| format!("tags ? '{}'", layer_tag(*layer)))
         .collect();
     let filter_clause = layer_filters.join(" OR ");
 
@@ -182,7 +153,10 @@ pub async fn search_wiki(
                 .and_then(|arr| {
                     arr.iter().find_map(|t| {
                         let s = t.as_str()?;
-                        layers.iter().find(|l| l.table_filter() == s).map(|_| s)
+                        layers
+                            .iter()
+                            .find(|layer| layer_tag(**layer) == s)
+                            .map(|_| s)
                     })
                 })
                 .unwrap_or("general");
@@ -209,10 +183,7 @@ pub fn format_knowledge(results: &[KnowledgeResult], layer_name: &str) -> String
     }
     let mut parts = vec![format!("### {} 相关知识", layer_name)];
     for r in results.iter().take(3) {
-        parts.push(format!(
-            "**{}** ({}):\n{}",
-            r.title, r.layer, r.content
-        ));
+        parts.push(format!("**{}** ({}):\n{}", r.title, r.layer, r.content));
     }
     parts.join("\n\n")
 }

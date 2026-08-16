@@ -4,10 +4,12 @@
 //! Called at the start of every tool-loop round. Only injects new
 //! knowledge (cache-miss), always injects current memory state.
 
-use kairos_platform_framework_database::PgPool;
-use super::memory::PentestMemory;
-use super::knowledge_cache::{self, KnowledgeCache, KnowledgeLayer};
 use super::attack_graph::AttackGraph;
+use super::knowledge_cache::{self, KnowledgeCache};
+use super::memory::PentestMemory;
+use kairos_platform_pent_runtime::ports::{
+    RuntimeEnrichment, RuntimeKnowledgeLayer as KnowledgeLayer,
+};
 
 /// What gets injected into the system prompt for the next turn.
 pub struct Injection {
@@ -34,7 +36,7 @@ impl Injection {
 
 /// Compute the injection for the next turn.
 pub async fn prepare_injection(
-    pool: &PgPool,
+    enrichment: &dyn RuntimeEnrichment,
     memory: &PentestMemory,
     cache: &mut KnowledgeCache,
     graph: &AttackGraph,
@@ -52,17 +54,20 @@ pub async fn prepare_injection(
     // New technologies → search technology + exploit_case layers
     for tech in &memory.technologies {
         if cache.needs_technology_search(tech) {
-            let results = knowledge_cache::search_wiki(
-                pool,
+            let results = search_knowledge(
+                enrichment,
                 tech,
                 &KnowledgeLayer::layers_for_technology(),
                 3,
             )
             .await;
             if !results.is_empty() {
-                injection.knowledge_blocks.push(
-                    knowledge_cache::format_knowledge(&results, &format!("技术栈: {tech}"))
-                );
+                injection
+                    .knowledge_blocks
+                    .push(knowledge_cache::format_knowledge(
+                        &results,
+                        &format!("技术栈: {tech}"),
+                    ));
                 injection.has_content = true;
             }
             cache.mark_technology(tech);
@@ -78,17 +83,20 @@ pub async fn prepare_injection(
 
     for vuln in &vuln_types {
         if cache.needs_vulnerability_search(vuln) {
-            let results = knowledge_cache::search_wiki(
-                pool,
+            let results = search_knowledge(
+                enrichment,
                 vuln,
                 &KnowledgeLayer::layers_for_vulnerability(),
                 3,
             )
             .await;
             if !results.is_empty() {
-                injection.knowledge_blocks.push(
-                    knowledge_cache::format_knowledge(&results, &format!("漏洞: {vuln}"))
-                );
+                injection
+                    .knowledge_blocks
+                    .push(knowledge_cache::format_knowledge(
+                        &results,
+                        &format!("漏洞: {vuln}"),
+                    ));
                 injection.has_content = true;
             }
             cache.mark_vulnerability(vuln);
@@ -98,31 +106,39 @@ pub async fn prepare_injection(
     // Methodology: inject once per session, including full vulnerability checklist
     if cache.needs_methodology() {
         // First inject general methodology
-        let results = knowledge_cache::search_wiki(
-            pool,
+        let results = search_knowledge(
+            enrichment,
             "penetration testing methodology web application",
             &KnowledgeLayer::layers_for_methodology(),
             3,
         )
         .await;
         if !results.is_empty() {
-            injection.knowledge_blocks.push(
-                knowledge_cache::format_knowledge(&results, "渗透方法论")
-            );
+            injection
+                .knowledge_blocks
+                .push(knowledge_cache::format_knowledge(&results, "渗透方法论"));
             injection.has_content = true;
         }
 
         // Pre-fetch methodology for ALL common vulnerability types
         // so the LLM knows what to test BEFORE finding anything.
         let preload_types = [
-            "idor", "jwt", "ssrf", "xss", "sql injection",
-            "access control", "file upload", "path traversal",
-            "csrf", "sensitive data exposure", "security misconfiguration",
+            "idor",
+            "jwt",
+            "ssrf",
+            "xss",
+            "sql injection",
+            "access control",
+            "file upload",
+            "path traversal",
+            "csrf",
+            "sensitive data exposure",
+            "security misconfiguration",
         ];
         let mut preload_results: Vec<String> = Vec::new();
         for vuln_type in &preload_types {
-            let results = knowledge_cache::search_wiki(
-                pool,
+            let results = search_knowledge(
+                enrichment,
                 vuln_type,
                 &[KnowledgeLayer::Vulnerability, KnowledgeLayer::ExploitCase],
                 2,
@@ -160,6 +176,25 @@ pub async fn prepare_injection(
     }
 
     injection
+}
+
+async fn search_knowledge(
+    enrichment: &dyn RuntimeEnrichment,
+    query: &str,
+    layers: &[KnowledgeLayer],
+    limit: usize,
+) -> Vec<knowledge_cache::KnowledgeResult> {
+    enrichment
+        .search_context_knowledge(query, layers, limit)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|result| knowledge_cache::KnowledgeResult {
+            title: result.title,
+            layer: result.layer,
+            content: result.content,
+        })
+        .collect()
 }
 
 /// Build the full injected content to append to the system prompt.

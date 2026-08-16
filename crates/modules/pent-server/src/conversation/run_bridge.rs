@@ -24,6 +24,12 @@ impl FindingRecorder for PgFindingRecorder {
             .await
             .map_err(anyhow::Error::msg)
     }
+
+    async fn reconcile(&self, run_id: &str, session_id: &str) -> anyhow::Result<usize> {
+        extract_and_persist_findings(&self.pool, run_id, session_id)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 /// Execute a session-backed Run through the same autonomous conversation

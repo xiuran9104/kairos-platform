@@ -102,6 +102,7 @@ pub trait ToolApprovalGate: Send + Sync {
 #[async_trait]
 pub trait FindingRecorder: Send + Sync {
     async fn record(&self, run_id: &str, arguments: &str) -> anyhow::Result<serde_json::Value>;
+    async fn reconcile(&self, run_id: &str, session_id: &str) -> anyhow::Result<usize>;
 }
 
 #[async_trait]
@@ -130,6 +131,63 @@ pub trait RoleResolver: Send + Sync {
 #[async_trait]
 pub trait SkillStore: Send + Sync {
     async fn execute(&self, tool_name: &str, arguments: &str) -> anyhow::Result<serde_json::Value>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKnowledgeLayer {
+    Technology,
+    Vulnerability,
+    Methodology,
+    ToolUsage,
+    ExploitCase,
+    Remediation,
+}
+
+impl RuntimeKnowledgeLayer {
+    pub fn layers_for_technology() -> Vec<Self> {
+        vec![Self::Technology, Self::ExploitCase]
+    }
+
+    pub fn layers_for_vulnerability() -> Vec<Self> {
+        vec![Self::Vulnerability, Self::ExploitCase, Self::Remediation]
+    }
+
+    pub fn layers_for_methodology() -> Vec<Self> {
+        vec![Self::Methodology]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeKnowledgeBlock {
+    pub title: String,
+    pub layer: String,
+    pub content: String,
+}
+
+#[async_trait]
+pub trait RuntimeEnrichment: Send + Sync {
+    async fn search_context_knowledge(
+        &self,
+        query: &str,
+        layers: &[RuntimeKnowledgeLayer],
+        limit: usize,
+    ) -> anyhow::Result<Vec<RuntimeKnowledgeBlock>>;
+
+    async fn search_memories(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<String>>;
+
+    async fn analyze_image(
+        &self,
+        image_data_url: &str,
+        question: Option<&str>,
+    ) -> anyhow::Result<String>;
+
+    async fn log_knowledge_retrieval(
+        &self,
+        query: &str,
+        guides: &[KnowledgeGuide],
+        session_id: &str,
+        run_id: Option<&str>,
+    ) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +437,10 @@ mod tests {
         ) -> anyhow::Result<serde_json::Value> {
             Ok(serde_json::json!({"recorded": true}))
         }
+
+        async fn reconcile(&self, _run_id: &str, _session_id: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
     }
 
     struct StubPlanStore;
@@ -417,6 +479,46 @@ mod tests {
             _arguments: &str,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(serde_json::json!({}))
+        }
+    }
+
+    struct StubRuntimeEnrichment;
+
+    #[async_trait]
+    impl RuntimeEnrichment for StubRuntimeEnrichment {
+        async fn search_context_knowledge(
+            &self,
+            _query: &str,
+            _layers: &[RuntimeKnowledgeLayer],
+            _limit: usize,
+        ) -> anyhow::Result<Vec<RuntimeKnowledgeBlock>> {
+            Ok(Vec::new())
+        }
+
+        async fn search_memories(
+            &self,
+            _query: &str,
+            _top_k: usize,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn analyze_image(
+            &self,
+            _image_data_url: &str,
+            _question: Option<&str>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn log_knowledge_retrieval(
+            &self,
+            _query: &str,
+            _guides: &[KnowledgeGuide],
+            _session_id: &str,
+            _run_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -472,6 +574,8 @@ mod tests {
         let _: &dyn RoleResolver = &roles;
         let skills = StubSkillStore;
         let _: &dyn SkillStore = &skills;
+        let enrichment = StubRuntimeEnrichment;
+        let _: &dyn RuntimeEnrichment = &enrichment;
     }
 
     #[test]

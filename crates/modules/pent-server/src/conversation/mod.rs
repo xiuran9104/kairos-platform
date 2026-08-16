@@ -43,6 +43,8 @@ pub(crate) fn build_runtime(
     let plan_store: Arc<dyn PlanStore> = Arc::new(plan_board::PgPlanStore::new(pool.clone()));
     let role_resolver: Arc<dyn RoleResolver> = Arc::new(agent_profiles::MarkdownRoleResolver);
     let skill_store: Arc<dyn SkillStore> = Arc::new(skill_store::PgSkillStore::new(pool.clone()));
+    let enrichment: Arc<dyn RuntimeEnrichment> =
+        Arc::new(enrichment_adapter::PgRuntimeEnrichment::new(pool.clone()));
     let events: Arc<dyn ConversationEventSink> = Arc::new(LoggingConversationEventSink);
     let agent_sessions: Arc<dyn AgentSessionFactory> =
         Arc::new(agent_manager::ServerAgentSessionFactory::new(
@@ -70,9 +72,9 @@ pub(crate) fn build_runtime(
         plan_store,
         role_resolver,
         skill_store,
+        enrichment,
         agent_sessions,
         events,
-        pool.clone(),
     );
     if let Some(n) = nats {
         rt.with_nats(n)
@@ -95,6 +97,7 @@ pub mod context_guard {
 }
 pub mod context_source;
 pub mod error_codes;
+mod enrichment_adapter;
 pub mod file_cache;
 pub mod http;
 pub mod hitl;
