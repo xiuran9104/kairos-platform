@@ -81,17 +81,6 @@ services:
       - "127.0.0.1:9222:9222"
     shm_size: 2gb
 
-  # mitmproxy — transparent HTTP proxy for Burp-like capture/replay
-  mitmproxy:
-    image: mitmproxy/mitmproxy:latest
-    container_name: kairos-platform-mitmproxy
-    command: mitmweb --web-host 0.0.0.0 --web-port 8081 --listen-port 8085
-    ports:
-      - "127.0.0.1:8081:8081"  # mitmweb UI
-      - "127.0.0.1:8085:8085"  # proxy port
-    volumes:
-      - kairos-platform-mitmproxy-data:/home/mitmproxy
-
   # ── M2-F12: Distributed Pent Agent worker nodes ──────────────────
   # Each instance is an independent worker that claims queued runs via
   # DB advisory lock. Scale horizontally by increasing the replica count
@@ -139,4 +128,3 @@ volumes:
   kairos-platform-minio:
   kairos-platform-neo4j:
   kairos-platform-chrome-data:
-  kairos-platform-mitmproxy-data:
