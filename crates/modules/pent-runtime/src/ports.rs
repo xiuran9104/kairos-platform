@@ -116,6 +116,23 @@ pub trait PlanStore: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+pub struct RuntimeAgentProfile {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub instruction: String,
+}
+
+pub trait RoleResolver: Send + Sync {
+    fn resolve(&self, role: &str) -> anyhow::Result<Option<RuntimeAgentProfile>>;
+}
+
+#[async_trait]
+pub trait SkillStore: Send + Sync {
+    async fn execute(&self, tool_name: &str, arguments: &str) -> anyhow::Result<serde_json::Value>;
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentSpawnRequest {
     pub description: String,
     pub prompt: String,
@@ -215,13 +232,6 @@ pub trait ConversationRepository: Send + Sync {
         run_id: &str,
         evidence_ids: &[String],
     ) -> anyhow::Result<Vec<(String, String)>>;
-    /// Execute one of the Skill tools (`skill_list`, `skill_load`). Only
-    /// published skills are visible; skills never widen scope.
-    async fn execute_skill_tool(
-        &self,
-        tool_name: &str,
-        arguments: &str,
-    ) -> anyhow::Result<serde_json::Value>;
     /// Persist HTTP exchanges captured from `http_request` / `http_probe`
     /// conversation tool results. Returns the ids of the inserted rows.
     async fn record_http_traffic(
@@ -389,6 +399,27 @@ mod tests {
         }
     }
 
+    struct StubRoleResolver;
+
+    impl RoleResolver for StubRoleResolver {
+        fn resolve(&self, _role: &str) -> anyhow::Result<Option<RuntimeAgentProfile>> {
+            Ok(None)
+        }
+    }
+
+    struct StubSkillStore;
+
+    #[async_trait]
+    impl SkillStore for StubSkillStore {
+        async fn execute(
+            &self,
+            _tool_name: &str,
+            _arguments: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
     #[async_trait]
     impl ToolApprovalGate for StubToolApprovalGate {
         async fn review(
@@ -433,6 +464,14 @@ mod tests {
         let _: &dyn FindingRecorder = &recorder;
         let plans = StubPlanStore;
         let _: &dyn PlanStore = &plans;
+    }
+
+    #[test]
+    fn capability_ports_are_object_safe() {
+        let roles = StubRoleResolver;
+        let _: &dyn RoleResolver = &roles;
+        let skills = StubSkillStore;
+        let _: &dyn SkillStore = &skills;
     }
 
     #[test]

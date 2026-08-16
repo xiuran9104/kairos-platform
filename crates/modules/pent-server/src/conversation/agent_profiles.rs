@@ -2,8 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
-pub struct AgentProfile { pub id: String, pub name: String, pub description: String, pub instruction: String }
+pub use kairos_platform_pent_runtime::ports::RuntimeAgentProfile as AgentProfile;
+use kairos_platform_pent_runtime::ports::RoleResolver;
+
+pub struct MarkdownRoleResolver;
+
+impl RoleResolver for MarkdownRoleResolver {
+    fn resolve(&self, role: &str) -> anyhow::Result<Option<AgentProfile>> {
+        load(role)
+    }
+}
 
 /// Root directory holding the markdown agent profiles.
 pub(crate) fn agents_dir() -> PathBuf {

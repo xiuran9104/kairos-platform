@@ -14,9 +14,9 @@ use super::{
     AgentSession, AgentSessionFactory, AgentSpawnRequest, ConversationContextSource,
     ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
-    ConversationToolExecutor, FindingRecorder, ModelTurnOutput, PlanStore, RuntimeAgentStatus,
-    RuntimeToolCall, ToolApprovalGate, ToolApprovalOutcome, ToolApprovalRequest,
-    ToolExecutionContext,
+    ConversationToolExecutor, FindingRecorder, ModelTurnOutput, PlanStore, RoleResolver,
+    RuntimeAgentStatus, RuntimeToolCall, SkillStore, ToolApprovalGate, ToolApprovalOutcome,
+    ToolApprovalRequest, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
@@ -164,6 +164,8 @@ pub struct ConversationRuntime {
     approval_gate: Arc<dyn ToolApprovalGate>,
     finding_recorder: Arc<dyn FindingRecorder>,
     plan_store: Arc<dyn PlanStore>,
+    role_resolver: Arc<dyn RoleResolver>,
+    skill_store: Arc<dyn SkillStore>,
     agent_sessions: Arc<dyn AgentSessionFactory>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
@@ -182,6 +184,8 @@ impl ConversationRuntime {
         approval_gate: Arc<dyn ToolApprovalGate>,
         finding_recorder: Arc<dyn FindingRecorder>,
         plan_store: Arc<dyn PlanStore>,
+        role_resolver: Arc<dyn RoleResolver>,
+        skill_store: Arc<dyn SkillStore>,
         agent_sessions: Arc<dyn AgentSessionFactory>,
         events: Arc<dyn ConversationEventSink>,
         pool: kairos_platform_framework_database::PgPool,
@@ -197,6 +201,8 @@ impl ConversationRuntime {
             approval_gate,
             finding_recorder,
             plan_store,
+            role_resolver,
+            skill_store,
             agent_sessions,
             events,
             nats: None,
@@ -1467,8 +1473,8 @@ impl ConversationRuntime {
             }
             "skill_list" | "skill_load" => {
                 let content = self
-                    .repository
-                    .execute_skill_tool(&tc.name, &tc.arguments)
+                    .skill_store
+                    .execute(&tc.name, &tc.arguments)
                     .await
                     .map(|v| v.to_string());
                 super::tool_executor::ConversationToolResult {
@@ -1852,7 +1858,7 @@ impl ConversationRuntime {
             .get("role")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        if let Ok(Some(profile)) = super::agent_profiles::load(role) {
+        if let Ok(Some(profile)) = self.role_resolver.resolve(role) {
             prompt = format!(
                 "## 专家角色：{} ({})\n{}\n\n## 本次委派\n{}",
                 profile.name, profile.id, profile.instruction, prompt

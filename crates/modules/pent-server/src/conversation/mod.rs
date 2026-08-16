@@ -41,6 +41,8 @@ pub(crate) fn build_runtime(
     let finding_recorder: Arc<dyn FindingRecorder> =
         Arc::new(run_bridge::PgFindingRecorder::new(pool.clone()));
     let plan_store: Arc<dyn PlanStore> = Arc::new(plan_board::PgPlanStore::new(pool.clone()));
+    let role_resolver: Arc<dyn RoleResolver> = Arc::new(agent_profiles::MarkdownRoleResolver);
+    let skill_store: Arc<dyn SkillStore> = Arc::new(skill_store::PgSkillStore::new(pool.clone()));
     let events: Arc<dyn ConversationEventSink> = Arc::new(LoggingConversationEventSink);
     let agent_sessions: Arc<dyn AgentSessionFactory> =
         Arc::new(agent_manager::ServerAgentSessionFactory::new(
@@ -51,6 +53,7 @@ pub(crate) fn build_runtime(
             tool_executor.clone(),
             approval_gate.clone(),
             finding_recorder.clone(),
+            skill_store.clone(),
             events.clone(),
             intent_detector.clone(),
         ));
@@ -65,6 +68,8 @@ pub(crate) fn build_runtime(
         approval_gate,
         finding_recorder,
         plan_store,
+        role_resolver,
+        skill_store,
         agent_sessions,
         events,
         pool.clone(),
@@ -101,6 +106,7 @@ pub mod repository_postgres;
 pub(crate) mod run_bridge;
 pub mod rmos;
 mod scan_progress;
+mod skill_store;
 pub mod stream;
 pub mod structured_output;
 pub mod tool_bus;

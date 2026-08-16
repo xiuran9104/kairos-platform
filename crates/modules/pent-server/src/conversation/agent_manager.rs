@@ -14,7 +14,7 @@ use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessa
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
-    ConversationToolExecutor, FindingRecorder, RuntimeToolCall, ToolApprovalGate,
+    ConversationToolExecutor, FindingRecorder, RuntimeToolCall, SkillStore, ToolApprovalGate,
     ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
@@ -99,6 +99,7 @@ impl AgentManager {
         tool_executor: Arc<dyn ConversationToolExecutor>,
         approval_gate: Arc<dyn ToolApprovalGate>,
         finding_recorder: Arc<dyn FindingRecorder>,
+        skill_store: Arc<dyn SkillStore>,
         events: Arc<dyn ConversationEventSink>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
     ) -> anyhow::Result<String> {
@@ -160,6 +161,7 @@ impl AgentManager {
                 tool_executor,
                 approval_gate,
                 finding_recorder,
+                skill_store,
                 events,
                 intent_detector,
             )
@@ -249,6 +251,7 @@ pub struct ServerAgentSessionFactory {
     tool_executor: Arc<dyn ConversationToolExecutor>,
     approval_gate: Arc<dyn ToolApprovalGate>,
     finding_recorder: Arc<dyn FindingRecorder>,
+    skill_store: Arc<dyn SkillStore>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
 }
@@ -263,6 +266,7 @@ impl ServerAgentSessionFactory {
         tool_executor: Arc<dyn ConversationToolExecutor>,
         approval_gate: Arc<dyn ToolApprovalGate>,
         finding_recorder: Arc<dyn FindingRecorder>,
+        skill_store: Arc<dyn SkillStore>,
         events: Arc<dyn ConversationEventSink>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
     ) -> Self {
@@ -274,6 +278,7 @@ impl ServerAgentSessionFactory {
             tool_executor,
             approval_gate,
             finding_recorder,
+            skill_store,
             events,
             intent_detector,
         }
@@ -291,6 +296,7 @@ impl AgentSessionFactory for ServerAgentSessionFactory {
             tool_executor: self.tool_executor.clone(),
             approval_gate: self.approval_gate.clone(),
             finding_recorder: self.finding_recorder.clone(),
+            skill_store: self.skill_store.clone(),
             events: self.events.clone(),
             intent_detector: self.intent_detector.clone(),
         })
@@ -306,6 +312,7 @@ struct ServerAgentSession {
     tool_executor: Arc<dyn ConversationToolExecutor>,
     approval_gate: Arc<dyn ToolApprovalGate>,
     finding_recorder: Arc<dyn FindingRecorder>,
+    skill_store: Arc<dyn SkillStore>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
 }
@@ -331,6 +338,7 @@ impl AgentSession for ServerAgentSession {
                 self.tool_executor.clone(),
                 self.approval_gate.clone(),
                 self.finding_recorder.clone(),
+                self.skill_store.clone(),
                 self.events.clone(),
                 self.intent_detector.clone(),
             )
@@ -385,6 +393,7 @@ async fn execute_sub_agent_inline_tool(
     repository: &Arc<dyn ConversationRepository>,
     knowledge_source: &Arc<dyn ConversationKnowledgeSource>,
     finding_recorder: &Arc<dyn FindingRecorder>,
+    skill_store: &Arc<dyn SkillStore>,
 ) -> super::tool_executor::ConversationToolResult {
     let content = match tool_name {
         "knowledge_search" => {
@@ -408,7 +417,7 @@ async fn execute_sub_agent_inline_tool(
                 .execute_evidence_tool(run_id, tool_name, arguments)
                 .await
         }
-        "skill_list" | "skill_load" => repository.execute_skill_tool(tool_name, arguments).await,
+        "skill_list" | "skill_load" => skill_store.execute(tool_name, arguments).await,
         "record_finding" => finding_recorder.record(run_id, arguments).await,
         _ => Err(anyhow::anyhow!("未知的子代理内联工具: {tool_name}")),
     };
@@ -439,6 +448,7 @@ async fn execute_sub_agent(
     tool_executor: Arc<dyn ConversationToolExecutor>,
     approval_gate: Arc<dyn ToolApprovalGate>,
     finding_recorder: Arc<dyn FindingRecorder>,
+    skill_store: Arc<dyn SkillStore>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
 ) -> anyhow::Result<String> {
@@ -678,6 +688,7 @@ async fn execute_sub_agent(
                         &repository,
                         &knowledge_source,
                         &finding_recorder,
+                        &skill_store,
                     )
                     .await;
                     fast_results.push((i, result, tc.id.clone(), tc.name.clone()));
