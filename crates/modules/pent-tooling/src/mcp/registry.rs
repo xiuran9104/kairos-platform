@@ -6,44 +6,33 @@ use super::protocol::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{info, warn};
 
-/// Process-wide shared registry, initialized on first use.
 static SHARED: OnceLock<Arc<McpRegistry>> = OnceLock::new();
 
-/// Get or lazily initialize the shared registry.
+/// Process-wide registry initialized from deployment environment settings.
 pub async fn shared() -> Arc<McpRegistry> {
     if let Some(registry) = SHARED.get() {
         return registry.clone();
     }
-    let registry = Arc::new(McpRegistry::init().await);
+    let registry = Arc::new(McpRegistry::from_configs(load_configs()).await);
     let _ = SHARED.set(registry.clone());
     registry
 }
 
-/// Load MCP server configs from the environment.
 pub fn load_configs() -> Vec<McpServerConfig> {
     let raw = std::env::var("PENTA_MCP_SERVERS").unwrap_or_default();
     if raw.is_empty() {
         return Vec::new();
     }
-    match serde_json::from_str::<Vec<McpServerConfig>>(&raw) {
+    match serde_json::from_str(&raw) {
         Ok(configs) => configs,
-        Err(e) => {
-            warn!(error = %e, raw, "failed to parse PENTA_MCP_SERVERS; MCP disabled");
+        Err(error) => {
+            warn!(%error, "failed to parse PENTA_MCP_SERVERS; MCP disabled");
             Vec::new()
         }
     }
-}
-
-/// Resolve a server config by id. Fails if the server is not configured.
-pub fn server_config(server_id: &str) -> anyhow::Result<McpServerConfig> {
-    let configs = load_configs();
-    configs
-        .into_iter()
-        .find(|c| c.id == server_id)
-        .ok_or_else(|| anyhow::anyhow!("MCP server '{server_id}' not found in PENTA_MCP_SERVERS"))
 }
 
 // ── Cached entry ─────────────────────────────────────────────────────────
@@ -55,6 +44,7 @@ struct McpServerEntry {
     tools: Vec<ToolDef>,
     #[allow(dead_code)]
     capabilities: ServerCapabilities,
+    concurrency: Arc<Semaphore>,
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────
@@ -64,9 +54,16 @@ pub struct McpRegistry {
 }
 
 impl McpRegistry {
-    /// Create and initialize all configured MCP servers.
-    pub async fn init() -> Self {
-        let configs = load_configs();
+    /// Create an empty registry. Deployment adapters decide where configuration
+    /// comes from and may add servers dynamically.
+    pub fn new() -> Self {
+        Self {
+            servers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Create and initialize the supplied MCP servers.
+    pub async fn from_configs(configs: impl IntoIterator<Item = McpServerConfig>) -> Self {
         let mut servers: HashMap<String, Arc<McpServerEntry>> = HashMap::new();
 
         for config in configs {
@@ -107,6 +104,7 @@ impl McpRegistry {
             client,
             tools,
             capabilities: init_result.capabilities,
+            concurrency: Arc::new(Semaphore::new(config.max_concurrency.max(1))),
         })
     }
 
@@ -126,10 +124,14 @@ impl McpRegistry {
         tool_name: &str,
         arguments: Value,
     ) -> anyhow::Result<CallToolResult> {
-        let servers = self.servers.read().await;
-        let entry = servers
+        let entry = self
+            .servers
+            .read()
+            .await
             .get(server_id)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("MCP server '{server_id}' not connected"))?;
+        let _permit = entry.concurrency.acquire().await?;
         entry.client.call_tool(tool_name, arguments).await
     }
 
@@ -192,5 +194,11 @@ impl McpRegistry {
             }));
         }
         result
+    }
+}
+
+impl Default for McpRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }

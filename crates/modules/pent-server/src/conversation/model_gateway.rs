@@ -1,7 +1,4 @@
 //! LLM-03: ModelGateway using AiModelFactory (ai-server).
-use crate::conversation::ports::{
-    ConversationModelGateway, ModelToolCall, ModelTurnOutput, ToolExecutionClass,
-};
 use async_trait::async_trait;
 use kairos_platform_ai_api::{ChatMessage, ChatRequest};
 use kairos_platform_ai_server::AiModelFactory;
@@ -9,6 +6,9 @@ use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::{ConversationContext, ConversationIntent, ModelUsage};
 use kairos_platform_pent_core::conversation::DEFAULT_CONTEXT_TOKEN_BUDGET;
 use kairos_platform_pent_runtime::context_compaction;
+use kairos_platform_pent_runtime::ports::{
+    ConversationModelGateway, ModelToolCall, ModelTurnOutput, ToolExecutionClass,
+};
 use serde_json::Value;
 
 use std::collections::{HashMap, HashSet};
@@ -44,12 +44,11 @@ impl AiModelGateway {
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await?;
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pent_agent_sessions WHERE id=$1)",
-        )
-        .bind(session_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pent_agent_sessions WHERE id=$1)")
+                .bind(session_id)
+                .fetch_one(&self.pool)
+                .await?;
         if !exists {
             return Err(anyhow::anyhow!("Agent Session 不存在"));
         }
@@ -57,13 +56,13 @@ impl AiModelGateway {
             id
         } else {
             sqlx::query_scalar(
-            "SELECT id FROM ai.model_configs
+                "SELECT id FROM ai.model_configs
              WHERE type = 'chat' AND status = 0
              ORDER BY id LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?
+            )
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?
         };
         Ok((id, Some(0.3), conversation_output_token_limit(2000)))
     }
@@ -96,22 +95,6 @@ fn routing_intent(context: &ConversationContext) -> String {
     )
 }
 
-/// Max risk accepted for routed tools. Conversation-executable tools are
-/// already allow-listed to low/medium risk; the policy snapshot can tighten
-/// this further via `max_risk`.
-fn routing_max_risk(context: &ConversationContext) -> &'static str {
-    match context
-        .policy_snapshot
-        .get("max_risk")
-        .and_then(Value::as_str)
-    {
-        Some("info") | Some("low") => "low",
-        Some("medium") => "medium",
-        Some("critical") => "critical",
-        _ => "high",
-    }
-}
-
 #[async_trait]
 impl ConversationModelGateway for AiModelGateway {
     fn set_exhausted_tools(&self, tools: HashSet<String>) {
@@ -129,7 +112,13 @@ impl ConversationModelGateway for AiModelGateway {
         let context_token_budget = std::env::var("PENTA_CONTEXT_TOKEN_BUDGET")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or_else(|| context.policy_snapshot.pointer("/multi_agent/context_budget_tokens").and_then(Value::as_u64).unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET))
+            .unwrap_or_else(|| {
+                context
+                    .policy_snapshot
+                    .pointer("/multi_agent/context_budget_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
+            })
             .clamp(2_000, 128_000);
         let model_context = context;
         let memory_context = if model_context.run_summary.trim().is_empty() {
@@ -172,11 +161,15 @@ impl ConversationModelGateway for AiModelGateway {
             super::tool_catalog::load_tools_for_intent(
                 &self.pool,
                 &routing_intent(context),
-                context.policy_snapshot.get("multi_agent").unwrap_or(&Value::Null),
-            ).await?
+                context
+                    .policy_snapshot
+                    .get("multi_agent")
+                    .unwrap_or(&Value::Null),
+            )
+            .await?
         };
         // Filter out tools that have exceeded their consecutive failure limit.
-        let tools: Vec<super::tool_catalog::ConversationToolDefinition> = {
+        let tools: Vec<kairos_platform_pent_tooling::catalog::ToolDefinition> = {
             // Apply the bound agent role's tool whitelist first (empty = all).
             let role_whitelist: Option<std::collections::HashSet<String>> = context
                 .policy_snapshot
@@ -201,7 +194,11 @@ impl ConversationModelGateway for AiModelGateway {
                 .exhausted_tools
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let sub_agent = context.policy_snapshot.get("_agent_role").and_then(Value::as_str) == Some("sub");
+            let sub_agent = context
+                .policy_snapshot
+                .get("_agent_role")
+                .and_then(Value::as_str)
+                == Some("sub");
             let multi_agent_enabled =
                 super::agent_pipeline::multi_agent_enabled(&context.policy_snapshot);
             tools
@@ -465,11 +462,7 @@ fn sanitize_tool_message_groups(api_messages: &mut Vec<Value>) {
             // Collect actual tool_call_ids from the tool messages we found.
             let actual: Vec<&str> = tool_indices
                 .iter()
-                .filter_map(|&i| {
-                    source[i]
-                        .get("tool_call_id")
-                        .and_then(Value::as_str)
-                })
+                .filter_map(|&i| source[i].get("tool_call_id").and_then(Value::as_str))
                 .collect();
             let actual_set: std::collections::HashSet<&str> = actual.iter().copied().collect();
             let complete =
@@ -486,9 +479,7 @@ fn sanitize_tool_message_groups(api_messages: &mut Vec<Value>) {
             // the assistant).
             for &ti in &tool_indices {
                 if complete || {
-                    let id = source[ti]
-                        .get("tool_call_id")
-                        .and_then(Value::as_str);
+                    let id = source[ti].get("tool_call_id").and_then(Value::as_str);
                     id.is_some_and(|id| expected.contains(id))
                 } {
                     sanitized.push(source[ti].clone());
@@ -755,7 +746,11 @@ mod tests {
             json!({"role": "user", "content": "continue"}),
         ];
         sanitize_tool_message_groups(&mut messages);
-        assert_eq!(messages.len(), 3, "system + assistant kept + user kept; mismatched tool removed");
+        assert_eq!(
+            messages.len(),
+            3,
+            "system + assistant kept + user kept; mismatched tool removed"
+        );
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[2]["role"], "user");
     }
@@ -772,7 +767,11 @@ mod tests {
             result("call-1"),
         ];
         sanitize_tool_message_groups(&mut messages);
-        assert_eq!(messages.len(), 5, "all five messages preserved — group complete with interleaved system/user");
+        assert_eq!(
+            messages.len(),
+            5,
+            "all five messages preserved — group complete with interleaved system/user"
+        );
     }
 
     #[test]
@@ -784,15 +783,21 @@ mod tests {
             json!({"role": "system", "content": "s"}),
             json!({"role": "user", "content": "question"}),
             call("call-1"),
-            result("call-1"),  // matches call-1 → group complete
-            result("orphan"),   // no assistant has this id → removed
+            result("call-1"), // matches call-1 → group complete
+            result("orphan"), // no assistant has this id → removed
             json!({"role": "user", "content": "latest"}),
         ];
         sanitize_tool_message_groups(&mut messages);
-        assert_eq!(messages.len(), 5, "orphan result after complete group removed, others kept");
-        assert!(!messages.iter().any(|m| {
-            m.get("tool_call_id").and_then(Value::as_str) == Some("orphan")
-        }));
+        assert_eq!(
+            messages.len(),
+            5,
+            "orphan result after complete group removed, others kept"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| { m.get("tool_call_id").and_then(Value::as_str) == Some("orphan") })
+        );
     }
 
     #[test]

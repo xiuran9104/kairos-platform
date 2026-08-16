@@ -6,7 +6,9 @@ use kairos_platform_pent_api::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::conversation::ports::{ConversationRepository, HistoricalToolCall, RunToolHistory};
+use kairos_platform_pent_runtime::ports::{
+    ConversationRepository, HistoricalToolCall, RunToolHistory,
+};
 
 const MAX_HISTORY_TOOL_CALLS: i64 = 500;
 const MAX_EVIDENCE_PAGE_SIZE: i64 = 50;
@@ -997,6 +999,11 @@ impl ConversationRepository for PgConversationRepository {
         event_type: &str,
         payload: &serde_json::Value,
     ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734291))")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "INSERT INTO pent_run_events(event_id, run_id, sequence, event_type, payload)
              VALUES($1, $2, COALESCE((SELECT max(sequence)+1 FROM pent_run_events WHERE run_id=$2), 1), $3, $4)",
@@ -1005,8 +1012,9 @@ impl ConversationRepository for PgConversationRepository {
         .bind(run_id)
         .bind(event_type)
         .bind(payload)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 

@@ -82,7 +82,7 @@ pub struct AgentLoopLimits {
     pub stall_limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgentLoopCheckpoint {
     pub next_round: usize,
     pub request_count: usize,

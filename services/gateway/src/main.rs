@@ -41,21 +41,8 @@ async fn main() -> anyhow::Result<()> {
         &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
     )
     .await;
-    let mcp_registry = kairos_platform_pent_server::tooling::mcp::registry::shared().await;
-    load_db_mcp_servers(&database, &mcp_registry).await;
-    let pent_state = kairos_platform_pent_server::PentState::new(database.clone())
-        .with_nats(nats_bus.handle())
-        .with_mcp(mcp_registry);
-    match kairos_platform_pent_server::infrastructure::recipe::load_from_db(&database).await {
-        Ok(count) => tracing::info!(count, "tool recipes loaded from pent_tool_definitions"),
-        Err(error) => warn!(%error, "tool recipe load failed; falling back to hardcoded registry"),
-    }
-    let _ = kairos_platform_pent_server::infrastructure::execution::init_global_executor(
-        std::sync::Arc::new(
-            kairos_platform_pent_server::infrastructure::execution::ElasticExecutor::from_env(),
-        ),
-    );
-    kairos_platform_pent_server::start_worker(database.clone(), "worker-gateway".into(), 120).await;
+    let pent_state =
+        kairos_platform_pent_server::PentState::new(database.clone()).with_nats(nats_bus.handle());
     system_state.bootstrap().await?;
     // Recover orphaned conversation turns left from previous shutdown
     recover_orphaned_turns(&database).await;
@@ -100,62 +87,6 @@ async fn connect_redis() -> Option<RedisClient> {
         Err(error) => {
             warn!(%error, "redis is configured but unavailable; cache and rate limit disabled");
             None
-        }
-    }
-}
-
-/// Start MCP servers that were configured through the capability center UI
-/// and persisted in `pent_mcp_servers`.
-async fn load_db_mcp_servers(
-    pool: &kairos_platform_framework_database::PgPool,
-    registry: &kairos_platform_pent_server::tooling::mcp::registry::McpRegistry,
-) {
-    use kairos_platform_pent_server::tooling::mcp::protocol::McpServerConfig;
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            String,
-            Option<String>,
-            serde_json::Value,
-            serde_json::Value,
-            Option<String>,
-            serde_json::Value,
-        ),
-    >(
-        "SELECT id, name, transport, command, args, env, url, headers
-         FROM pent_mcp_servers WHERE enabled",
-    )
-    .fetch_all(pool)
-    .await;
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(error) => {
-            warn!(%error, "failed to load configured MCP servers");
-            return;
-        }
-    };
-    for (id, name, transport, command, args, env, url, headers) in rows {
-        let config = McpServerConfig {
-            id,
-            command: if transport == "stdio" {
-                command.unwrap_or_default()
-            } else {
-                String::new()
-            },
-            args: serde_json::from_value(args).unwrap_or_default(),
-            env: serde_json::from_value(env).unwrap_or_default(),
-            auto_start: true,
-            url: if matches!(transport.as_str(), "http" | "sse") {
-                url
-            } else {
-                None
-            },
-            headers: serde_json::from_value(headers).unwrap_or_default(),
-        };
-        if let Err(error) = registry.add_server(config).await {
-            warn!(%error, server = %name, "failed to start configured MCP server");
         }
     }
 }

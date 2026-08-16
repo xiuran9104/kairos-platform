@@ -17,6 +17,7 @@ fi
 
 echo "==> [1/8] 基础工具链"
 apt-get update
+apt-get install -y --no-install-recommends bubblewrap
 apt-get install -y --no-install-recommends \
     golang-go python3-pip cargo ruby-full git curl dnsutils openssh-client postgresql-client \
     build-essential pkg-config libssl-dev libgmp-dev \
@@ -100,4 +101,5 @@ echo "==> [8/8] metasploit-framework（体积大，失败不阻断）"
 apt-get install -y metasploit-framework || true
 
 echo "==> 安装完成。可运行下方命令验证："
+echo "    bwrap --version"
 echo "    bash script/verify-tools.sh"

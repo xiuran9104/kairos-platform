@@ -29,6 +29,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
+use kairos_platform_framework_common::ApiResponse;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
@@ -36,13 +37,14 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub use config::PentConfig;
+pub use mcp_servers::PgMcpServerConfigSource;
 
 #[derive(Clone)]
 pub struct PentState {
     pub pool: PgPool,
     conversation_tasks: conversation::turn_tasks::TurnTaskRegistry,
     pub nats: Option<crate::transport::mq::NatsHandle>,
-    pub mcp_registry: Option<std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>>,
+    pub mcp_registry: Option<std::sync::Arc<kairos_platform_pent_tooling::mcp::McpRegistry>>,
 }
 
 impl PentState {
@@ -60,7 +62,7 @@ impl PentState {
         self
     }
 
-    pub fn with_mcp(mut self, mcp: std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>) -> Self {
+    pub fn with_mcp(mut self, mcp: std::sync::Arc<kairos_platform_pent_tooling::mcp::McpRegistry>) -> Self {
         self.mcp_registry = Some(mcp);
         self
     }
@@ -1030,6 +1032,21 @@ pub async fn start_worker(pool: PgPool, worker_id: String, lease_ttl: i64) {
         tracing::warn!(worker=%worker_id, error=%error, "worker registration failed");
     }
     tokio::spawn(ensure_host_tools());
+    // Run recovery before polling for new work. This immediately re-queues
+    // expired parent leases, making their unfinished child-agent events
+    // eligible for recovery by the normal exactly-once run claim path.
+    if let Err(error) = maintenance_scanner(&pool).await {
+        tracing::warn!(worker=%worker_id, error=%error, "initial Pent recovery scan failed");
+    }
+    match recoverable_sub_agent_count(&pool).await {
+        Ok(count) if count > 0 => {
+            tracing::info!(worker=%worker_id, count, "unfinished sub-agents queued for startup recovery");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(worker=%worker_id, error=%error, "startup sub-agent scan failed");
+        }
+    }
     let maintenance_pool = pool.clone();
     tokio::spawn(async move {
         loop {
@@ -1057,6 +1074,27 @@ pub async fn start_worker(pool: PgPool, worker_id: String, lease_ttl: i64) {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
+}
+
+async fn recoverable_sub_agent_count(pool: &PgPool) -> Result<i64, String> {
+    sqlx::query_scalar(
+        "SELECT count(*)
+         FROM pent_run_events spawned
+         JOIN pent_runs run ON run.id=spawned.run_id
+         WHERE spawned.event_type='agent.spawned'
+           AND spawned.payload ? 'request'
+           AND run.status='queued' AND run.next_attempt_at<=now()
+           AND NOT EXISTS (
+             SELECT 1 FROM pent_run_events terminal
+             WHERE terminal.run_id=spawned.run_id
+               AND terminal.sequence>spawned.sequence
+               AND terminal.payload->>'agent_id'=spawned.payload->>'agent_id'
+               AND terminal.event_type IN ('agent.completed','agent.failed','agent.cancelled','agent.timed_out')
+           )",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn register_worker(pool: &PgPool, worker_id: &str) -> Result<(), String> {
@@ -1091,6 +1129,25 @@ async fn heartbeat_worker_record(pool: &PgPool, worker_id: &str) -> Result<(), S
 
 async fn maintenance_scanner(pool: &PgPool) -> Result<(), String> {
     recovery_scanner(pool).await?;
+    let released_sub_agents = sqlx::query(
+        "UPDATE pent_run_events spawned
+         SET payload=(spawned.payload - 'claimant_id') - 'claim_expires_at'
+         FROM pent_runs run
+         WHERE run.id=spawned.run_id AND run.status='queued'
+           AND spawned.event_type='agent.spawned'
+           AND spawned.payload ? 'claimant_id'
+           AND NOT EXISTS (
+             SELECT 1 FROM pent_run_events terminal
+             WHERE terminal.run_id=spawned.run_id
+               AND terminal.sequence>spawned.sequence
+               AND terminal.payload->>'agent_id'=spawned.payload->>'agent_id'
+               AND terminal.event_type IN ('agent.completed','agent.failed','agent.cancelled','agent.timed_out')
+           )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .rows_affected();
     let expired = sqlx::query(
         "WITH expired AS (
              UPDATE pent_approvals
@@ -1118,6 +1175,9 @@ async fn maintenance_scanner(pool: &PgPool) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     if expired > 0 {
         tracing::info!(count = expired, "expired Pent approvals");
+    }
+    if released_sub_agents > 0 {
+        tracing::info!(count = released_sub_agents, "released orphaned sub-agent claims");
     }
     Ok(())
 }
@@ -1657,6 +1717,12 @@ pub(crate) async fn append_run_event(
     event_type: &str,
     payload: Value,
 ) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734291))")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| error.to_string())?;
     sqlx::query(
         "INSERT INTO pent_run_events(event_id,run_id,sequence,event_type,occurred_at,payload)
          SELECT $1,$2,COALESCE(MAX(sequence),-1)+1,$3,now(),$4
@@ -1666,9 +1732,10 @@ pub(crate) async fn append_run_event(
     .bind(run_id)
     .bind(event_type)
     .bind(payload)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|error| error.to_string())?;
+    tx.commit().await.map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -2748,19 +2815,4 @@ pub(crate) fn sanitize_sensitive_data(text: &str) -> String {
         }
     }
     result
-}
-#[derive(serde::Serialize)]
-pub(crate) struct ApiResponse<T: serde::Serialize> {
-    code: i32,
-    data: T,
-    message: String,
-}
-impl<T: serde::Serialize> ApiResponse<T> {
-    pub(crate) fn new(data: T) -> Self {
-        Self {
-            code: 0,
-            data,
-            message: "ok".into(),
-        }
-    }
 }

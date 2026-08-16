@@ -47,3 +47,32 @@ impl QueueLimiter {
         self.limits.get(queue).and_then(|s| s.try_acquire().ok())
     }
 }
+
+impl Default for QueueLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routes_risk_and_tool_type_to_stable_queues() {
+        assert_eq!(dispatch_queue("critical", "scan"), QUEUE_DANGEROUS);
+        assert_eq!(dispatch_queue("high", "browser"), QUEUE_BROWSER);
+        assert_eq!(dispatch_queue("high", "scan"), QUEUE_SCAN_HEAVY);
+        assert_eq!(dispatch_queue("medium", "scan"), QUEUE_SCAN_LIGHT);
+        assert_eq!(dispatch_queue("low", "native"), QUEUE_NATIVE_FAST);
+    }
+
+    #[test]
+    fn dangerous_queue_is_serialized() {
+        let limiter = QueueLimiter::new();
+        let permit = limiter.acquire(QUEUE_DANGEROUS).unwrap();
+        assert!(limiter.acquire(QUEUE_DANGEROUS).is_none());
+        drop(permit);
+        assert!(limiter.acquire(QUEUE_DANGEROUS).is_some());
+    }
+}

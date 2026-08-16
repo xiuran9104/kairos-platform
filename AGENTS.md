@@ -65,6 +65,15 @@ export RUST_LOG='info'
 cargo run -p kairos-platform-gateway
 ```
 
+In another terminal, start the execution worker. The gateway never executes
+security tools:
+
+```bash
+export DATABASE_URL='postgres://kairos_platform:kairos_platform@127.0.0.1:5432/kairos_platform'
+export PENTA_WORKER_ID='local-01'
+cargo run -p kairos-platform-pent-agent
+```
+
 In a second terminal, start the frontend:
 
 ```bash
@@ -111,6 +120,7 @@ Install prerequisites:
 
 - Rust stable with Rust 2024 edition support.
 - Docker and Docker Compose.
+- Bubblewrap (`bwrap`) on every host that runs `kairos-platform-pent-agent`.
 - Node.js `22.18+` or `24.x`.
 - pnpm `11+` through Corepack.
 - Nginx or another reverse proxy for production frontend/API routing.
@@ -147,6 +157,7 @@ Build the backend:
 
 ```bash
 cargo build --release -p kairos-platform-gateway
+cargo build --release -p kairos-platform-pent-agent
 ```
 
 Run once manually to verify the imported database and initial admin creation:

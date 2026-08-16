@@ -1,8 +1,8 @@
 //! PostgreSQL ToolCatalog — implements `ToolCatalog` trait (AI-01).
-use crate::tooling::ports::ToolCatalog;
 use async_trait::async_trait;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::{ToolDescriptor, ToolRouteRequest};
+use kairos_platform_pent_tooling::ports::ToolCatalog;
 
 pub struct PgToolCatalog {
     pool: PgPool,

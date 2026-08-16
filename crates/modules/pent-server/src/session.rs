@@ -818,6 +818,11 @@ async fn create_instruction(
     .await
     .map_err(internal)?;
 
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734291))")
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
     let sequence: i64 = sqlx::query_scalar(
         "SELECT coalesce(max(sequence), -1) + 1
          FROM pent_run_events

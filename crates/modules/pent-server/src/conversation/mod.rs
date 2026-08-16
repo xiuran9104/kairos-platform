@@ -2,12 +2,6 @@
 
 mod runtime;
 
-/// Compatibility facade for callers that still import runtime ports through
-/// `pent_server::conversation::ports`.
-pub mod ports {
-    pub use kairos_platform_pent_runtime::ports::*;
-}
-
 pub use kairos_platform_pent_runtime::ports::*;
 pub use runtime::*;
 use std::sync::Arc;
@@ -48,6 +42,7 @@ pub(crate) fn build_runtime(
     let events: Arc<dyn ConversationEventSink> = Arc::new(LoggingConversationEventSink);
     let agent_sessions: Arc<dyn AgentSessionFactory> =
         Arc::new(agent_manager::ServerAgentSessionFactory::new(
+            pool.clone(),
             repository.clone(),
             model_gateway.clone(),
             context_source.clone(),
@@ -56,7 +51,6 @@ pub(crate) fn build_runtime(
             approval_gate.clone(),
             finding_recorder.clone(),
             skill_store.clone(),
-            events.clone(),
             intent_detector.clone(),
         ));
     let rt = ConversationRuntime::new(
@@ -89,35 +83,29 @@ pub(crate) mod agent_manager;
 pub(crate) mod agent_pipeline;
 pub(crate) mod agent_profiles;
 pub(crate) mod claim_gate;
-mod checkpoint;
 pub(crate) mod plan_board;
-/// Compatibility facade; context budgeting now belongs to `pent-runtime`.
-pub mod context_guard {
-    pub use kairos_platform_pent_runtime::context_guard::*;
-}
 pub mod context_source;
-pub mod error_codes;
 mod enrichment_adapter;
+pub mod error_codes;
 pub mod file_cache;
-pub mod http;
 pub mod hitl;
 pub mod hitl_http;
+pub mod http;
 pub mod instruction_sink;
 pub mod memory_adapter;
 pub mod model_gateway;
 pub mod repository_postgres;
-pub(crate) mod run_bridge;
 pub mod rmos;
+pub(crate) mod run_bridge;
 mod scan_progress;
 mod skill_store;
 pub mod stream;
 pub mod structured_output;
-pub mod tool_bus;
 pub mod tool_catalog;
-mod tool_execution_coordinator;
 pub mod tool_executor;
-pub mod tool_guard;
 mod tool_extensions;
+pub mod tool_guard;
 mod tool_result_processor;
+mod tool_result_sinks;
 pub mod traffic;
 pub(crate) mod turn_tasks;

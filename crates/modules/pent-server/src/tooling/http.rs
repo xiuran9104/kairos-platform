@@ -3,13 +3,13 @@ use crate::PentState;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::{get, post, put},
+    routing::{get, post},
 };
+use kairos_platform_framework_common::ApiResponse;
 use kairos_platform_framework_web::AppError;
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use uuid::Uuid;
 
 pub fn routes() -> Router<PentState> {
     Router::new()
@@ -178,20 +178,4 @@ async fn health_check(
     Ok(Json(ApiResponse::new(
         json!({"status":status,"detail":detail}),
     )))
-}
-
-#[derive(serde::Serialize)]
-struct ApiResponse<T: serde::Serialize> {
-    code: i32,
-    data: T,
-    message: String,
-}
-impl<T: serde::Serialize> ApiResponse<T> {
-    fn new(data: T) -> Self {
-        Self {
-            code: 0,
-            data,
-            message: "ok".into(),
-        }
-    }
 }

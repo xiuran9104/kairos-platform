@@ -1,68 +1,17 @@
 use kairos_platform_framework_database::PgPool;
-use kairos_platform_pent_runtime::ports::ToolExecutionClass;
+use kairos_platform_pent_api::ToolExecutionClass;
+use kairos_platform_pent_tooling::catalog::ToolDefinition;
+use kairos_platform_pent_tooling::manifest::{ToolManifestRecord, descriptor_execution_class};
 use serde_json::{Value, json};
 
 use super::tool_executor::has_conversation_handler;
 
-#[derive(Debug, Clone)]
-pub struct ConversationToolDefinition {
-    pub schema: Value,
-    pub execution_class: ToolExecutionClass,
+fn tool_definition(schema: Value, execution_class: ToolExecutionClass) -> ToolDefinition {
+    ToolDefinition::new(schema, execution_class)
 }
 
-impl ConversationToolDefinition {
-    pub fn name(&self) -> Option<&str> {
-        self.schema
-            .pointer("/function/name")
-            .and_then(Value::as_str)
-    }
-}
-
-fn tool_definition(
-    schema: Value,
-    execution_class: ToolExecutionClass,
-) -> ConversationToolDefinition {
-    ConversationToolDefinition {
-        schema,
-        execution_class,
-    }
-}
-
-fn inline_definition(schema: Value) -> ConversationToolDefinition {
+fn inline_definition(schema: Value) -> ToolDefinition {
     tool_definition(schema, ToolExecutionClass::Inline)
-}
-
-fn descriptor_execution_class(
-    risk_level: &str,
-    approval_policy: &str,
-    executor: &Value,
-) -> ToolExecutionClass {
-    if let Some(class) = explicit_execution_class(executor) {
-        return class;
-    }
-    if approval_policy.eq_ignore_ascii_case("always")
-        || matches!(
-            risk_level.to_ascii_lowercase().as_str(),
-            "high" | "critical"
-        )
-    {
-        ToolExecutionClass::Destructive
-    } else {
-        ToolExecutionClass::ReadOnly
-    }
-}
-
-fn explicit_execution_class(executor: &Value) -> Option<ToolExecutionClass> {
-    match executor.get("execution_class").and_then(Value::as_str) {
-        Some("inline") => Some(ToolExecutionClass::Inline),
-        Some("read_only") => Some(ToolExecutionClass::ReadOnly),
-        Some("destructive") => Some(ToolExecutionClass::Destructive),
-        Some(other) => {
-            tracing::warn!(%other, "invalid tool execution_class; using safe default");
-            Some(ToolExecutionClass::Destructive)
-        }
-        None => None,
-    }
 }
 
 /// FTS search on tool `embedding_document` using PostgreSQL full-text search.
@@ -156,7 +105,7 @@ async fn retrieve_tool_ids(pool: &PgPool, intent: &str, top_k: usize) -> Vec<(St
 /// in the conversation runtime.
 pub async fn load_conversation_tool_definitions(
     pool: &PgPool,
-) -> anyhow::Result<Vec<ConversationToolDefinition>> {
+) -> anyhow::Result<Vec<ToolDefinition>> {
     let rows = sqlx::query_as::<_, (String, String, Value, String, String, Value)>(
         "SELECT tool_id, description, input_schema, risk_level, approval_policy, executor
          FROM pent_tool_definitions
@@ -199,38 +148,9 @@ pub async fn load_conversation_tool_definitions(
     // DesRed-style MCP-first extension point.  Server qualification keeps two
     // providers with the same tool name unambiguous for the model and routes
     // the call back to the selected MCP server without a second lookup.
-    let registry = crate::tooling::mcp::registry::shared().await;
+    let registry = kairos_platform_pent_tooling::mcp::registry::shared().await;
     let mcp_tools = registry.all_tools().await;
-    let internal_recipe_names = mcp_tools
-        .iter()
-        .filter(|(server_id, _)| server_id == crate::tooling::mcp::internal::INTERNAL_SERVER_ID)
-        .map(|(_, tool)| tool.name.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let registered_classes = definitions
-        .iter()
-        .filter_map(|definition| {
-            definition
-                .name()
-                .map(|name| (name.to_owned(), definition.execution_class))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    // Once a host tool has a local MCP recipe, do not expose its legacy direct
-    // function definition. This makes the migration opt-in per recipe while
-    // retaining compatibility for tools that have not moved yet.
-    definitions.retain(|definition| {
-        definition
-            .name()
-            .is_none_or(|name| !internal_recipe_names.contains(name))
-    });
     for (server_id, tool) in mcp_tools {
-        let execution_class = if server_id == crate::tooling::mcp::internal::INTERNAL_SERVER_ID {
-            registered_classes
-                .get(&tool.name)
-                .copied()
-                .unwrap_or(ToolExecutionClass::Destructive)
-        } else {
-            ToolExecutionClass::Destructive
-        };
         definitions.push(tool_definition(
             json!({
                 "type": "function",
@@ -240,7 +160,7 @@ pub async fn load_conversation_tool_definitions(
                     "parameters": tool.input_schema,
                 }
             }),
-            execution_class,
+            ToolExecutionClass::Destructive,
         ));
     }
 
@@ -310,7 +230,7 @@ pub async fn load_tools_for_intent(
     pool: &PgPool,
     intent: &str,
     config: &Value,
-) -> anyhow::Result<Vec<ConversationToolDefinition>> {
+) -> anyhow::Result<Vec<ToolDefinition>> {
     let all = load_conversation_tool_definitions(pool).await?;
     if config.get("tool_search_enabled").and_then(Value::as_bool) == Some(false) {
         return Ok(all);
@@ -580,7 +500,12 @@ fn skill_tool_definitions() -> Vec<Value> {
 
 fn agent_tool_definitions() -> Vec<Value> {
     let agent_roles = super::agent_profiles::list()
-        .map(|profiles| profiles.into_iter().map(|profile| profile.id).collect::<Vec<_>>())
+        .map(|profiles| {
+            profiles
+                .into_iter()
+                .map(|profile| profile.id)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to enumerate agent profiles for tool schema");
             Vec::new()
@@ -896,10 +821,7 @@ mod tests {
 
 // ── Routed tool catalog (top-K schema injection) ─────────────────────────
 
-use kairos_platform_pent_api::{
-    ToolDescriptor, ToolExecutorSpec, ToolHealthStatus, ToolLifecycleStatus, ToolQualityMetrics,
-    ToolResourceProfile, ToolRouteRequest, ToolSource,
-};
+use kairos_platform_pent_api::{ToolDescriptor, ToolRouteRequest};
 
 #[derive(sqlx::FromRow)]
 struct DescriptorRow {
@@ -1123,111 +1045,27 @@ fn descriptor_from_row(row: DescriptorRow) -> anyhow::Result<ToolDescriptor> {
         created_at,
         updated_at,
     } = row;
-    Ok(ToolDescriptor {
+    ToolManifestRecord {
         tool_id,
         version,
         manifest_version,
         namespace,
         name,
         description,
-        capabilities: string_list(&capabilities),
-        tags: string_list(&tags),
-        source: descriptor_source(&source, &executor)?,
+        capabilities,
+        tags,
+        source,
         input_schema,
         output_schema,
         risk_level,
         approval_policy,
-        supported_target_types: string_list(&supported_target_types),
-        executor: ToolExecutorSpec {
-            kind: descriptor_source(&source, &executor)?,
-            endpoint: executor
-                .get("endpoint")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            server_id: executor
-                .get("server_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            handler: executor
-                .get("handler")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            execution_class: explicit_execution_class(&executor),
-        },
-        resource_profile: ToolResourceProfile {
-            cpu_cores: resource_profile
-                .get("cpu_cores")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.5) as f32,
-            memory_mb: resource_profile
-                .get("memory_mb")
-                .and_then(Value::as_u64)
-                .unwrap_or(256),
-            timeout_seconds: resource_profile
-                .get("timeout_seconds")
-                .and_then(Value::as_u64)
-                .unwrap_or(300),
-            max_concurrency: resource_profile
-                .get("max_concurrency")
-                .and_then(Value::as_u64)
-                .unwrap_or(1) as u32,
-            network_policy: resource_profile
-                .get("network_policy")
-                .and_then(Value::as_str)
-                .unwrap_or("scope_only")
-                .to_string(),
-        },
-        // Health is probed on demand by the management API; active registry
-        // tools are assumed routable until marked otherwise.
-        health_status: ToolHealthStatus::Ready,
-        lifecycle_status: ToolLifecycleStatus::Active,
+        supported_target_types,
+        executor,
+        resource_profile,
         embedding_document,
-        embedding_model: None,
-        embedding_version: None,
-        vector_record_id: None,
-        quality: ToolQualityMetrics::default(),
         revision,
         created_at,
         updated_at,
-    })
-}
-
-fn string_list(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_tool_source(value: &str) -> anyhow::Result<ToolSource> {
-    match value {
-        "builtin" => Ok(ToolSource::Builtin),
-        // The host backend is a local-process executor (test-only); the
-        // descriptor enum has no Host variant, so it maps to Builtin.
-        "host" => Ok(ToolSource::Builtin),
-        "container" => Ok(ToolSource::Builtin),
-        "mcp" => Ok(ToolSource::Mcp),
-        "http" => Ok(ToolSource::Http),
-        other => anyhow::bail!("未知工具执行类型: {other}"),
     }
-}
-
-/// `source` in the registry is provenance (`builtin` shipped vs `external`
-/// registered), not the execution backend; the backend lives in
-/// `executor.type`. Externally-registered tools take their source from the
-/// executor so routing and health semantics stay accurate.
-fn descriptor_source(source: &str, executor: &Value) -> anyhow::Result<ToolSource> {
-    let executor_kind = executor
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or(source);
-    if source == "builtin" {
-        return Ok(ToolSource::Builtin);
-    }
-    parse_tool_source(executor_kind)
+    .into_descriptor()
 }

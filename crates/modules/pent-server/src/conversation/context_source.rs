@@ -1,8 +1,8 @@
 //! LLM-02: ContextSource — layered context assembly.
-use crate::conversation::ports::ConversationContextSource;
 use async_trait::async_trait;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationContext};
+use kairos_platform_pent_runtime::ports::ConversationContextSource;
 
 pub struct PgContextSource {
     pool: PgPool,
@@ -76,7 +76,10 @@ impl ConversationContextSource for PgContextSource {
         )
         .bind(&req.session_id)
         .fetch_optional(&self.pool).await?;
-        let mut run_summary = checkpoint.as_ref().map(|row| row.0.clone()).unwrap_or_default();
+        let mut run_summary = checkpoint
+            .as_ref()
+            .map(|row| row.0.clone())
+            .unwrap_or_default();
         let mut policy_snapshot = session.3.clone();
         if policy_snapshot.get("multi_agent").is_none() {
             policy_snapshot["multi_agent"] = session.6.clone();
@@ -88,7 +91,11 @@ impl ConversationContextSource for PgContextSource {
                 local.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
-        if let Some(runtime_state) = checkpoint.as_ref().filter(|row| row.2).and_then(|row| row.1.get("_checkpoint")) {
+        if let Some(runtime_state) = checkpoint
+            .as_ref()
+            .filter(|row| row.2)
+            .and_then(|row| row.1.get("_checkpoint"))
+        {
             policy_snapshot["_checkpoint"] = runtime_state.clone();
         }
         let mut memory_refs = Vec::new();
@@ -133,17 +140,19 @@ impl ConversationContextSource for PgContextSource {
         // section in the system instruction.
         let role: Option<(String, String, serde_json::Value)> =
             match session.3.get("role_id").and_then(serde_json::Value::as_str) {
-                Some(role_id) => sqlx::query_as(
-                    "SELECT r.name, r.user_prompt, r.tool_whitelist
+                Some(role_id) => {
+                    sqlx::query_as(
+                        "SELECT r.name, r.user_prompt, r.tool_whitelist
                      FROM pent_agent_roles r
                      JOIN pent_agent_sessions s ON s.id = $2
                        AND (r.tenant_id = s.tenant_id OR r.tenant_id = 0)
                      WHERE r.id = $1 AND r.enabled = true",
-                )
-                .bind(role_id)
-                .bind(&req.session_id)
-                .fetch_optional(&self.pool)
-                .await?,
+                    )
+                    .bind(role_id)
+                    .bind(&req.session_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                }
                 None => None,
             };
         if let Some((role_name, role_prompt, role_tools)) = &role {

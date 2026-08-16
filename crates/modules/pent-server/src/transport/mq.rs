@@ -168,7 +168,8 @@ pub mod subjects {
     }
 }
 
-/// Classify a tool into a queue tier. Mirrors [`crate::tooling::dispatcher::dispatch_queue`]
+/// Classify a tool into a queue tier. Mirrors
+/// [`kairos_platform_pent_tooling::dispatcher::dispatch_queue`].
 /// but operates on tool names directly rather than risk/tool_type pairs.
 pub fn classify_tool_queue(tool_name: &str) -> &'static str {
     match tool_name {

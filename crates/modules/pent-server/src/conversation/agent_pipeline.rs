@@ -91,33 +91,6 @@ pub fn is_transient_model_error(error: &anyhow::Error) -> bool {
     .any(|marker| message.contains(marker))
 }
 
-/// Preserve the first and latest user inputs when enriching sub-agent tasks.
-pub fn user_context_supplement(
-    messages: &[kairos_platform_pent_api::AgentMessage],
-    max_chars: usize,
-) -> String {
-    let user: Vec<&str> = messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .map(|m| m.content.trim())
-        .filter(|m| !m.is_empty())
-        .collect();
-    if user.is_empty() || max_chars == 0 {
-        return String::new();
-    }
-    let combined = if user.len() == 1 {
-        user[0].to_string()
-    } else {
-        format!(
-            "[最初目标]\n{}\n\n[当前指令]\n{}",
-            user[0],
-            user[user.len() - 1]
-        )
-    };
-    let clipped: String = combined.chars().take(max_chars).collect();
-    format!("\n\n## 用户历史输入（原文，子代理必读）\n{clipped}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

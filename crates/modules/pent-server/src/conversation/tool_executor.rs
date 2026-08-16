@@ -336,8 +336,8 @@ async fn execute_mcp_tool(name: &str, arguments: &str) -> ConversationToolResult
 
     // Tool disclosure, capability-center lifecycle operations and execution
     // must all observe the same process-wide registry. Database-configured
-    // servers are attached to this registry by the gateway at startup.
-    let registry = crate::tooling::mcp::registry::shared().await;
+    // servers are attached to this registry by pent-agent at startup.
+    let registry = kairos_platform_pent_tooling::mcp::registry::shared().await;
     if registry.server_count().await == 0 {
         return ConversationToolResult {
             tool_call_id: String::new(),
@@ -374,13 +374,13 @@ async fn execute_mcp_tool(name: &str, arguments: &str) -> ConversationToolResult
                 .content
                 .iter()
                 .filter_map(|block| match block {
-                    crate::tooling::mcp::protocol::ContentBlock::Text { text } => {
+                    kairos_platform_pent_tooling::mcp::ContentBlock::Text { text } => {
                         Some(text.clone())
                     }
-                    crate::tooling::mcp::protocol::ContentBlock::Image { mime_type, .. } => {
-                        Some(format!("[image: {mime_type}]"))
-                    }
-                    crate::tooling::mcp::protocol::ContentBlock::Resource { uri, .. } => {
+                    kairos_platform_pent_tooling::mcp::ContentBlock::Image {
+                        mime_type, ..
+                    } => Some(format!("[image: {mime_type}]")),
+                    kairos_platform_pent_tooling::mcp::ContentBlock::Resource { uri, .. } => {
                         Some(format!("[resource: {uri}]"))
                     }
                 })

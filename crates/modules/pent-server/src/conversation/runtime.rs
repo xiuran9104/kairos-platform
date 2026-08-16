@@ -10,7 +10,6 @@ use super::rmos::{
     AttackGraph, KnowledgeCache, PentestMemory,
     injector::{build_injected_context, prepare_injection},
 };
-use super::tool_execution_coordinator::ToolExecutionCoordinator;
 use super::tool_result_processor::{
     ToolResultPersistence, ToolResultProcessingContext, ToolResultProcessor, is_evidence_tool,
     is_finding_tool, is_traffic_tool,
@@ -24,12 +23,18 @@ use super::{
     SkillStore, ToolApprovalGate, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
-    AgentDirective, AgentLoopCheckpoint, AgentLoopLimits, parse_agent_directive,
+    AgentDirective, AgentLoopLimits, parse_agent_directive,
 };
-use kairos_platform_pent_runtime::orchestrator::{AgentOrchestrator, ModelAttemptOutcome};
+use kairos_platform_pent_runtime::agent_runner::{
+    AgentRoundHooks, AgentRoundOutcome, AgentRunConfig, AgentRunHooks, AgentRunner,
+};
+use kairos_platform_pent_runtime::agent_scheduler::inherit_child_budget;
+use kairos_platform_pent_runtime::context_lifecycle::ContextManager;
+use kairos_platform_pent_runtime::ports::{AgentChildBudget, KnowledgeGuide};
 use kairos_platform_pent_runtime::tool_dispatch::{
     ToolDispatchContext, ToolDispatchPolicy, ToolDispatcher,
 };
+use kairos_platform_pent_runtime::tool_execution::ToolExecutionCoordinator;
 
 /// Maximum tool-calling rounds before forcing a stop.
 /// PentAGI CLI uses 3 hours default runtime; the conversation agent
@@ -43,55 +48,32 @@ const DEFAULT_MAX_CONSECUTIVE_MODEL_ERRORS: usize = 3;
 /// Autonomous loop injection message sent to the model at the start of every
 /// tool loop. This reminds the model it is operating in autonomous mode and
 /// must directly call tools or emit lifecycle actions.
-const AUTONOMOUS_LOOP_PROMPT: &str = "\
+const AUTONOMOUS_LOOP_PROMPT: &str = r#"## 自主工具循环已启动
 
-## 自主工具循环已启动\n\n\
+你现在处于自主执行模式。根据目标、当前证据和可用工具直接选择下一步操作：
+- 需要信息 → 直接发起 Tool Calling
+- 任务完成 → 输出 `FINAL: <结论>`（事实性结论必须引用 Evidence ID）
+- 所有路径均失败 → 输出 `NO_PATH: <原因>` 说明已尝试内容和阻塞点
+- 无可行路径 → 输出 `NO_PATH: <原因>`
+- 策略失败需调整 → 输出 `REPLAN: <新策略>` 并在下一轮直接执行
 
-你现在处于自主执行模式。根据目标、当前证据和可用工具直接选择下一步操作：\n\
+## ⚠ 工具选择规则（严格遵守）
+不要用 curl/http_request 手工做所有事！每个任务有专用工具：
+- 端口扫描 → nmap（不要 curl 逐个端口试）
+- 漏洞扫描 → nuclei / web_vuln_scan（不要 curl 手工测）
+- XSS 检测 → dalfox / web_xss_scan（不要 curl 试 payload）
+- SQL 注入 → sqlmap / sqlmap_scan（不要 curl 手工注入）
+- 目录爆破 → ffuf / gobuster / dir_fuzz（不要手工猜路径）
+- 技术栈识别 → whatweb（不要手工看响应头）
+- 子域名枚举 → subfinder / amass（不要手工 DNS）
+- CSP 头分析 → csp_analyze（不要手工读 header）
+- JS 安全审计 → js_security_audit（不要手工看代码）
+- Wiki 知识查询 → knowledge_search（不要凭记忆猜）
+- 浏览器操作 → mcp_navigate_page / mcp_take_screenshot（不要 curl）
 
-- 需要信息 → 直接发起 Tool Calling\n\
+每次执行前先问自己：有没有专用工具能做这件事？有就用专用工具，不要用 curl/http_request 替代。
 
-- 任务完成 → 输出 `FINAL: <结论>`（事实性结论必须引用 Evidence ID）\n\
-
-- 所有路径均失败 → 输出 `NO_PATH: <原因>` 说明已尝试内容和阻塞点\n\
-
-- 无可行路径 → 输出 `NO_PATH: <原因>`\n\
-
-- 策略失败需调整 → 输出 `REPLAN: <新策略>` 并在下一轮直接执行\n\n\
-
-## ⚠ 工具选择规则（严格遵守）\n\
-
-不要用 curl/http_request 手工做所有事！每个任务有专用工具：\n\
-
-- 端口扫描 → nmap（不要 curl 逐个端口试）\n\
-
-- 漏洞扫描 → nuclei / web_vuln_scan（不要 curl 手工测）\n\
-
-- XSS 检测 → dalfox / web_xss_scan（不要 curl 试 payload）\n\
-
-- SQL 注入 → sqlmap / sqlmap_scan（不要 curl 手工注入）\n\
-
-- 目录爆破 → ffuf / gobuster / dir_fuzz（不要手工猜路径）\n\
-
-- 技术栈识别 → whatweb（不要手工看响应头）\n\
-
-- 子域名枚举 → subfinder / amass（不要手工 DNS）\n\
-
-- CSP 头分析 → csp_analyze（不要手工读 header）\n\
-
-- JS 安全审计 → js_security_audit（不要手工看代码）\n\
-
-- Wiki 知识查询 → knowledge_search（不要凭记忆猜）\n\
-
-- 浏览器操作 → mcp_navigate_page / mcp_take_screenshot（不要 curl）\n\
-
-\n\
-
-每次执行前先问自己：有没有专用工具能做这件事？有就用专用工具，不要用 curl/http_request 替代。\n\
-
-
-
-不要输出等待确认的计划、不要枚举工具列表、不要在工具调用前请求许可。";
+不要输出等待确认的计划、不要枚举工具列表、不要在工具调用前请求许可。"#;
 
 #[derive(Debug, Clone, Copy)]
 struct TurnBudget {
@@ -202,7 +184,603 @@ impl InlineToolExecutor for MainInlineToolExecutor<'_> {
     }
 }
 
+struct MainAgentRunHooks<'a> {
+    runtime: &'a ConversationRuntime,
+    turn_id: &'a str,
+    session_id: &'a str,
+    context: &'a mut ConversationContext,
+    intent: &'a ConversationIntent,
+    orchestration: super::agent_pipeline::OrchestrationMode,
+    agent_session: &'a Arc<dyn AgentSession>,
+    pentest_memory: &'a mut PentestMemory,
+    knowledge_cache: &'a mut KnowledgeCache,
+    attack_graph: &'a AttackGraph,
+    scan_progress: &'a mut super::scan_progress::ScanProgress,
+    evidence_ids: &'a mut Vec<String>,
+    run_summary: &'a mut String,
+    stall_terminal_prompted: &'a mut bool,
+}
+
+#[async_trait::async_trait]
+impl AgentRunHooks for MainAgentRunHooks<'_> {
+    type Output = ModelTurnOutput;
+
+    async fn run_round(
+        &mut self,
+        round: usize,
+        runner: &mut AgentRunner,
+    ) -> anyhow::Result<AgentRoundOutcome<Self::Output>> {
+        runner.run_model_round(round, self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentRoundHooks for MainAgentRunHooks<'_> {
+    type Output = ModelTurnOutput;
+
+    async fn prepare_round(&mut self, round: usize) -> anyhow::Result<()> {
+        let injection = prepare_injection(
+            self.runtime.enrichment.as_ref(),
+            self.pentest_memory,
+            self.knowledge_cache,
+            self.attack_graph,
+        )
+        .await;
+        let rmos_context = build_injected_context(&injection);
+        if !rmos_context.is_empty() {
+            self.context.recent_messages.push(AgentMessage {
+                message_id: format!("rmos_injection_{round}"),
+                role: "system".into(),
+                content: rmos_context,
+                format: "text".into(),
+            });
+        }
+        ContextManager::main().project(self.context);
+        Ok(())
+    }
+
+    async fn generate(&mut self, _round: usize) -> anyhow::Result<ModelTurnOutput> {
+        self.runtime
+            .model_gateway
+            .generate(self.context, self.intent)
+            .await
+    }
+
+    fn is_transient_model_error(&self, error: &anyhow::Error) -> bool {
+        super::agent_pipeline::is_transient_model_error(error)
+    }
+
+    async fn model_retry(
+        &mut self,
+        round: usize,
+        error: &anyhow::Error,
+        attempt: usize,
+    ) -> anyhow::Result<()> {
+        tracing::warn!(
+            error = %error,
+            attempt,
+            "model call failed inside agent loop; retrying"
+        );
+        self.context.recent_messages.push(AgentMessage {
+            message_id: format!("runtime_model_error:round_{round}"),
+            role: "user".into(),
+            content: format!(
+                "运行时报告：上一次模型调用发生临时错误（{}）。\
+                 请保持当前目标和已有 Evidence，继续执行；不要重复已经失败的策略。",
+                compact_runtime_error(&error.to_string())
+            ),
+            format: "text".into(),
+        });
+        Ok(())
+    }
+
+    async fn model_exhausted(
+        &mut self,
+        _round: usize,
+        error: &anyhow::Error,
+        transient: bool,
+        attempts: usize,
+    ) -> anyhow::Result<()> {
+        self.runtime
+            .repository
+            .fail_turn(
+                self.turn_id,
+                "MODEL_UNAVAILABLE",
+                &error.to_string(),
+                transient,
+            )
+            .await?;
+        Err(anyhow::anyhow!("模型调用连续失败 {attempts} 次: {error}"))
+    }
+
+    async fn empty_model_retry(&mut self, round: usize, _attempt: usize) -> anyhow::Result<()> {
+        self.context.recent_messages.push(AgentMessage {
+            message_id: format!("runtime_empty_model_response:round_{round}"),
+            role: "user".into(),
+            content: "运行时报告：上一条模型响应为空，没有正文或有效工具调用。\
+                      请保留当前目标和已有 Evidence，选择可用工具继续执行；\
+                      若确实无法继续，请明确返回 ASK_USER 或 NO_PATH。"
+                .into(),
+            format: "text".into(),
+        });
+        Ok(())
+    }
+
+    async fn empty_model_exhausted(
+        &mut self,
+        _round: usize,
+        attempts: usize,
+    ) -> anyhow::Result<()> {
+        self.runtime
+            .repository
+            .fail_turn(
+                self.turn_id,
+                "MODEL_EMPTY_RESPONSE",
+                &format!("模型连续 {attempts} 次返回了空内容"),
+                true,
+            )
+            .await?;
+        Err(anyhow::anyhow!("模型连续 {attempts} 次返回了空内容"))
+    }
+
+    async fn handle_output(
+        &mut self,
+        round: usize,
+        output: ModelTurnOutput,
+        directive: Option<AgentDirective>,
+        runner: &mut AgentRunner,
+    ) -> anyhow::Result<AgentRoundOutcome<Self::Output>> {
+        self.process_output(round, output, directive, runner).await
+    }
+}
+
+impl MainAgentRunHooks<'_> {
+    async fn process_output(
+        &mut self,
+        round: usize,
+        output: ModelTurnOutput,
+        directive: Option<AgentDirective>,
+        runner: &mut AgentRunner,
+    ) -> anyhow::Result<AgentRoundOutcome<ModelTurnOutput>> {
+        self.runtime
+            .process_main_agent_output(
+                round,
+                runner,
+                self.turn_id,
+                self.session_id,
+                self.context,
+                self.orchestration,
+                self.agent_session,
+                self.pentest_memory,
+                self.scan_progress,
+                self.evidence_ids,
+                self.run_summary,
+                self.stall_terminal_prompted,
+                output,
+                directive,
+            )
+            .await
+    }
+}
+
 impl ConversationRuntime {
+    async fn process_main_agent_output(
+        &self,
+        round: usize,
+        runner: &mut AgentRunner,
+        turn_id: &str,
+        session_id: &str,
+        context: &mut ConversationContext,
+        orchestration: super::agent_pipeline::OrchestrationMode,
+        agent_session: &Arc<dyn AgentSession>,
+        pentest_memory: &mut PentestMemory,
+        scan_progress: &mut super::scan_progress::ScanProgress,
+        evidence_ids: &mut Vec<String>,
+        run_summary: &mut String,
+        stall_terminal_prompted: &mut bool,
+        mut output: ModelTurnOutput,
+        directive: Option<AgentDirective>,
+    ) -> anyhow::Result<AgentRoundOutcome<ModelTurnOutput>> {
+        if !output.tool_calls.is_empty() {
+            // Every tool path, including inline tools and agent_spawn, crosses
+            // the same DesRed-compatible HITL fence before execution.
+            let plan_required = orchestration
+                == super::agent_pipeline::OrchestrationMode::PlanExecute
+                && if let Some(run_id) = context.run_id.as_deref() {
+                    !self.plan_store.exists(run_id).await.unwrap_or(false)
+                } else {
+                    false
+                };
+            let dispatch_plan = ToolDispatcher::new(self.approval_gate.as_ref())
+                .prepare(
+                    &mut output.tool_calls,
+                    &ToolDispatchContext {
+                        run_id: context.run_id.clone(),
+                        session_id: session_id.to_string(),
+                        policy: ToolDispatchPolicy {
+                            agent_management_only: orchestration
+                                == super::agent_pipeline::OrchestrationMode::Supervisor,
+                            plan_required,
+                        },
+                    },
+                )
+                .await;
+            for decision in &dispatch_plan.decisions {
+                if let Some(reason) = decision.repair.as_deref() {
+                    tracing::warn!(tool_call_id = %decision.tool_call_id, %reason, "repaired malformed model tool arguments");
+                }
+            }
+            // Write assistant tool_calls message to DB so SSE can stream it
+            let tool_calls_json: Vec<serde_json::Value> = output
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }
+                    })
+                })
+                .collect();
+
+            // Persist the model's optional reasoning/plan together with
+            // tool_calls so it remains part of the native tool transcript.
+            let assistant_tool_message = serde_json::json!({
+                "content": if output.content.trim().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(output.content.clone())
+                },
+                "tool_calls": tool_calls_json
+            });
+            self.repository
+                .write_intermediate_message(
+                    turn_id,
+                    session_id,
+                    "assistant",
+                    &assistant_tool_message.to_string(),
+                    "tool_calls",
+                )
+                .await?;
+
+            context.recent_messages.push(AgentMessage {
+                message_id: format!("assistant_tool:round_{}", round),
+                role: "assistant".into(),
+                content: assistant_tool_message.to_string(),
+                format: "tool_calls".into(),
+            });
+
+            // ── Phase pushes: guide the model through a systematic workflow ──
+            if round == 2 {
+                context.recent_messages.push(AgentMessage {
+                    message_id: "runtime_push_js".into(),
+                    role: "user".into(),
+                    content: "第一步存活确认已完成。请立即对网站进行 JavaScript 分析：\
+                                  用 js_collect 收集所有 JS 文件，然后用 js_analyze 分析提取 \
+                                  API 端点、密钥、内部路径。这比逐一手工测试高效得多。"
+                        .into(),
+                    format: "text".into(),
+                });
+            }
+            if round == 3 {
+                context.recent_messages.push(AgentMessage {
+                    message_id: "runtime_push_vuln_scan".into(),
+                    role: "user".into(),
+                    content: "信息收集阶段基本完成。请立即切换策略：用专项自动扫描工具（漏洞扫描、\
+                                  XSS 检测、SQL 注入检测、目录爆破）批量发现漏洞，\
+                                  用浏览器工具验证交互式漏洞，不要再逐一手工测试。"
+                        .into(),
+                    format: "text".into(),
+                });
+            }
+
+            // ── Force summary when approaching turn limit ──────────
+            if round == 15 {
+                context.recent_messages.push(AgentMessage {
+                        message_id: "runtime_force_summary".into(), role: "user".into(),
+                        content: "已执行大量工具调用。请立即停止调用工具，用纯文本总结所有发现和漏洞。不要调用任何工具。".into(),
+                        format: "text".into(),
+                    });
+            }
+            if round > 15 {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_stop_{round}"),
+                    role: "user".into(),
+                    content: "停止调用工具，输出最终报告。".into(),
+                    format: "text".into(),
+                });
+            }
+
+            let mut loop_diagnostic = None;
+
+            // ── Phase 1: group tools by capability ──
+            // Read/info tools → concurrent. Destructive/write tools → sequential.
+            let allowed_calls = output
+                .tool_calls
+                .iter()
+                .take_while(|_| runner.start_request().is_ok())
+                .count();
+            let inline_executor = MainInlineToolExecutor {
+                runtime: self,
+                session_id,
+                context: &context,
+                agent_session: &agent_session,
+            };
+            let execution_context = ToolExecutionContext {
+                scope_snapshot: context.scope_snapshot.clone(),
+                session_id: session_id.to_string(),
+                run_id: context.run_id.clone(),
+            };
+            let tool_results = ToolExecutionCoordinator::from_env(self.tool_executor.clone())
+                .execute(
+                    &output.tool_calls[..allowed_calls],
+                    &dispatch_plan,
+                    &execution_context,
+                    &inline_executor,
+                )
+                .await;
+
+            // ── Track unreachable targets for diagnostic ──
+            let mut unreachable_targets: Vec<String> = Vec::new();
+
+            // ── Phase 3: process all results (SSE + evidence + traffic + summary) ──
+            for item in &tool_results {
+                let result = &item.result;
+                let call_id = &item.call_id;
+                let tool_name = &item.tool_name;
+                let processed = ToolResultProcessor::new(self.repository.as_ref())
+                    .with_events(self.events.as_ref())
+                    .with_nats(self.nats.as_ref())
+                    .process(
+                        item,
+                        ToolResultProcessingContext {
+                            run_id: context.run_id.as_deref(),
+                            turn_id: Some(turn_id),
+                            session_id,
+                            message_id: format!("tool_result:{call_id}"),
+                            persistence: ToolResultPersistence::MainEvidence,
+                            emit_completion: true,
+                            capture_http_traffic: true,
+                        },
+                    )
+                    .await?;
+                let succeeded = processed.succeeded;
+                // Detect unreachable targets so the model doesn't retry dead hosts
+                if !succeeded && is_unreachable_error(&result.content) {
+                    if let Some(target) = extract_target_from_content(&result.content) {
+                        let host = target_host_from_url(&target);
+                        if !unreachable_targets.contains(&host) {
+                            unreachable_targets.push(host);
+                        }
+                    }
+                }
+                let effective_observation = processed.effective_observation;
+                runner.record_tool_result(succeeded, effective_observation);
+                if let Some(diagnostic) = scan_progress.record_tool_result(
+                    tool_name,
+                    succeeded,
+                    effective_observation,
+                    &result.content,
+                ) {
+                    loop_diagnostic = Some(diagnostic);
+                }
+                if tool_name == "traffic_replay" && succeeded {
+                    scan_progress.record_traffic_replay();
+                }
+
+                let evidence_id = processed.evidence_id;
+                if let Some(eid) = evidence_id.as_ref() {
+                    evidence_ids.push(eid.clone());
+                    scan_progress.record_evidence_tool(&eid, tool_name);
+                }
+                append_run_summary(
+                    run_summary,
+                    round + 1,
+                    tool_name,
+                    succeeded,
+                    evidence_id.as_deref(),
+                    &result.content,
+                );
+                context.recent_messages.push(processed.model_message);
+            }
+            if runner.stop_reason().is_some() {
+                return Ok(AgentRoundOutcome::Continue);
+            }
+            let loop_checkpoint = runner.checkpoint();
+            ContextManager::main().checkpoint(
+                context,
+                loop_checkpoint,
+                run_summary,
+                Some(format!("{:?}", orchestration).to_ascii_lowercase()),
+                Some(chrono::Utc::now().to_rfc3339()),
+            );
+
+            // ── RMOS: update memory from tool results ──
+            for item in &tool_results {
+                let result = &item.result;
+                let tool_name = &item.tool_name;
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.content) {
+                    pentest_memory.absorb_tool_result(tool_name, &parsed);
+                }
+            }
+            // Generate next_actions for uncovered methodology items
+            pentest_memory.ensure_coverage_actions();
+
+            self.repository
+                .checkpoint_context(turn_id, &context, &run_summary, &evidence_ids)
+                .await?;
+
+            if scan_progress.stall_exhausted() && !*stall_terminal_prompted {
+                *stall_terminal_prompted = true;
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_stall_exhausted:round_{round}"),
+                    role: "user".into(),
+                    content: "运行时报告：连续多次工具调用失败且没有产生新 Evidence。\
+                                  请判断失败原因并立即改变工具或参数；如果没有可行替代路径，\
+                                  返回 NO_PATH 并说明具体阻塞，不要继续机械重试。"
+                        .into(),
+                    format: "text".into(),
+                });
+            }
+            if let Some(diagnostic) = loop_diagnostic {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_diagnostic:round_{round}"),
+                    role: "user".into(),
+                    content: diagnostic,
+                    format: "text".into(),
+                });
+            }
+            // Tell model about unreachable targets so it doesn't waste rounds retrying
+            for host in &unreachable_targets {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_unreachable:{}", host),
+                    role: "user".into(),
+                    content: format!(
+                        "目标 {host} 不可达（连接被拒绝或超时），请**跳过**该目标，\
+                             不要再次调用 http_request/http_probe 指向它。\
+                             如果所有目标都不可达请输出 NO_PATH。"
+                    ),
+                    format: "text".into(),
+                });
+            }
+            // Remove repeatedly-failing tools from model catalog so the
+            // agent is forced to try alternatives instead of retrying.
+            let exhausted = scan_progress.exhausted_tools().clone();
+            if !exhausted.is_empty() {
+                self.model_gateway.set_exhausted_tools(exhausted);
+            }
+            return Ok(AgentRoundOutcome::Continue);
+        }
+
+        // A tool-free response must declare, or be treated as, a lifecycle
+        // action. The runtime validates the action against actual progress
+        // and Evidence rather than forcing a fixed pentest phase template.
+        match directive.expect("runtime supplies a directive for tool-free output") {
+            AgentDirective::Replan(reason) => {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("assistant_replan:round_{round}"),
+                    role: "assistant".into(),
+                    content: format!("REPLAN: {reason}"),
+                    format: "text".into(),
+                });
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_replan:round_{round}"),
+                    role: "user".into(),
+                    content: "请根据新计划直接选择并调用下一项最有信息增益的可用工具；\
+                                  不要只输出另一份计划。"
+                        .into(),
+                    format: "text".into(),
+                });
+                return Ok(AgentRoundOutcome::Continue);
+            }
+            AgentDirective::NoPath(reason) => {
+                if let Some(rejection) = scan_progress.no_path_rejection() {
+                    push_gate_rejection(
+                        context,
+                        round,
+                        &output.content,
+                        &format!("NO_PATH 被拒绝：{rejection}"),
+                    );
+                    return Ok(AgentRoundOutcome::Continue);
+                }
+                output.content = format!(
+                    "当前授权范围和可用能力下无法继续：{}",
+                    nonempty_or(&reason, "模型未提供具体原因")
+                );
+            }
+            AgentDirective::AskUser(question) => {
+                // Autonomous mode: treat ASK_USER as a signal to replan.
+                // The model has exhausted its current approach — push it to try
+                // alternative tools or conclude with NO_PATH.
+                let reason = nonempty_or(&question, "模型判断需要补充信息，但当前为全自主模式");
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("assistant_askuser_replan:round_{round}"),
+                    role: "assistant".into(),
+                    content: format!("ASK_USER: {reason}"),
+                    format: "text".into(),
+                });
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_askuser_replan:round_{round}"),
+                    role: "user".into(),
+                    content: format!(
+                        "你的 ASK_USER（{reason}）在全自主模式下不可用。\
+                             请改为：1) 换其他工具或策略继续验证；\
+                             2) 如果确实无路可走，输出 NO_PATH 说明阻塞点。"
+                    ),
+                    format: "text".into(),
+                });
+                return Ok(AgentRoundOutcome::Continue);
+            }
+            AgentDirective::Final(candidate) | AgentDirective::Candidate(candidate) => {
+                if let Some(rejection) = scan_progress.final_rejection(&candidate, &evidence_ids) {
+                    push_gate_rejection(
+                        context,
+                        round,
+                        &output.content,
+                        &format!("FINAL 被拒绝：{rejection}"),
+                    );
+                    return Ok(AgentRoundOutcome::Continue);
+                }
+                if let Some(rejection) = self
+                    .claim_projection_rejection(
+                        context.run_id.as_deref(),
+                        &candidate,
+                        &evidence_ids,
+                    )
+                    .await?
+                {
+                    push_gate_rejection(
+                        context,
+                        round,
+                        &output.content,
+                        &format!("FINAL 被拒绝：{rejection}"),
+                    );
+                    return Ok(AgentRoundOutcome::Continue);
+                }
+                if let Some(rejection) = scan_progress.maturity_rejection(&candidate, &evidence_ids)
+                {
+                    push_gate_rejection(
+                        context,
+                        round,
+                        &output.content,
+                        &format!("FINAL 被拒绝：{rejection}"),
+                    );
+                    return Ok(AgentRoundOutcome::Continue);
+                }
+                output.content = candidate;
+                // ── RMOS: don't stop if there are high-priority next actions ──
+                // Cap P1/P2 pending items at 3 to prevent infinite loops when
+                // the target simply doesn't have those vulnerability types.
+                let pending: Vec<_> = pentest_memory
+                    .next_actions
+                    .iter()
+                    .filter(|a| a.priority <= 2)
+                    .take(3)
+                    .collect();
+                if !pending.is_empty() {
+                    let mut lines = vec![
+                        "## ⚠ 渗透测试尚未完成\n".to_string(),
+                        "以下高优先级任务未执行，请选择一个继续操作：".to_string(),
+                    ];
+                    for a in pending.iter().take(5) {
+                        let tool = a.tool.as_deref().unwrap_or("manual");
+                        lines.push(format!(
+                            "- [P{}] {} — `{}` {}",
+                            a.priority, a.action, tool, a.target
+                        ));
+                    }
+                    lines.push("\n选择最优先的任务，直接调用工具继续渗透。".to_string());
+                    push_gate_rejection(context, round, &output.content, &lines.join("\n"));
+                    return Ok(AgentRoundOutcome::Continue);
+                }
+            }
+        }
+        Ok(AgentRoundOutcome::Complete(output))
+    }
+
     pub fn new(
         repository: Arc<dyn ConversationRepository>,
         context_source: Arc<dyn ConversationContextSource>,
@@ -488,7 +1066,7 @@ impl ConversationRuntime {
         mut context: ConversationContext,
         intent: &ConversationIntent,
     ) -> anyhow::Result<String> {
-        let mut final_output: Option<super::ports::ModelTurnOutput> = None;
+        ContextManager::main().initialize(&mut context, None);
         let mut budget = TurnBudget::from_snapshot(&context.budget_snapshot);
         if let Some(max_iterations) = context
             .policy_snapshot
@@ -497,15 +1075,7 @@ impl ConversationRuntime {
         {
             budget.max_tool_rounds = (max_iterations as usize).clamp(1, 10_000);
         }
-        let checkpoint = context
-            .policy_snapshot
-            .get("_checkpoint")
-            .cloned()
-            .unwrap_or_default();
-        let start_round = checkpoint
-            .get("round")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
+        let checkpoint = ContextManager::main().restore_checkpoint(&context);
         // Per-turn budget counts actual model API usage below. Historical
         // messages are windowed by the model gateway and are already included
         // in each provider-reported input_tokens value.
@@ -514,25 +1084,9 @@ impl ConversationRuntime {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_CONSECUTIVE_MODEL_ERRORS)
             .clamp(1, 5);
-        let mut orchestrator = AgentOrchestrator::from_checkpoint(
-            budget.loop_limits(),
-            AgentLoopCheckpoint {
-                next_round: start_round,
-                request_count: checkpoint
-                    .get("request_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize,
-                token_count: checkpoint
-                    .get("token_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                effective_observations: checkpoint
-                    .get("successful_observations")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize,
-                ..Default::default()
-            },
-            max_consecutive_model_errors,
+        let mut runner = AgentRunner::from_checkpoint(
+            AgentRunConfig::main(budget.loop_limits(), max_consecutive_model_errors),
+            checkpoint.loop_state,
         );
         let mut evidence_ids = Vec::new();
         let mut run_summary = context.run_summary.clone();
@@ -551,6 +1105,12 @@ impl ConversationRuntime {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4),
         );
+        if let Some(run_id) = context.run_id.as_deref() {
+            let recovered = agent_session.recover(run_id).await?;
+            if recovered > 0 {
+                tracing::info!(run_id, recovered, "recovered unfinished sub-agents");
+            }
+        }
         let orchestration =
             super::agent_pipeline::OrchestrationMode::from_policy(&context.policy_snapshot);
         let orchestration_instruction =
@@ -593,7 +1153,7 @@ impl ConversationRuntime {
         // ── RMOS: Memory + Knowledge + Attack Graph ──────────────────
         let mut pentest_memory = PentestMemory::new(&scan_goal);
         let mut knowledge_cache = KnowledgeCache::new();
-        let mut attack_graph = AttackGraph::new();
+        let attack_graph = AttackGraph::new();
 
         // ── Planning phase (before tool execution) ──────────────────
         // When the input is complex, inject a planning prompt that
@@ -620,536 +1180,45 @@ impl ConversationRuntime {
             });
         }
 
-        for round in orchestrator.next_round()..orchestrator.limits().max_rounds {
-            if orchestrator.begin_round(round).is_err() {
-                break;
+        let mut hooks = MainAgentRunHooks {
+            runtime: self,
+            turn_id,
+            session_id,
+            context: &mut context,
+            intent,
+            orchestration,
+            agent_session: &agent_session,
+            pentest_memory: &mut pentest_memory,
+            knowledge_cache: &mut knowledge_cache,
+            attack_graph: &attack_graph,
+            scan_progress: &mut scan_progress,
+            evidence_ids: &mut evidence_ids,
+            run_summary: &mut run_summary,
+            stall_terminal_prompted: &mut stall_terminal_prompted,
+        };
+        let run_result = match runner.run(&mut hooks).await {
+            Ok(result) => result,
+            Err(error) => {
+                drop(hooks);
+                agent_session.abort_all().await;
+                return Err(error);
             }
+        };
+        drop(hooks);
+        let mut final_output = run_result.output;
 
-            // ── RMOS: inject memory + knowledge + attack chain ──
-            let injection = prepare_injection(
-                self.enrichment.as_ref(),
-                &pentest_memory,
-                &mut knowledge_cache,
-                &attack_graph,
-            )
-            .await;
-            let rmos_context = build_injected_context(&injection);
-            if !rmos_context.is_empty() {
-                context.recent_messages.push(AgentMessage {
-                    message_id: format!("rmos_injection_{}", round),
-                    role: "system".into(),
-                    content: rmos_context,
-                    format: "text".into(),
-                });
-            }
-
-            let mut output = match self.model_gateway.generate(&context, intent).await {
-                Ok(output) => output,
-                Err(error) => {
-                    let transient = super::agent_pipeline::is_transient_model_error(&error);
-                    match orchestrator.record_model_error(transient) {
-                        ModelAttemptOutcome::Retry {
-                            attempt,
-                            backoff_ms,
-                        } => {
-                            tracing::warn!(
-                                error = %error,
-                                attempt,
-                                max_attempts = orchestrator.max_consecutive_model_errors(),
-                                "model call failed inside agent loop; retrying"
-                            );
-                            context.recent_messages.push(AgentMessage {
-                                message_id: format!("runtime_model_error:round_{round}"),
-                                role: "user".into(),
-                                content: format!(
-                                    "运行时报告：上一次模型调用发生临时错误（{}）。\
-                                     请保持当前目标和已有 Evidence，继续执行；不要重复已经失败的策略。",
-                                    compact_runtime_error(&error.to_string())
-                                ),
-                                format: "text".into(),
-                            });
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                            continue;
-                        }
-                        ModelAttemptOutcome::Exhausted { attempts } => {
-                            self.repository
-                                .fail_turn(
-                                    turn_id,
-                                    "MODEL_UNAVAILABLE",
-                                    &error.to_string(),
-                                    transient,
-                                )
-                                .await?;
-                            return Err(anyhow::anyhow!("模型调用连续失败 {attempts} 次: {error}"));
-                        }
-                        ModelAttemptOutcome::Accepted => unreachable!(),
-                    }
-                }
-            };
-
-            // An empty completion is recoverable: keep the agent loop alive and
-            // explicitly ask the next model attempt to resume from its context.
-            let empty_output = output.tool_calls.is_empty() && output.content.trim().is_empty();
-            match orchestrator.record_model_output(
-                output.usage.input_tokens,
-                output.usage.output_tokens,
-                empty_output,
-            ) {
-                ModelAttemptOutcome::Retry {
-                    attempt: _,
-                    backoff_ms,
-                } => {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("runtime_empty_model_response:round_{round}"),
-                        role: "user".into(),
-                        content: "运行时报告：上一条模型响应为空，没有正文或有效工具调用。\
-                                  请保留当前目标和已有 Evidence，选择可用工具继续执行；\
-                                  若确实无法继续，请明确返回 ASK_USER 或 NO_PATH。"
-                            .into(),
-                        format: "text".into(),
-                    });
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                ModelAttemptOutcome::Exhausted { attempts } => {
-                    self.repository
-                        .fail_turn(
-                            turn_id,
-                            "MODEL_EMPTY_RESPONSE",
-                            &format!("模型连续 {attempts} 次返回了空内容"),
-                            true,
-                        )
-                        .await?;
-                    return Err(anyhow::anyhow!("模型连续 {attempts} 次返回了空内容"));
-                }
-                ModelAttemptOutcome::Accepted => {}
-            }
-
-            if !output.tool_calls.is_empty() {
-                // Every tool path, including inline tools and agent_spawn, crosses
-                // the same DesRed-compatible HITL fence before execution.
-                let plan_required = orchestration
-                    == super::agent_pipeline::OrchestrationMode::PlanExecute
-                    && if let Some(run_id) = context.run_id.as_deref() {
-                        !self.plan_store.exists(run_id).await.unwrap_or(false)
-                    } else {
-                        false
-                    };
-                let dispatch_plan = ToolDispatcher::new(self.approval_gate.as_ref())
-                    .prepare(
-                        &mut output.tool_calls,
-                        &ToolDispatchContext {
-                            run_id: context.run_id.clone(),
-                            session_id: session_id.to_string(),
-                            policy: ToolDispatchPolicy {
-                                agent_management_only: orchestration
-                                    == super::agent_pipeline::OrchestrationMode::Supervisor,
-                                plan_required,
-                            },
-                        },
-                    )
-                    .await;
-                for decision in &dispatch_plan.decisions {
-                    if let Some(reason) = decision.repair.as_deref() {
-                        tracing::warn!(tool_call_id = %decision.tool_call_id, %reason, "repaired malformed model tool arguments");
-                    }
-                }
-                // Write assistant tool_calls message to DB so SSE can stream it
-                let tool_calls_json: Vec<serde_json::Value> = output
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments
-                            }
-                        })
-                    })
-                    .collect();
-
-                // Persist the model's optional reasoning/plan together with
-                // tool_calls so it remains part of the native tool transcript.
-                let assistant_tool_message = serde_json::json!({
-                    "content": if output.content.trim().is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::Value::String(output.content.clone())
-                    },
-                    "tool_calls": tool_calls_json
-                });
-                self.repository
-                    .write_intermediate_message(
-                        turn_id,
-                        session_id,
-                        "assistant",
-                        &assistant_tool_message.to_string(),
-                        "tool_calls",
-                    )
-                    .await?;
-
-                context.recent_messages.push(AgentMessage {
-                    message_id: format!("assistant_tool:round_{}", round),
-                    role: "assistant".into(),
-                    content: assistant_tool_message.to_string(),
-                    format: "tool_calls".into(),
-                });
-
-                // ── Phase pushes: guide the model through a systematic workflow ──
-                if round == 2 {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: "runtime_push_js".into(),
-                        role: "user".into(),
-                        content: "第一步存活确认已完成。请立即对网站进行 JavaScript 分析：\
-                                  用 js_collect 收集所有 JS 文件，然后用 js_analyze 分析提取 \
-                                  API 端点、密钥、内部路径。这比逐一手工测试高效得多。"
-                            .into(),
-                        format: "text".into(),
-                    });
-                }
-                if round == 3 {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: "runtime_push_vuln_scan".into(),
-                        role: "user".into(),
-                        content:
-                            "信息收集阶段基本完成。请立即切换策略：用专项自动扫描工具（漏洞扫描、\
-                                  XSS 检测、SQL 注入检测、目录爆破）批量发现漏洞，\
-                                  用浏览器工具验证交互式漏洞，不要再逐一手工测试。"
-                                .into(),
-                        format: "text".into(),
-                    });
-                }
-
-                // ── Force summary when approaching turn limit ──────────
-                if round == 15 {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: "runtime_force_summary".into(), role: "user".into(),
-                        content: "已执行大量工具调用。请立即停止调用工具，用纯文本总结所有发现和漏洞。不要调用任何工具。".into(),
-                        format: "text".into(),
-                    });
-                }
-                if round > 15 {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("runtime_stop_{round}"),
-                        role: "user".into(),
-                        content: "停止调用工具，输出最终报告。".into(),
-                        format: "text".into(),
-                    });
-                }
-
-                let mut loop_diagnostic = None;
-
-                // ── Phase 1: group tools by capability ──
-                // Read/info tools → concurrent. Destructive/write tools → sequential.
-                let allowed_calls = output
-                    .tool_calls
-                    .iter()
-                    .take_while(|_| orchestrator.start_request().is_ok())
-                    .count();
-                let inline_executor = MainInlineToolExecutor {
-                    runtime: self,
-                    session_id,
-                    context: &context,
-                    agent_session: &agent_session,
-                };
-                let execution_context = ToolExecutionContext {
-                    scope_snapshot: context.scope_snapshot.clone(),
-                    session_id: session_id.to_string(),
-                    run_id: context.run_id.clone(),
-                };
-                let tool_results = ToolExecutionCoordinator::from_env(self.tool_executor.clone())
-                    .execute(
-                        &output.tool_calls[..allowed_calls],
-                        &dispatch_plan,
-                        &execution_context,
-                        &inline_executor,
-                    )
-                    .await;
-
-                // ── Track unreachable targets for diagnostic ──
-                let mut unreachable_targets: Vec<String> = Vec::new();
-
-                // ── Phase 3: process all results (SSE + evidence + traffic + summary) ──
-                for item in &tool_results {
-                    let result = &item.result;
-                    let call_id = &item.call_id;
-                    let tool_name = &item.tool_name;
-                    let processed = ToolResultProcessor::new(self.repository.as_ref())
-                        .with_events(self.events.as_ref())
-                        .with_nats(self.nats.as_ref())
-                        .process(
-                            item,
-                            ToolResultProcessingContext {
-                                run_id: context.run_id.as_deref(),
-                                turn_id: Some(turn_id),
-                                session_id,
-                                message_id: format!("tool_result:{call_id}"),
-                                persistence: ToolResultPersistence::MainEvidence,
-                                emit_completion: true,
-                                capture_http_traffic: true,
-                            },
-                        )
-                        .await?;
-                    let succeeded = processed.succeeded;
-                    // Detect unreachable targets so the model doesn't retry dead hosts
-                    if !succeeded && is_unreachable_error(&result.content) {
-                        if let Some(target) = extract_target_from_content(&result.content) {
-                            let host = target_host_from_url(&target);
-                            if !unreachable_targets.contains(&host) {
-                                unreachable_targets.push(host);
-                            }
-                        }
-                    }
-                    let effective_observation = processed.effective_observation;
-                    orchestrator.record_tool_result(succeeded, effective_observation);
-                    if let Some(diagnostic) = scan_progress.record_tool_result(
-                        tool_name,
-                        succeeded,
-                        effective_observation,
-                        &result.content,
-                    ) {
-                        loop_diagnostic = Some(diagnostic);
-                    }
-                    if tool_name == "traffic_replay" && succeeded {
-                        scan_progress.record_traffic_replay();
-                    }
-
-                    let evidence_id = processed.evidence_id;
-                    if let Some(eid) = evidence_id.as_ref() {
-                        evidence_ids.push(eid.clone());
-                        scan_progress.record_evidence_tool(&eid, tool_name);
-                    }
-                    append_run_summary(
-                        &mut run_summary,
-                        round + 1,
-                        tool_name,
-                        succeeded,
-                        evidence_id.as_deref(),
-                        &result.content,
-                    );
-                    context.recent_messages.push(processed.model_message);
-                }
-                if orchestrator.stop_reason().is_some() {
-                    break;
-                }
-                context.run_summary = run_summary.clone();
-                let loop_checkpoint = orchestrator.checkpoint();
-                context.policy_snapshot["_checkpoint"] = serde_json::json!({
-                    "round": loop_checkpoint.next_round,
-                    "request_count": loop_checkpoint.request_count,
-                    "token_count": loop_checkpoint.token_count,
-                    "successful_observations": loop_checkpoint.effective_observations,
-                    "orchestration": format!("{:?}", orchestration).to_ascii_lowercase(),
-                    "updated_at": chrono::Utc::now()
-                });
-
-                // ── RMOS: update memory from tool results ──
-                for item in &tool_results {
-                    let result = &item.result;
-                    let tool_name = &item.tool_name;
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.content) {
-                        pentest_memory.absorb_tool_result(tool_name, &parsed);
-                    }
-                }
-                // Generate next_actions for uncovered methodology items
-                pentest_memory.ensure_coverage_actions();
-
-                self.repository
-                    .checkpoint_context(turn_id, &context, &run_summary, &evidence_ids)
-                    .await?;
-
-                if scan_progress.stall_exhausted() && !stall_terminal_prompted {
-                    stall_terminal_prompted = true;
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("runtime_stall_exhausted:round_{round}"),
-                        role: "user".into(),
-                        content: "运行时报告：连续多次工具调用失败且没有产生新 Evidence。\
-                                  请判断失败原因并立即改变工具或参数；如果没有可行替代路径，\
-                                  返回 NO_PATH 并说明具体阻塞，不要继续机械重试。"
-                            .into(),
-                        format: "text".into(),
-                    });
-                }
-                if let Some(diagnostic) = loop_diagnostic {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("runtime_diagnostic:round_{round}"),
-                        role: "user".into(),
-                        content: diagnostic,
-                        format: "text".into(),
-                    });
-                }
-                // Tell model about unreachable targets so it doesn't waste rounds retrying
-                for host in &unreachable_targets {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("runtime_unreachable:{}", host),
-                        role: "user".into(),
-                        content: format!(
-                            "目标 {host} 不可达（连接被拒绝或超时），请**跳过**该目标，\
-                             不要再次调用 http_request/http_probe 指向它。\
-                             如果所有目标都不可达请输出 NO_PATH。"
-                        ),
-                        format: "text".into(),
-                    });
-                }
-                // Remove repeatedly-failing tools from model catalog so the
-                // agent is forced to try alternatives instead of retrying.
-                let exhausted = scan_progress.exhausted_tools().clone();
-                if !exhausted.is_empty() {
-                    self.model_gateway.set_exhausted_tools(exhausted);
-                }
-                continue;
-            }
-
-            // A tool-free response must declare, or be treated as, a lifecycle
-            // action. The runtime validates the action against actual progress
-            // and Evidence rather than forcing a fixed pentest phase template.
-            match orchestrator.directive(&output.content) {
-                AgentDirective::Replan(reason) => {
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("assistant_replan:round_{round}"),
-                        role: "assistant".into(),
-                        content: format!("REPLAN: {reason}"),
-                        format: "text".into(),
-                    });
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("runtime_replan:round_{round}"),
-                        role: "user".into(),
-                        content: "请根据新计划直接选择并调用下一项最有信息增益的可用工具；\
-                                  不要只输出另一份计划。"
-                            .into(),
-                        format: "text".into(),
-                    });
-                    continue;
-                }
-                AgentDirective::NoPath(reason) => {
-                    if let Some(rejection) = scan_progress.no_path_rejection() {
-                        push_gate_rejection(
-                            &mut context,
-                            round,
-                            &output.content,
-                            &format!("NO_PATH 被拒绝：{rejection}"),
-                        );
-                        continue;
-                    }
-                    output.content = format!(
-                        "当前授权范围和可用能力下无法继续：{}",
-                        nonempty_or(&reason, "模型未提供具体原因")
-                    );
-                }
-                AgentDirective::AskUser(question) => {
-                    // Autonomous mode: treat ASK_USER as a signal to replan.
-                    // The model has exhausted its current approach — push it to try
-                    // alternative tools or conclude with NO_PATH.
-                    let reason = nonempty_or(&question, "模型判断需要补充信息，但当前为全自主模式");
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("assistant_askuser_replan:round_{round}"),
-                        role: "assistant".into(),
-                        content: format!("ASK_USER: {reason}"),
-                        format: "text".into(),
-                    });
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("runtime_askuser_replan:round_{round}"),
-                        role: "user".into(),
-                        content: format!(
-                            "你的 ASK_USER（{reason}）在全自主模式下不可用。\
-                             请改为：1) 换其他工具或策略继续验证；\
-                             2) 如果确实无路可走，输出 NO_PATH 说明阻塞点。"
-                        ),
-                        format: "text".into(),
-                    });
-                    continue;
-                }
-                AgentDirective::Final(candidate) | AgentDirective::Candidate(candidate) => {
-                    if let Some(rejection) =
-                        scan_progress.final_rejection(&candidate, &evidence_ids)
-                    {
-                        push_gate_rejection(
-                            &mut context,
-                            round,
-                            &output.content,
-                            &format!("FINAL 被拒绝：{rejection}"),
-                        );
-                        continue;
-                    }
-                    if let Some(rejection) = self
-                        .claim_projection_rejection(
-                            context.run_id.as_deref(),
-                            &candidate,
-                            &evidence_ids,
-                        )
-                        .await?
-                    {
-                        push_gate_rejection(
-                            &mut context,
-                            round,
-                            &output.content,
-                            &format!("FINAL 被拒绝：{rejection}"),
-                        );
-                        continue;
-                    }
-                    if let Some(rejection) =
-                        scan_progress.maturity_rejection(&candidate, &evidence_ids)
-                    {
-                        push_gate_rejection(
-                            &mut context,
-                            round,
-                            &output.content,
-                            &format!("FINAL 被拒绝：{rejection}"),
-                        );
-                        continue;
-                    }
-                    output.content = candidate;
-                    // ── RMOS: don't stop if there are high-priority next actions ──
-                    // Cap P1/P2 pending items at 3 to prevent infinite loops when
-                    // the target simply doesn't have those vulnerability types.
-                    let pending: Vec<_> = pentest_memory
-                        .next_actions
-                        .iter()
-                        .filter(|a| a.priority <= 2)
-                        .take(3)
-                        .collect();
-                    if !pending.is_empty() {
-                        let mut lines = vec![
-                            "## ⚠ 渗透测试尚未完成\n".to_string(),
-                            "以下高优先级任务未执行，请选择一个继续操作：".to_string(),
-                        ];
-                        for a in pending.iter().take(5) {
-                            let tool = a.tool.as_deref().unwrap_or("manual");
-                            lines.push(format!(
-                                "- [P{}] {} — `{}` {}",
-                                a.priority, a.action, tool, a.target
-                            ));
-                        }
-                        lines.push("\n选择最优先的任务，直接调用工具继续渗透。".to_string());
-                        push_gate_rejection(
-                            &mut context,
-                            round,
-                            &output.content,
-                            &lines.join("\n"),
-                        );
-                        continue;
-                    }
-                }
-            }
-            final_output = Some(output);
-            orchestrator.finish();
-            break;
-        }
-
-        if !orchestrator.finished_normally() {
-            let stop_reason = orchestrator
+        if !runner.finished_normally() {
+            let stop_reason = runner
                 .stop_reason()
                 .map(|reason| reason.as_str())
                 .unwrap_or("rounds");
-            let loop_checkpoint = orchestrator.checkpoint();
+            let loop_checkpoint = runner.checkpoint();
             context.recent_messages.push(AgentMessage {
                 message_id: "runtime_budget_finalization".into(),
                 role: "user".into(),
                 content: budget_finalization_prompt(
                     stop_reason,
-                    orchestrator.rounds_used(),
+                    runner.rounds_used(),
                     loop_checkpoint.request_count,
                     loop_checkpoint.token_count,
                     &run_summary,
@@ -1187,7 +1256,7 @@ impl ConversationRuntime {
             }
         }
         let output = final_output.ok_or_else(|| anyhow::anyhow!("模型未返回有效响应"))?;
-        let loop_checkpoint = orchestrator.checkpoint();
+        let loop_checkpoint = runner.checkpoint();
 
         let final_content = if context.run_id.is_some() {
             let report = if output.content.trim().is_empty() {
@@ -1410,7 +1479,7 @@ impl ConversationRuntime {
             .unwrap_or(4)
             .clamp(1, 8);
         let queries = crate::tooling::reranker::knowledge::expand_queries(query, multi_query_max);
-        let mut guides: Vec<super::ports::KnowledgeGuide> = Vec::new();
+        let mut guides: Vec<KnowledgeGuide> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for variant in &queries {
             if let Ok(mut result) = self.knowledge_source.search_guides(variant, 3).await {
@@ -1424,7 +1493,7 @@ impl ConversationRuntime {
         }
         if let Ok(memories) = self.enrichment.search_memories(query, 3).await {
             for memory in memories {
-                guides.push(super::ports::KnowledgeGuide {
+                guides.push(KnowledgeGuide {
                     id: format!("vec-{}", uuid::Uuid::new_v4()),
                     title: "向量记忆匹配".into(),
                     source: Some("pgvector".into()),
@@ -1522,7 +1591,7 @@ impl ConversationRuntime {
     async fn log_knowledge_retrieval(
         &self,
         query: &str,
-        guides: &[super::ports::KnowledgeGuide],
+        guides: &[KnowledgeGuide],
         session_id: &str,
         run_id: Option<&str>,
     ) {
@@ -1644,6 +1713,16 @@ impl ConversationRuntime {
                 session_id: session_id.to_string(),
                 parent_run_id: context.run_id.clone().unwrap_or_else(|| "unknown".into()),
                 target,
+                child_budget: inherit_child_budget(
+                    context,
+                    AgentChildBudget {
+                        max_rounds: 12,
+                        max_duration_seconds: 15 * 60,
+                        max_requests: 80,
+                        max_tokens: 100_000,
+                        stall_limit: 4,
+                    },
+                ),
             })
             .await
         {
@@ -2009,9 +2088,7 @@ fn compact_runtime_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AgentDirective, compact_runtime_error, parse_agent_directive,
-    };
+    use super::{AgentDirective, compact_runtime_error, parse_agent_directive};
 
     #[test]
     fn runtime_error_is_compacted_before_returning_to_model() {

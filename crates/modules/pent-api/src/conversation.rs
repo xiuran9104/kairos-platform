@@ -126,3 +126,43 @@ pub struct ConversationContext {
     pub tool_ids: Vec<String>,
     pub estimated_tokens: u64,
 }
+
+/// Stable request passed from an agent loop to the sub-agent scheduler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSpawnRequest {
+    pub description: String,
+    pub prompt: String,
+    pub session_id: String,
+    pub parent_run_id: String,
+    pub target: Option<String>,
+    pub child_budget: AgentChildBudget,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentChildBudget {
+    pub max_rounds: usize,
+    pub max_duration_seconds: u64,
+    pub max_requests: usize,
+    pub max_tokens: u64,
+    pub stall_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAgentStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSubAgent {
+    pub agent_id: String,
+    pub description: String,
+    pub status: RuntimeAgentStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}

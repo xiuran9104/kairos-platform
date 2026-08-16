@@ -203,6 +203,12 @@ async fn append_event(
     event_type: &str,
     payload: serde_json::Value,
 ) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734291))")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| error.to_string())?;
     sqlx::query(
         "INSERT INTO pent_run_events(
              event_id, run_id, sequence, event_type, occurred_at, payload
@@ -214,9 +220,10 @@ async fn append_event(
     .bind(run_id)
     .bind(event_type)
     .bind(payload)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|error| error.to_string())?;
+    tx.commit().await.map_err(|error| error.to_string())?;
     Ok(())
 }
 

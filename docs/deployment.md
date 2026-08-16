@@ -31,7 +31,7 @@ cargo build --release -p kairos-platform-gateway
 新服务器首次部署建议流程：
 
 1. 安装 Rust stable、Docker Compose、Node.js `22.18+` 或 `24.x`，并通过 Corepack 使用 pnpm `11+`。
-   如需使用 Pent 主动检测，另需在网关宿主机安装 `nmap`、`nuclei`、`sqlmap`、`ffuf`、
+   如需使用 Pent 主动检测，另需在 pent-agent 宿主机安装 `bubblewrap`、`nmap`、`nuclei`、`sqlmap`、`ffuf`、
    `gobuster`、`whatweb`、`nikto`、`subfinder`、`amass`、`wfuzz`、`dirsearch`、
    `feroxbuster`、`dalfox` 等本地工具。
 2. 克隆代码到固定目录，例如 `/opt/kairos-platform`。
@@ -176,7 +176,11 @@ done
 /usr/bin/nmap -sT -Pn --reason -- 127.0.0.1
 ```
 
-Pent 主动检测工具由网关宿主机直接执行。不要为渗透工具配置 Docker 工具镜像；Compose 中的
+Pent 主动检测工具由 pent-agent 宿主机上的 bubblewrap 沙箱执行。沙箱使用本地工具和文件系统，
+不创建 OCI/runc 容器或工具镜像；`/workspace` 与 `/artifacts` 默认持久化在
+`PENTA_SANDBOX_ROOT`（默认 `/tmp/kairos-pent-sandbox`）下。沙箱隔离 mount、PID、user、IPC、UTS
+和 cgroup namespace，清空 capabilities 并加载 seccomp-bpf；按当前部署决策复用宿主机网络栈，
+不提供 network namespace 或内核级内网阻断。Compose 中的
 Docker 服务只承担数据库、缓存、消息队列、对象存储、图数据库、headless Chrome 和代理等
 基础设施职责。
 
@@ -203,6 +207,6 @@ pnpm --dir apps/web --filter @vben/web-antd run build
 - SSE 到前端后一次性出现：关闭 Nginx/Ingress 的响应缓冲并增加读取超时。
 - AI 任务一直处理中：检查模型配置的任务查询路径、鉴权头和供应商任务 ID；可调用 `/poll` 接口立即同步。
 - 前端请求 404：确认 Vben API 基址或 Nginx `/api/` 转发是否去掉了正确的前缀。
-- Pent 工具调用提示命令不存在：在网关宿主机安装对应二进制，并确认 `command -v <tool>` 可找到。
+- Pent 工具调用提示命令不存在：在 pent-agent 宿主机安装对应二进制，并确认 `command -v <tool>` 可找到。
 - `mcp_navigate_page` 提示 MCP 不可用：先检查 `http://127.0.0.1:9222/json/version`。
   Chrome DevTools 可用时，网关会使用 HTTP fallback 打开页面。

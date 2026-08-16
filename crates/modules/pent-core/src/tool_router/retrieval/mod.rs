@@ -1,7 +1,5 @@
 //! Hybrid retrieval (FTS + Vector) for tool search.
 
-use kairos_platform_pent_api::ToolDescriptor;
-
 /// Hybrid retriever combining FTS and vector search results.
 #[derive(Default)]
 pub struct HybridRetriever;

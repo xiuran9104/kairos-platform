@@ -191,6 +191,8 @@ mod tool_execution_tests {
             memory_mb: 512,
             timeout_seconds: 300,
             network_access: NetworkPolicy::TargetOnly("example.com".into()),
+            workspace_dir: None,
+            artifact_dir: None,
             allowed_paths: vec!["/tmp".into()],
             run_id: None,
         };
@@ -201,12 +203,14 @@ mod tool_execution_tests {
     }
 
     #[test]
-    fn host_execution_uses_direct_binary() {
+    fn sandbox_execution_retains_resource_policy() {
         let limits = ToolExecutionLimits {
             cpu_cores: 2.0,
             memory_mb: 1024,
             timeout_seconds: 120,
             network_access: NetworkPolicy::Full,
+            workspace_dir: None,
+            artifact_dir: None,
             allowed_paths: vec![],
             run_id: None,
         };

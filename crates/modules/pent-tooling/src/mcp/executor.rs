@@ -1,15 +1,14 @@
 //! MCP executor — delegates tool execution to external MCP servers
 //! via the McpRegistry. Replaces the previous stub.
-use crate::tooling::mcp::protocol::ContentBlock;
-use crate::tooling::ports::ToolExecutionBackend;
+use super::protocol::ContentBlock;
+use super::registry::McpRegistry;
+use crate::ports::ToolExecutionBackend;
 use async_trait::async_trait;
 use chrono::Utc;
 use kairos_platform_pent_api::{
     ToolDescriptor, ToolExecutionMetrics, ToolExecutionResult, ToolExecutionStatus, ToolInvocation,
 };
 use std::sync::Arc;
-
-use crate::tooling::mcp::registry::McpRegistry;
 
 pub struct McpExecutor {
     pub registry: Arc<McpRegistry>,

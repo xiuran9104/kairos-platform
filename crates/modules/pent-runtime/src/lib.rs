@@ -6,9 +6,14 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_loop;
+pub mod agent_runner;
+pub mod agent_scheduler;
 pub mod context_compaction;
 pub mod context_guard;
+pub mod context_lifecycle;
+pub mod observation;
 pub mod orchestrator;
 pub mod ports;
 pub mod tool_dispatch;
+pub mod tool_execution;
 pub mod tool_result;

@@ -95,8 +95,8 @@ services:
       DATABASE_URL: postgres://kairos_platform:kairos_platform@postgres:5432/kairos_platform
       REDIS_URL: redis://redis:6379
       NATS_URL: nats://nats:4222
-      JWT_SECRET: kairos-platform-local-dev-secret-key-2026
-      GATEWAY_PORT: "8081"
+      PENT_AGENT_PORT: "8081"
+      PENTA_WORKER_ID: "node-1"
       RUST_LOG: info
     ports:
       - "8081:8081"
@@ -114,8 +114,8 @@ services:
       DATABASE_URL: postgres://kairos_platform:kairos_platform@postgres:5432/kairos_platform
       REDIS_URL: redis://redis:6379
       NATS_URL: nats://nats:4222
-      JWT_SECRET: kairos-platform-local-dev-secret-key-2026
-      GATEWAY_PORT: "8082"
+      PENT_AGENT_PORT: "8082"
+      PENTA_WORKER_ID: "node-2"
       RUST_LOG: info
     ports:
       - "8082:8082"

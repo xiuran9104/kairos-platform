@@ -1746,13 +1746,12 @@ dependencies = [
  "axum",
  "kairos-platform-framework-common",
  "kairos-platform-framework-database",
- "kairos-platform-framework-security",
  "kairos-platform-framework-web",
- "kairos-platform-pent-api",
- "kairos-platform-pent-core",
  "kairos-platform-pent-server",
+ "kairos-platform-pent-tooling",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1770,7 +1769,6 @@ name = "kairos-platform-pent-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "base64",
  "chrono",
  "kairos-platform-pent-api",
@@ -1778,8 +1776,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tokio",
- "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1790,9 +1786,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "kairos-platform-pent-api",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1820,6 +1819,7 @@ dependencies = [
  "kairos-platform-pent-core",
  "kairos-platform-pent-runtime",
  "kairos-platform-pent-tooling",
+ "libc",
  "md-5",
  "regex",
  "reqwest",
@@ -1840,9 +1840,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
+ "futures-util",
  "kairos-platform-pent-api",
+ "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

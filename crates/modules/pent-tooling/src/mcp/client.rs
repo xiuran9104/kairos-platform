@@ -14,13 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::debug;
 
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
-
 pub struct McpClient {
     server_id: String,
     transport: Arc<dyn McpTransport>,
     next_id: AtomicU64,
     initialized: AtomicBool,
+    call_timeout: Duration,
 }
 
 impl McpClient {
@@ -46,6 +45,7 @@ impl McpClient {
             transport,
             next_id: AtomicU64::new(1),
             initialized: AtomicBool::new(false),
+            call_timeout: Duration::from_secs(config.timeout_secs.max(1)),
         }
     }
 
@@ -67,7 +67,7 @@ impl McpClient {
     /// Discover tools from the MCP server.
     pub async fn list_tools(&self) -> anyhow::Result<Vec<ToolDef>> {
         let result: ListToolsResult = self
-            .call_raw("tools/list", None::<Value>, CALL_TIMEOUT)
+            .call_raw("tools/list", None::<Value>, self.call_timeout)
             .await?;
         Ok(result.tools)
     }
@@ -86,7 +86,7 @@ impl McpClient {
             .call_raw(
                 "tools/call",
                 Some(serde_json::to_value(params)?),
-                CALL_TIMEOUT,
+                self.call_timeout,
             )
             .await?;
         Ok(result)

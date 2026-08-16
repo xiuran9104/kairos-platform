@@ -8,6 +8,7 @@ use axum::{
     extract::{Path, State},
     routing::{get, post},
 };
+use kairos_platform_framework_common::ApiResponse;
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
 use serde_json::{Value, json};
@@ -39,9 +40,7 @@ async fn create_pent_task(
     let tenant_id = crate::security::tenant_id(&user)?;
     let task_id = uuid::Uuid::new_v4().to_string();
     let name = body["name"].as_str().unwrap_or("unnamed");
-    let desc = body
-        .get("description")
-        .and_then(|v| v.as_str());
+    let desc = body.get("description").and_then(|v| v.as_str());
     let priority = body["priority"].as_str().unwrap_or("medium");
     // ── M2-F10: AUP confirmation ────────────────────────────────────
     // Require the operator to acknowledge the Acceptable Use Policy before
@@ -56,7 +55,7 @@ async fn create_pent_task(
             .unwrap_or(false);
         if !aup_confirmed {
             return Err(AppError::bad_request(
-                "请先确认可接受使用政策（AUP）。在请求中设置 aup_confirmed: true"
+                "请先确认可接受使用政策（AUP）。在请求中设置 aup_confirmed: true",
             ));
         }
     }
@@ -108,12 +107,10 @@ async fn create_pent_task(
     };
     // Extract scope from request or project
     let scope = normalise_scope(&body, &project_id)?;
-    let model_config_id = body["model_config_id"]
-        .as_i64()
-        .or_else(|| {
-            // Fallback: use first available chat model
-            None
-        });
+    let model_config_id = body["model_config_id"].as_i64().or_else(|| {
+        // Fallback: use first available chat model
+        None
+    });
     sqlx::query(
         "INSERT INTO pent_tasks(id,tenant_id,project_id,name,description,target_scope,priority,status,created_by)
          VALUES($1,$2,$3,$4,$5,$6,$7,'running',$8)",
@@ -189,7 +186,11 @@ async fn create_and_launch_run(
     }
     let orchestration = match orchestration.unwrap_or("deep") {
         "deep" | "plan_execute" | "supervisor" => orchestration.unwrap_or("deep"),
-        _ => return Err(AppError::bad_request("orchestration 必须是 deep、plan_execute 或 supervisor")),
+        _ => {
+            return Err(AppError::bad_request(
+                "orchestration 必须是 deep、plan_execute 或 supervisor",
+            ));
+        }
     };
     policy_with_model["multi_agent"] = json!({"orchestration": orchestration});
     sqlx::query(
@@ -235,7 +236,9 @@ fn normalise_scope(body: &Value, _project_id: &str) -> Result<Value, AppError> {
         })
         .unwrap_or_default();
     if targets.is_empty() {
-        return Err(AppError::bad_request("请提供至少一个目标 URL（targets 数组）"));
+        return Err(AppError::bad_request(
+            "请提供至少一个目标 URL（targets 数组）",
+        ));
     }
     Ok(json!({
         "targets": targets,
@@ -362,15 +365,13 @@ async fn get_report(
         None
     });
     match artifact {
-        Some((artifact_id, object_key, size_bytes, run_id)) => {
-            Ok(Json(ApiResponse::new(json!({
-                "artifact_id": artifact_id,
-                "run_id": run_id,
-                "object_key": object_key,
-                "size_bytes": size_bytes,
-                "format": "markdown"
-            }))))
-        }
+        Some((artifact_id, object_key, size_bytes, run_id)) => Ok(Json(ApiResponse::new(json!({
+            "artifact_id": artifact_id,
+            "run_id": run_id,
+            "object_key": object_key,
+            "size_bytes": size_bytes,
+            "format": "markdown"
+        })))),
         None => {
             // Generate a report on the fly
             match crate::report::generate_run_report(&s.pool, &id, None).await {
@@ -382,7 +383,9 @@ async fn get_report(
                     "format": "markdown",
                     "generated": true
                 })))),
-                Err(_) => Err(AppError::not_found("该运行尚未产生报告，请等待任务完成后自动生成"))
+                Err(_) => Err(AppError::not_found(
+                    "该运行尚未产生报告，请等待任务完成后自动生成",
+                )),
             }
         }
     }
@@ -396,7 +399,11 @@ async fn cancel_turn(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     crate::security::ensure_turn_access(&s.pool, &turn_id, &user).await?;
-    let mut tx = s.pool.begin().await.map_err(|e| AppError::internal(e.to_string()))?;
+    let mut tx = s
+        .pool
+        .begin()
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let (session_id, run_id): (String, Option<String>) = sqlx::query_as(
         "SELECT t.session_id,COALESCE(t.run_id,s.active_run_id)
          FROM pent_conversation_turns t
@@ -432,9 +439,13 @@ async fn cancel_turn(
     }
     sqlx::query("UPDATE pent_agent_sessions SET status='ready',active_run_id=NULL,updated_at=now() WHERE id=$1")
         .bind(&session_id).execute(&mut *tx).await.map_err(|e| AppError::internal(e.to_string()))?;
-    tx.commit().await.map_err(|e| AppError::internal(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let execution_aborted = s.conversation_tasks.abort(&turn_id);
-    Ok(Json(ApiResponse::new(json!({"turn_id":turn_id,"status":"cancelled","execution_aborted":execution_aborted}))))
+    Ok(Json(ApiResponse::new(
+        json!({"turn_id":turn_id,"status":"cancelled","execution_aborted":execution_aborted}),
+    )))
 }
 
 async fn stream_turn(
@@ -451,20 +462,4 @@ async fn stream_turn(
 > {
     crate::security::ensure_turn_access(&s.pool, &turn_id, &user).await?;
     Ok(turn_sse(s.pool.clone(), turn_id))
-}
-
-#[derive(serde::Serialize)]
-struct ApiResponse<T: serde::Serialize> {
-    code: i32,
-    data: T,
-    message: String,
-}
-impl<T: serde::Serialize> ApiResponse<T> {
-    fn new(data: T) -> Self {
-        Self {
-            code: 0,
-            data,
-            message: "ok".into(),
-        }
-    }
 }

@@ -30,19 +30,21 @@ crates/
     media-api|server       # 素材上传与媒体能力
     pent-api               # Pent 契约：模型、事件、工具注册表、认知
     pent-core              # Pent 领域：工具归一化、路由、认知图、规划
-    pent-server            # Pent 服务：会话、工具执行、MCP、流量落库、报告
+    pent-runtime           # AgentRunner、调度、Context/Observation 生命周期
+    pent-tooling           # Tool catalog/dispatcher/backend 与 MCP 实现
+    pent-server            # HTTP、PostgreSQL、NATS、模型及执行后端适配器
     mitm-proxy             # 进程内 MITM 代理：CA、TLS 终止、HTTP 转发、流量捕获
     scan-api|server        # 扫描器、扫描任务、资产发现与归一化
 services/
   gateway/                 # 统一入口（8080），组合各模块路由与横切中间件
-  pent-agent/              # 独立安全自动化微服务（8081）：Agent 运行时、工具执行、MITM
+  pent-agent/              # 执行进程（8081 仅健康检查）：Agent、MCP、Tool/Sandbox、MITM
   scan-agent/              # 扫描执行节点
 apps/web/                  # Vben Admin 前端 monorepo
 sql/postgresql/            # 0001_initial.sql 全量初始化快照
 script/                    # docker-compose、数据库导出/备份/迁移测试
 ```
 
-依赖方向：`gateway -> module-server -> module-api`，`framework/*` 不依赖业务模块。`pent-server` 依赖 `mitm-proxy`（实现流量落库并内嵌启动代理）。
+Pent 依赖方向：`pent-server -> pent-runtime|pent-tooling|pent-core -> pent-api`；`pent-runtime` 与 `pent-tooling` 不依赖 `pent-server`，`pent-core` 不依赖异步运行时或文件系统。`gateway` 只组合 HTTP API，不启动 Agent worker 或安全工具。
 
 ## 4. 业务域
 
@@ -64,11 +66,13 @@ pent_tool_definitions 表（初始化快照）
   -> 模型工具清单（动态披露 + 常驻证据/流量工具）
   -> 对话模式：http_request/http_probe/dns_lookup 等原生 handler 或 MCP
   -> Run 模式：tool_registry::prepare_tool 按 YAML 配方渲染命令
-  -> 白名单 + Scope 校验 + 网络策略 + prlimit + cgroup v2 资源限额
+  -> 白名单 + Scope 校验
+  -> bubblewrap（最小只读根、workspace/artifact 挂载、PID/user/IPC/UTS namespace、capdrop、seccomp）
+  -> prlimit + cgroup v2 资源限额
   -> execute_tool（经 ElasticExecutor：并发限制 + 熔断 + 取消）
 ```
 
-安全边界：无 shell（execve 数组）、`program` 前缀白名单、目标 Scope 校验、保留地址/换行/`-` 注入拦截、输出字节上限。
+安全边界：无 shell（execve 数组）、`program` 前缀白名单、目标 Scope 校验、最小 mount namespace、capabilities 全量清空、seccomp-bpf、输出字节上限。工具复用宿主机网络栈，不启用 network namespace；网络策略是应用层目标校验，不是内核级内网隔离。
 
 ### 5.2 工具通道
 
@@ -77,7 +81,7 @@ pent_tool_definitions 表（初始化快照）
 | 纯 CLI 工具 | YAML 配方（`tools/recipes.yaml`）驱动 `prepare_tool` |
 | 有状态/外部服务 | 真实 MCP（stdio / HTTP / SSE） |
 | 低延迟确定性逻辑 | builtin Rust handler（js_analyze、knowledge_search、证据/流量检索） |
-| 内部工具 | 内部 MCP server `kairos-local`（进程内、协议形状） |
+| 平台内联工具 | `pent-runtime` 的 `InlineToolExecutor` 契约与 `pent-server` 基础设施适配器 |
 
 ### 5.3 MITM 流量抓取
 
@@ -114,7 +118,7 @@ pent_tool_definitions 表（初始化快照）
 | 服务 | 端口 | 职责 |
 | --- | --- | --- |
 | gateway | 8080 | 统一路由、鉴权、限流、审计，组合各模块 |
-| pent-agent | 8081 | Agent 运行时、工具执行、MCP、MITM 代理 |
+| pent-agent | 8081（仅健康检查） | Agent worker、工具/Sandbox、MCP、MITM 代理与 Evidence 产出 |
 | scan-agent | — | 扫描执行节点 |
 | mitm-proxy | 8085（内嵌） | 流量抓取代理 |
 

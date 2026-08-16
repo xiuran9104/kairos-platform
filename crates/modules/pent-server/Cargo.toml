@@ -39,3 +39,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
 uuid.workspace = true
 md-5 = "0.10"
+libc = "0.2"

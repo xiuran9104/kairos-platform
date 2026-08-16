@@ -1,10 +1,16 @@
 //! Tool contracts and MCP protocol types shared by runtime adapters.
 //!
-//! Tool implementations, transports and process execution intentionally live
-//! outside this crate.
+//! Reusable tool implementations and transports live here; deployment-specific
+//! persistence and process sandbox backends remain in server adapters.
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
+pub mod catalog;
+pub mod dispatcher;
+pub mod execution_policy;
+pub mod executor;
+pub mod manifest;
 pub mod mcp;
 pub mod ports;
 

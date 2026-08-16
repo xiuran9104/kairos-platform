@@ -1,20 +1,14 @@
 //! DesRed-compatible YAML recipes for host tools.
 //!
-//! A recipe only describes an already allow-listed host tool.  It never grants
-//! arbitrary command execution: the existing lifecycle registry and process
-//! sandbox remain the sole execution authority.
+//! This module parses and projects recipes without granting execution authority.
+//! Infrastructure adapters must enforce their own lifecycle and sandbox policy.
 
 use std::{collections::HashMap, fs, path::Path};
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::infrastructure::{
-    process::{NetworkPolicy, ToolExecutionLimits, execute_tool},
-    tool_lifecycle,
-};
-
-use super::protocol::{CallToolResult, ContentBlock, ToolDef};
+use super::protocol::ToolDef;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolRecipe {
@@ -86,14 +80,19 @@ impl ToolRecipe {
                 }
                 Value::Object(schema)
             }),
+            annotations: None,
         }
     }
 
-    fn arguments(&self, arguments: &Value) -> Result<Vec<String>, String> {
+    pub fn arguments(&self, arguments: &Value) -> Result<Vec<String>, String> {
         let values = arguments
             .as_object()
             .ok_or_else(|| "MCP 工具参数必须是 JSON 对象".to_string())?;
-        for parameter in self.parameters.iter().filter(|parameter| parameter.required) {
+        for parameter in self
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.required)
+        {
             if !values.contains_key(&parameter.name) {
                 return Err(format!("缺少必填参数: {}", parameter.name));
             }
@@ -145,7 +144,10 @@ pub fn load_dir(directory: impl AsRef<Path>) -> Result<HashMap<String, ToolRecip
     for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        if !matches!(path.extension().and_then(|value| value.to_str()), Some("yaml" | "yml")) {
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("yaml" | "yml")
+        ) {
             continue;
         }
         let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
@@ -153,12 +155,6 @@ pub fn load_dir(directory: impl AsRef<Path>) -> Result<HashMap<String, ToolRecip
             .map_err(|error| format!("{}: {error}", path.display()))?;
         if recipe.name.trim().is_empty() {
             return Err(format!("{}: 工具 name 不能为空", path.display()));
-        }
-        if tool_lifecycle::find(&recipe.name).is_none() {
-            return Err(format!(
-                "{}: 工具 '{}' 未加入 Pent 生命周期白名单",
-                path.display(), recipe.name
-            ));
         }
         if recipes.insert(recipe.name.clone(), recipe).is_some() {
             return Err(format!("重复的工具配方: {}", path.display()));
@@ -169,46 +165,6 @@ pub fn load_dir(directory: impl AsRef<Path>) -> Result<HashMap<String, ToolRecip
 
 pub fn configured_dir() -> String {
     std::env::var("PENTA_TOOLS_DIR").unwrap_or_else(|_| "tools".into())
-}
-
-pub async fn execute(
-    recipe: &ToolRecipe,
-    arguments: Value,
-    network_policy: NetworkPolicy,
-) -> CallToolResult {
-    let arguments = match recipe.arguments(&arguments) {
-        Ok(arguments) => arguments,
-        Err(error) => return error_result(error),
-    };
-    let limits = ToolExecutionLimits {
-        network_access: network_policy,
-        ..Default::default()
-    };
-    match execute_tool(&recipe.name, &arguments, &limits).await {
-        Ok(output) => CallToolResult {
-            content: vec![ContentBlock::Text {
-                text: json!({
-                    "exit_code": output.exit_code,
-                    "stdout": output.stdout,
-                    "stderr": output.stderr,
-                    "duration_ms": output.duration_ms,
-                    "audit": output.audit,
-                })
-                .to_string(),
-            }],
-            is_error: output.exit_code != 0,
-        },
-        Err(error) => error_result(error),
-    }
-}
-
-fn error_result(error: String) -> CallToolResult {
-    CallToolResult {
-        content: vec![ContentBlock::Text {
-            text: json!({"error": error}).to_string(),
-        }],
-        is_error: true,
-    }
 }
 
 #[cfg(test)]
@@ -230,6 +186,9 @@ parameters:
         )
         .unwrap();
         assert_eq!(recipe.definition().input_schema["required"][0], "target");
-        assert_eq!(recipe.arguments(&json!({"target":"127.0.0.1"})).unwrap(), ["-sV", "127.0.0.1"]);
+        assert_eq!(
+            recipe.arguments(&json!({"target":"127.0.0.1"})).unwrap(),
+            ["-sV", "127.0.0.1"]
+        );
     }
 }

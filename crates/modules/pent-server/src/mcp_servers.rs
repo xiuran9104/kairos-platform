@@ -9,9 +9,83 @@ use axum::{
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
 use serde_json::{Value, json};
+use tracing::warn;
 
-use crate::tooling::mcp::protocol::McpServerConfig;
 use crate::{ApiResponse, PentState, security};
+use kairos_platform_pent_tooling::mcp::McpServerConfig;
+
+/// PostgreSQL-backed deployment adapter for persisted MCP server configuration.
+#[derive(Clone)]
+pub struct PgMcpServerConfigSource {
+    pool: kairos_platform_framework_database::PgPool,
+}
+
+impl PgMcpServerConfigSource {
+    pub fn new(pool: kairos_platform_framework_database::PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn load(&self) -> anyhow::Result<Vec<McpServerConfig>> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                serde_json::Value,
+                serde_json::Value,
+                Option<String>,
+                serde_json::Value,
+                i32,
+            ),
+        >(
+            "SELECT id, transport, command, args, env, url, headers, timeout_secs
+             FROM pent_mcp_servers WHERE enabled",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, transport, command, args, env, url, headers, timeout_secs)| McpServerConfig {
+                    id,
+                    command: if transport == "stdio" {
+                        command.unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                    args: serde_json::from_value(args).unwrap_or_default(),
+                    env: serde_json::from_value(env).unwrap_or_default(),
+                    auto_start: true,
+                    url: matches!(transport.as_str(), "http" | "sse")
+                        .then_some(url)
+                        .flatten(),
+                    headers: serde_json::from_value(headers).unwrap_or_default(),
+                    timeout_secs: u64::try_from(timeout_secs).unwrap_or(120).max(1),
+                    max_concurrency: 4,
+                },
+            )
+            .collect())
+    }
+
+    /// Apply the current database snapshot to a live registry.
+    pub async fn load_into(
+        &self,
+        registry: &kairos_platform_pent_tooling::mcp::McpRegistry,
+    ) -> anyhow::Result<usize> {
+        let configs = self.load().await?;
+        let mut connected = 0;
+        for config in configs {
+            let server_id = config.id.clone();
+            match registry.add_server(config).await {
+                Ok(()) => connected += 1,
+                Err(error) => warn!(%error, %server_id, "failed to start configured MCP server"),
+            }
+        }
+        Ok(connected)
+    }
+}
 
 pub fn routes() -> Router<PentState> {
     Router::new()
@@ -45,7 +119,10 @@ async fn runtime_snapshot(s: &PentState) -> std::collections::HashMap<String, Va
 
 /// Merge DB row with runtime status: connected/error from the registry,
 /// `disconnected` for enabled servers not in the registry, `disabled` otherwise.
-fn with_runtime_status(mut server: Value, snapshot: &std::collections::HashMap<String, Value>) -> Value {
+fn with_runtime_status(
+    mut server: Value,
+    snapshot: &std::collections::HashMap<String, Value>,
+) -> Value {
     let enabled = server
         .get("enabled")
         .and_then(Value::as_bool)
@@ -169,11 +246,7 @@ async fn create_server(
     .bind(body.get("env").cloned().unwrap_or_else(|| json!({})))
     .bind(body.get("url").and_then(Value::as_str))
     .bind(body.get("headers").cloned().unwrap_or_else(|| json!({})))
-    .bind(
-        body.get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-    )
+    .bind(body.get("enabled").and_then(Value::as_bool).unwrap_or(true))
     .bind(
         body.get("timeout_secs")
             .and_then(Value::as_i64)
@@ -319,6 +392,8 @@ async fn start_server(
                 auto_start: true,
                 url: Some(url.to_string()),
                 headers: serde_json::from_value(row["headers"].clone()).unwrap_or_default(),
+                timeout_secs: row["timeout_secs"].as_u64().unwrap_or(60).max(1),
+                max_concurrency: 4,
             }
         }
         _ => {
@@ -335,6 +410,8 @@ async fn start_server(
                 auto_start: true,
                 url: None,
                 headers: Default::default(),
+                timeout_secs: row["timeout_secs"].as_u64().unwrap_or(60).max(1),
+                max_concurrency: 4,
             }
         }
     };

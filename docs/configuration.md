@@ -20,20 +20,23 @@
 | `BOOTSTRAP_ADMIN_USERNAME` | 否 | `admin` | 初始管理员用户名 |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 否 | 无 | 不配置时跳过管理员初始化 |
 | `RUST_LOG` | 否 | 框架默认 | tracing 日志过滤规则 |
+| `PENTA_BWRAP_PATH` | 否 | `/usr/bin/bwrap` | pent-agent 强制使用的 bubblewrap 可执行文件 |
+| `PENTA_SANDBOX_ROOT` | 否 | `/tmp/kairos-pent-sandbox` | run 级 workspace/artifact 宿主机根目录 |
+| `PENTA_SANDBOX_ALLOWED_ROOTS` | 否 | 无 | 额外允许读写挂载到沙箱的绝对目录，逗号分隔 |
 
 ## Pent 本地工具执行
 
-Pent 的主动检测工具统一在网关宿主机本地执行，不再通过 Docker 工具镜像或容器执行器运行。
+Pent 的主动检测工具统一在 pent-agent 宿主机通过 bubblewrap 执行，不使用 Docker/OCI 工具镜像或容器执行器。
 Docker Compose 仍只用于 PostgreSQL、Redis、NATS、MinIO、Neo4j、Graphiti、
 headless Chrome 和 mitmproxy 等本地基础设施。
 
-网关启动时会检查常用宿主机工具，并尝试通过系统包管理器或语言工具链快速安装缺失项。
-自动安装失败不会阻止网关启动，但对应工具调用会不可用。生产环境建议提前安装并锁定版本。
+pent-agent 启动时强制检查 bubblewrap，缺失时拒绝启动；安全工具仍可按现有生命周期策略安装。
+生产环境建议通过 `script/install-pent-tools.sh` 提前安装并锁定版本。
 
 常用宿主机工具：
 
 ```bash
-for tool in nmap nuclei sqlmap ffuf gobuster whatweb nikto subfinder amass wfuzz dirsearch feroxbuster dalfox; do
+for tool in bwrap nmap nuclei sqlmap ffuf gobuster whatweb nikto subfinder amass wfuzz dirsearch feroxbuster dalfox; do
   command -v "$tool" >/dev/null && echo "ok $tool" || echo "missing $tool"
 done
 ```
@@ -41,11 +44,11 @@ done
 核心执行约束：
 
 - 工具命令必须来自 Rust allowlist，不能由模型传入任意程序路径。
-- 命令通过 `/usr/bin/prlimit -- <tool>` 执行，带 CPU、内存、超时和输出截断限制。
-- `TargetOnly` 不再做任务授权范围拦截；只保留目标格式安全检查。
+- bubblewrap 构造最小只读文件系统，仅将 run 级目录读写挂载为 `/workspace`、`/artifacts`。
+- PID/user/IPC/UTS/cgroup namespace、capabilities drop、seccomp-bpf 与 cgroup/prlimit 同时生效。
+- 按当前部署决策不启用 network namespace；工具复用宿主机网络栈，`TargetOnly` 继续做应用层授权范围校验。
 - 仍拒绝空目标、`-` 开头目标、控制字符、link-local、广播和部分基础设施地址。
-- `http_request` 的 Cookie 状态默认保存到 `/tmp/kairos-pent-tool-state/cookies.txt`。
-  可通过 `PENTA_TOOL_STATE_ROOT` 调整状态目录。
+- `http_request` 的 Cookie 状态目录由 `PENTA_TOOL_STATE_ROOT` 管理，并显式挂载为沙箱内 `/state`。
 
 ### MCP 与浏览器工具
 
@@ -62,14 +65,8 @@ MCP registry 不可用时，会 fallback 到 Chrome DevTools HTTP API 打开页�
 curl -fsS -X PUT 'http://127.0.0.1:9222/json/new?http%3A%2F%2F127.0.0.1%3A5666%2F'
 ```
 
-`PENTA_MCP_SERVERS` 可选，用于显式声明外部 MCP Server。未配置时网关会尝试默认的
+`PENTA_MCP_SERVERS` 可选，用于显式声明外部 MCP Server。未配置时 pent-agent 会尝试默认的
 Chrome DevTools MCP；该 MCP 初始化失败不影响 `mcp_navigate_page` 的 HTTP fallback。
-
-Pent 同时提供一个内部 MCP Server（`kairos-local`）。将 YAML 配方置于
-`PENTA_TOOLS_DIR`（默认仓库根目录的 `tools/`）后，模型会动态收到
-`mcp_kairos-local__<工具名>`。配方只描述参数模式和命令模板，不能引入任意程序：
-工具名必须已在 Pent 的 Rust 生命周期白名单中，实际执行仍经过现有的资源限制、
-输出截断与审计。示例见 `tools/nmap.yaml`。
 
 ## 前端环境变量
 

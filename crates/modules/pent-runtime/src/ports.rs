@@ -5,7 +5,9 @@ use kairos_platform_pent_api::{
     AgentTurnRequest, AgentTurnResult, ConversationContext, ConversationIntent, ModelUsage,
 };
 
-pub use kairos_platform_pent_api::ToolExecutionClass;
+pub use kairos_platform_pent_api::{
+    AgentChildBudget, AgentSpawnRequest, RuntimeAgentStatus, RuntimeSubAgent, ToolExecutionClass,
+};
 
 #[derive(Debug, Clone)]
 pub struct ModelTurnOutput {
@@ -204,40 +206,13 @@ pub trait RuntimeEnrichment: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-#[derive(Debug, Clone)]
-pub struct AgentSpawnRequest {
-    pub description: String,
-    pub prompt: String,
-    pub session_id: String,
-    pub parent_run_id: String,
-    pub target: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeAgentStatus {
-    Running,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RuntimeSubAgent {
-    pub agent_id: String,
-    pub description: String,
-    pub status: RuntimeAgentStatus,
-    pub result: Option<String>,
-    pub error: Option<String>,
-    pub started_at: String,
-    pub completed_at: Option<String>,
-}
-
 pub trait AgentSessionFactory: Send + Sync {
     fn create(&self, max_concurrent: usize) -> std::sync::Arc<dyn AgentSession>;
 }
 
 #[async_trait]
 pub trait AgentSession: Send + Sync {
+    async fn recover(&self, parent_run_id: &str) -> anyhow::Result<usize>;
     async fn active_count(&self) -> usize;
     async fn spawn(&self, request: AgentSpawnRequest) -> anyhow::Result<String>;
     async fn status(&self, agent_id: &str) -> Option<RuntimeSubAgent>;
@@ -405,6 +380,9 @@ mod tests {
 
     #[async_trait]
     impl AgentSession for StubAgentSession {
+        async fn recover(&self, _parent_run_id: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
         async fn active_count(&self) -> usize {
             0
         }

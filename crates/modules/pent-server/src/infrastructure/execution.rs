@@ -1,15 +1,20 @@
 //! Elastic tool execution — execution ids, cancellation, concurrency limits,
 //! and per-tool circuit breakers (D-06).
 
-use super::process::{ToolExecutionLimits, ToolOutput, execute_tool_direct};
+use super::process::{NetworkPolicy, ToolExecutionLimits, ToolOutput};
+use super::sandbox::BubblewrapSandboxBackend;
+use kairos_platform_pent_tooling::backend::{
+    ExecutionBackend, ExecutionNetworkPolicy, ExecutionRequest, SandboxSpec,
+};
+pub use kairos_platform_pent_tooling::execution_policy::CircuitBreaker;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Unique identifier for an in-flight tool execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -52,15 +57,15 @@ pub struct ExecutionRegistry {
     executions: Mutex<HashMap<ExecutionId, ExecutionRecord>>,
     next_id: AtomicU64,
     /// Max concurrent executions per tool name.
-    concurrency: HashMap<String, Arc<Semaphore>>,
+    concurrency: Mutex<HashMap<String, Arc<Semaphore>>>,
     default_permit: usize,
+    backend: Arc<dyn ExecutionBackend>,
 }
 
 impl std::fmt::Debug for ExecutionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionRegistry")
             .field("next_id", &self.next_id.load(Ordering::SeqCst))
-            .field("concurrency_tools", &self.concurrency.len())
             .field("default_permit", &self.default_permit)
             .finish_non_exhaustive()
     }
@@ -68,11 +73,16 @@ impl std::fmt::Debug for ExecutionRegistry {
 
 impl ExecutionRegistry {
     pub fn new(default_permit: usize) -> Self {
+        Self::with_backend(default_permit, Arc::new(BubblewrapSandboxBackend))
+    }
+
+    pub fn with_backend(default_permit: usize, backend: Arc<dyn ExecutionBackend>) -> Self {
         Self {
             executions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
-            concurrency: HashMap::new(),
+            concurrency: Mutex::new(HashMap::new()),
             default_permit,
+            backend,
         }
     }
 
@@ -80,21 +90,19 @@ impl ExecutionRegistry {
         ExecutionId(self.next_id.fetch_add(1, Ordering::SeqCst).to_string())
     }
 
-    fn semaphore(&self, tool_name: &str) -> Arc<Semaphore> {
-        self.concurrency
-            .get(tool_name)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(Semaphore::new(self.default_permit)))
+    async fn semaphore(&self, tool_name: &str) -> Arc<Semaphore> {
+        let mut concurrency = self.concurrency.lock().await;
+        concurrency
+            .entry(tool_name.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.default_permit)))
+            .clone()
     }
 
     /// Enqueue or start an execution, returning its id immediately.
-    pub async fn start(
-        self: Arc<Self>,
-        tool_name: String,
-        arguments: Vec<String>,
-        limits: ToolExecutionLimits,
-    ) -> ExecutionId {
+    pub async fn start(self: Arc<Self>, mut request: ExecutionRequest) -> ExecutionId {
         let id = self.next_id();
+        request.execution_id = id.0.clone();
+        let tool_name = request.tool_name.clone();
         let cancel = CancellationToken::new();
         let (tx, rx) = oneshot::channel();
 
@@ -115,24 +123,16 @@ impl ExecutionRegistry {
         let registry = self.clone();
         let run_id = id.clone();
         tokio::spawn(async move {
-            registry
-                .run(tool_name, arguments, limits, cancel, run_id)
-                .await;
+            registry.run(request, cancel, run_id).await;
         });
 
         id
     }
 
-    async fn run(
-        &self,
-        tool_name: String,
-        arguments: Vec<String>,
-        limits: ToolExecutionLimits,
-        cancel: CancellationToken,
-        id: ExecutionId,
-    ) {
+    async fn run(&self, request: ExecutionRequest, cancel: CancellationToken, id: ExecutionId) {
+        let tool_name = request.tool_name.clone();
         // Acquire concurrency permit; block until available.
-        let semaphore = self.semaphore(&tool_name);
+        let semaphore = self.semaphore(&tool_name).await;
         let permit = match semaphore.acquire().await {
             Ok(p) => p,
             Err(error) => {
@@ -147,18 +147,13 @@ impl ExecutionRegistry {
 
         self.set_state(&id, ExecutionState::Running).await;
 
-        let tool_name_for_exec = tool_name.clone();
-        let arguments_for_exec = arguments.clone();
-        let limits_for_exec = limits.clone();
-        let cancel_for_exec = cancel.clone();
-
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 debug!(execution_id = %id.0, tool = %tool_name, "execution cancelled before completion");
                 ExecutionState::Cancelled
             }
-            output = execute_with_cancel(tool_name_for_exec, arguments_for_exec, limits_for_exec, cancel_for_exec) => {
+            output = self.backend.execute(request) => {
                 match output {
                     Ok(tool_output) => ExecutionState::Completed(tool_output),
                     Err(error) => ExecutionState::Failed(error),
@@ -234,105 +229,31 @@ impl ExecutionRegistry {
     }
 }
 
-async fn execute_with_cancel(
-    tool_name: String,
-    arguments: Vec<String>,
-    limits: ToolExecutionLimits,
-    cancel: CancellationToken,
-) -> Result<ToolOutput, String> {
-    // Wrap the synchronous execute_tool in a cancellable task.
-    let handle = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => Err("cancelled".to_string()),
-                result = execute_tool_direct(&tool_name, &arguments, &limits) => result,
-            }
-        })
-    });
-
-    match handle.await {
-        Ok(result) => result,
-        Err(error) => Err(format!("execution task panicked: {error}")),
-    }
-}
-
-/// Per-tool circuit breaker.
-pub struct CircuitBreaker {
-    failures: Mutex<HashMap<String, BreakerState>>,
-    threshold: u32,
-    recovery_secs: u64,
-}
-
-impl std::fmt::Debug for CircuitBreaker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CircuitBreaker")
-            .field("threshold", &self.threshold)
-            .field("recovery_secs", &self.recovery_secs)
-            .finish_non_exhaustive()
-    }
-}
-
-struct BreakerState {
-    failures: u32,
-    open_until: Option<std::time::Instant>,
-}
-
-impl CircuitBreaker {
-    pub fn new(threshold: u32, recovery_secs: u64) -> Self {
-        Self {
-            failures: Mutex::new(HashMap::new()),
-            threshold,
-            recovery_secs,
-        }
-    }
-
-    /// Returns Err if the breaker is open for this tool.
-    pub async fn check(&self, tool_name: &str) -> Result<(), String> {
-        let mut states = self.failures.lock().await;
-        let state = states.entry(tool_name.to_string()).or_insert(BreakerState {
-            failures: 0,
-            open_until: None,
-        });
-
-        if let Some(open_until) = state.open_until {
-            if std::time::Instant::now() < open_until {
-                return Err(format!("tool {tool_name} circuit breaker is open"));
-            }
-            // Recovery window passed — half-close.
-            state.open_until = None;
-            state.failures = 0;
-        }
-        Ok(())
-    }
-
-    /// Record a success, resetting failures.
-    pub async fn record_success(&self, tool_name: &str) {
-        let mut states = self.failures.lock().await;
-        states.insert(
-            tool_name.to_string(),
-            BreakerState {
-                failures: 0,
-                open_until: None,
+fn execution_request(
+    tool_name: &str,
+    arguments: &[String],
+    limits: &ToolExecutionLimits,
+) -> ExecutionRequest {
+    ExecutionRequest {
+        execution_id: String::new(),
+        tool_name: tool_name.to_string(),
+        arguments: arguments.to_vec(),
+        run_id: limits.run_id.clone(),
+        sandbox: SandboxSpec {
+            cpu_cores: limits.cpu_cores,
+            memory_mb: limits.memory_mb,
+            timeout_seconds: limits.timeout_seconds,
+            network_access: match &limits.network_access {
+                NetworkPolicy::None => ExecutionNetworkPolicy::None,
+                NetworkPolicy::TargetOnly(target) => {
+                    ExecutionNetworkPolicy::TargetOnly(target.clone())
+                }
+                NetworkPolicy::Full => ExecutionNetworkPolicy::Full,
             },
-        );
-    }
-
-    /// Record a failure; opens the breaker when threshold is reached.
-    pub async fn record_failure(&self, tool_name: &str) {
-        let mut states = self.failures.lock().await;
-        let state = states.entry(tool_name.to_string()).or_insert(BreakerState {
-            failures: 0,
-            open_until: None,
-        });
-        state.failures += 1;
-        if state.failures >= self.threshold {
-            warn!(tool = %tool_name, threshold = self.threshold, "circuit breaker opened");
-            state.open_until = Some(
-                std::time::Instant::now() + std::time::Duration::from_secs(self.recovery_secs),
-            );
-        }
+            workspace_dir: limits.workspace_dir.clone(),
+            artifact_dir: limits.artifact_dir.clone(),
+            allowed_paths: limits.allowed_paths.clone(),
+        },
     }
 }
 
@@ -349,9 +270,26 @@ pub struct ElasticExecutor {
 
 impl ElasticExecutor {
     pub fn new(default_permit: usize, breaker_threshold: u32, breaker_recovery_secs: u64) -> Self {
+        Self::with_backend(
+            default_permit,
+            breaker_threshold,
+            breaker_recovery_secs,
+            Arc::new(BubblewrapSandboxBackend),
+        )
+    }
+
+    pub fn with_backend(
+        default_permit: usize,
+        breaker_threshold: u32,
+        breaker_recovery_secs: u64,
+        backend: Arc<dyn ExecutionBackend>,
+    ) -> Self {
         Self {
-            registry: Arc::new(ExecutionRegistry::new(default_permit)),
-            breaker: Arc::new(CircuitBreaker::new(breaker_threshold, breaker_recovery_secs)),
+            registry: Arc::new(ExecutionRegistry::with_backend(default_permit, backend)),
+            breaker: Arc::new(CircuitBreaker::new(
+                breaker_threshold,
+                breaker_recovery_secs,
+            )),
         }
     }
 
@@ -400,9 +338,8 @@ impl ElasticExecutor {
         limits: &ToolExecutionLimits,
     ) -> Result<ExecutionId, String> {
         self.breaker.check(tool_name).await?;
-        Ok(Arc::clone(&self.registry)
-            .start(tool_name.to_string(), arguments.to_vec(), limits.clone())
-            .await)
+        let request = execution_request(tool_name, arguments, limits);
+        Ok(Arc::clone(&self.registry).start(request).await)
     }
 
     /// Wait for a previously started execution and record breaker state.
@@ -449,6 +386,64 @@ pub fn global_executor() -> Option<Arc<ElasticExecutor>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use kairos_platform_pent_tooling::backend::{ExecutionAudit, ExecutionOutput};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    struct FakeBackend;
+
+    #[async_trait]
+    impl ExecutionBackend for FakeBackend {
+        async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput, String> {
+            Ok(success_output(&request.tool_name, "fake"))
+        }
+    }
+
+    struct PendingBackend;
+
+    #[async_trait]
+    impl ExecutionBackend for PendingBackend {
+        async fn execute(&self, _request: ExecutionRequest) -> Result<ExecutionOutput, String> {
+            std::future::pending().await
+        }
+    }
+
+    struct GateBackend {
+        entered: Arc<AtomicUsize>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for GateBackend {
+        async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput, String> {
+            self.entered.fetch_add(1, AtomicOrdering::SeqCst);
+            let _permit = self.release.acquire().await.map_err(|e| e.to_string())?;
+            Ok(success_output(&request.tool_name, "gate"))
+        }
+    }
+
+    fn success_output(tool_name: &str, backend: &str) -> ExecutionOutput {
+        ExecutionOutput {
+            exit_code: 0,
+            stdout: tool_name.to_string(),
+            stderr: String::new(),
+            duration_ms: 1,
+            audit: ExecutionAudit {
+                backend: backend.to_string(),
+                network_policy: "none".into(),
+                cpu_cores: 0.5,
+                memory_mb: 256,
+                timeout_seconds: 5,
+                workspace_dir: None,
+                artifact_dir: None,
+                mount_namespace: false,
+                pid_namespace: false,
+                user_namespace: false,
+                capabilities_dropped: false,
+                seccomp: false,
+            },
+        }
+    }
 
     #[test]
     fn execution_id_is_unique() {
@@ -501,5 +496,65 @@ mod tests {
         assert!(outcome.is_ok() || outcome.is_err());
         // The execution is removed from the registry after collect.
         assert!(executor.registry().state(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn injected_backend_drives_elastic_execution() {
+        let executor = ElasticExecutor::with_backend(2, 5, 60, Arc::new(FakeBackend));
+        let output = executor
+            .execute("fake_tool", &[], &ToolExecutionLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(output.stdout, "fake_tool");
+        assert_eq!(output.audit.backend, "fake");
+    }
+
+    #[tokio::test]
+    async fn cancellation_propagates_around_backend_future() {
+        let executor = ElasticExecutor::with_backend(1, 5, 60, Arc::new(PendingBackend));
+        let id = executor
+            .start("pending", &[], &ToolExecutionLimits::default())
+            .await
+            .unwrap();
+        assert!(executor.registry().cancel(&id).await);
+        assert_eq!(
+            executor.collect(&id).await.unwrap_err(),
+            "execution cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_tool_uses_one_shared_concurrency_semaphore() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let backend = GateBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let executor = ElasticExecutor::with_backend(1, 5, 60, Arc::new(backend));
+        let first = executor
+            .start("serialized", &[], &ToolExecutionLimits::default())
+            .await
+            .unwrap();
+        let second = executor
+            .start("serialized", &[], &ToolExecutionLimits::default())
+            .await
+            .unwrap();
+
+        while entered.load(AtomicOrdering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(entered.load(AtomicOrdering::SeqCst), 1);
+
+        release.add_permits(1);
+        while entered.load(AtomicOrdering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        release.add_permits(1);
+        assert!(executor.collect(&first).await.is_ok());
+        assert!(executor.collect(&second).await.is_ok());
     }
 }

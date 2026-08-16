@@ -377,10 +377,7 @@ impl HttpSseTransport {
 
     async fn handle_sse_event(&self, data: String) {
         // First event is usually the endpoint URL.
-        if data.starts_with("http://")
-            || data.starts_with("https://")
-            || data.starts_with('/')
-        {
+        if data.starts_with("http://") || data.starts_with("https://") || data.starts_with('/') {
             let url = if data.starts_with('/') {
                 // Resolve relative path against SSE base URL.
                 match resolve_relative_url(&self.sse_url, &data) {
@@ -549,6 +546,8 @@ mod tests {
             auto_start: true,
             url: None,
             headers: HashMap::new(),
+            timeout_secs: 120,
+            max_concurrency: 4,
         };
         assert!(!stdio.is_http());
 
@@ -560,6 +559,8 @@ mod tests {
             auto_start: true,
             url: Some("http://127.0.0.1:3000/sse".into()),
             headers: HashMap::new(),
+            timeout_secs: 120,
+            max_concurrency: 4,
         };
         assert!(http.is_http());
     }
@@ -575,8 +576,7 @@ mod tests {
             "http://127.0.0.1:3000/mcp/message"
         );
         assert_eq!(
-            resolve_relative_url("http://127.0.0.1:3000/sse", "http://other/message")
-                .unwrap(),
+            resolve_relative_url("http://127.0.0.1:3000/sse", "http://other/message").unwrap(),
             "http://other/message"
         );
     }

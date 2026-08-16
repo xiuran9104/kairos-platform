@@ -101,6 +101,24 @@ pub struct ToolDef {
     #[serde(default)]
     pub description: String,
     pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+}
+
+/// Optional behavioral hints advertised by an MCP tool.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
 }
 
 // ── Tool invocation ─────────────────────────────────────────────────────
@@ -142,7 +160,7 @@ pub enum ContentBlock {
     },
 }
 
-// ── Server config (from env) ────────────────────────────────────────────
+// ── Server config ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
@@ -162,6 +180,18 @@ pub struct McpServerConfig {
     /// Extra HTTP headers for HTTP/SSE transport (e.g., authorization).
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+}
+
+fn default_timeout_secs() -> u64 {
+    120
+}
+
+fn default_max_concurrency() -> usize {
+    4
 }
 
 impl McpServerConfig {
@@ -201,10 +231,15 @@ mod tests {
             name: "inspect".into(),
             description: "Inspect a target".into(),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: Some(ToolAnnotations {
+                read_only_hint: Some(true),
+                ..Default::default()
+            }),
         };
 
         let value = serde_json::to_value(tool).unwrap();
         assert_eq!(value["inputSchema"]["type"], "object");
         assert!(value.get("input_schema").is_none());
+        assert_eq!(value["annotations"]["readOnlyHint"], true);
     }
 }

@@ -1,12 +1,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kairos_platform_pent_runtime::ports::{
+use crate::ports::{
     ConversationToolExecutor, InlineToolExecutor, ModelToolCall, RuntimeToolCall,
     RuntimeToolResult, ToolExecutionContext,
 };
-use kairos_platform_pent_runtime::tool_dispatch::{ToolDispatchPlan, ToolExecutionClass};
-use kairos_platform_pent_runtime::tool_result::{NormalizedToolResult, normalize_tool_result};
+use crate::tool_dispatch::{ToolDispatchPlan, ToolExecutionClass};
+use crate::tool_result::{NormalizedToolResult, normalize_tool_result};
 use tokio::sync::Semaphore;
 
 pub struct CoordinatedToolResult {
@@ -207,7 +207,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use kairos_platform_pent_runtime::tool_dispatch::ToolDispatchDecision;
+    use crate::tool_dispatch::ToolDispatchDecision;
 
     struct NoInline;
 
