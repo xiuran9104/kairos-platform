@@ -202,6 +202,8 @@ impl ConversationModelGateway for AiModelGateway {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let sub_agent = context.policy_snapshot.get("_agent_role").and_then(Value::as_str) == Some("sub");
+            let multi_agent_enabled =
+                super::agent_pipeline::multi_agent_enabled(&context.policy_snapshot);
             tools
                     .into_iter()
                     .filter(|t| {
@@ -209,8 +211,15 @@ impl ConversationModelGateway for AiModelGateway {
                             .pointer("/function/name")
                             .and_then(Value::as_str)
                             .unwrap_or("");
+                        let agent_tool = matches!(
+                            name,
+                            "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
+                        );
                         !exhausted.contains(name)
-                            && !(sub_agent && matches!(name, "agent_spawn" | "plan_create" | "plan_get" | "plan_update"))
+                            && (multi_agent_enabled || !agent_tool)
+                            && !(sub_agent
+                                && (agent_tool
+                                    || matches!(name, "plan_create" | "plan_get" | "plan_update")))
                     })
                     .collect()
         };
@@ -235,6 +244,52 @@ impl ConversationModelGateway for AiModelGateway {
             sanitize_tool_message_groups(&mut api_messages);
         }
         trim_api_messages_preserving_tool_groups(&mut api_messages, context_token_budget);
+        let tool_names = tools
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let system_prompt = api_messages
+            .first()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let record_model_prompts = context
+            .policy_snapshot
+            .pointer("/multi_agent/platform_settings/audit/record_model_prompts")
+            .or_else(|| {
+                context
+                    .policy_snapshot
+                    .pointer("/platform_settings/audit/record_model_prompts")
+            })
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || std::env::var("PENTA_LOG_MODEL_REQUESTS").as_deref() == Ok("true");
+        tracing::info!(
+            model_id,
+            session_id = %context.session_id,
+            run_id = ?context.run_id,
+            system_prompt_chars = system_prompt.chars().count(),
+            tool_count = tool_names.len(),
+            bound_role = ?context.policy_snapshot.pointer("/_role/name").and_then(|value| value.as_str()),
+            skills_available = tool_names.contains(&"skill_load"),
+            agent_tools_available = tool_names.contains(&"agent_spawn"),
+            mcp_tool_count = tool_names.iter().filter(|name| name.starts_with("mcp_")).count(),
+            message_count = api_messages.len(),
+            "assembled conversation model request"
+        );
+        if record_model_prompts {
+            tracing::debug!(
+                model_id,
+                session_id = %context.session_id,
+                run_id = ?context.run_id,
+                system_prompt = %crate::infrastructure::secrets::redact_sensitive(system_prompt),
+                available_tools = ?tool_names,
+                message_count = api_messages.len(),
+                "assembled conversation model request"
+            );
+        } else {
+            tracing::debug!(available_tools = ?tool_names, "conversation tools disclosed to model");
+        }
         let response = self
             .factory
             .chat_tools(model_id, api_messages, tools, temperature, Some(max_tokens))

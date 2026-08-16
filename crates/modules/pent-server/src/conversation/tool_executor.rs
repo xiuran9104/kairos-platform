@@ -48,6 +48,7 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "evidence_list"
             | "evidence_search"
             | "evidence_view"
+            | "record_finding"
             | "traffic_list"
             | "traffic_view"
             | "traffic_diff"
@@ -208,9 +209,7 @@ pub async fn execute_tool(
         "web_search" => execute_builtin_local("web_search", arguments).await,
 
         // ── MCP tools (dynamic) ────────────────────────────────────
-        name if name.starts_with("mcp_") => {
-            execute_mcp_tool(name, arguments).await
-        }
+        name if name.starts_with("mcp_") => execute_mcp_tool(name, arguments).await,
 
         // ── Fallback ────────────────────────────────────────────
         other => {
@@ -299,29 +298,13 @@ async fn execute_builtin_local(name: &str, arguments: &str) -> ConversationToolR
 
 // ── MCP tool dispatch ──────────────────────────────────────────────────
 
-static MCP_REGISTRY: std::sync::OnceLock<
-    std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>,
-> = std::sync::OnceLock::new();
-
-async fn get_mcp_registry() -> Option<
-    std::sync::Arc<crate::tooling::mcp::registry::McpRegistry>,
-> {
-    let registry = MCP_REGISTRY.get_or_init(|| {
-        let registry =
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(crate::tooling::mcp::registry::McpRegistry::init())
-            });
-        std::sync::Arc::new(registry)
-    });
-    if tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(async { registry.server_count().await })
-    }) > 0
-    {
-        Some(registry.clone())
-    } else {
-        None
+fn parse_mcp_tool_name(name: &str) -> (Option<&str>, &str) {
+    let qualified = name.strip_prefix("mcp_").unwrap_or(name);
+    match qualified.split_once("__") {
+        Some((server_id, tool_name)) if !server_id.is_empty() && !tool_name.is_empty() => {
+            (Some(server_id), tool_name)
+        }
+        _ => (None, qualified),
     }
 }
 
@@ -331,26 +314,31 @@ async fn execute_mcp_tool(name: &str, arguments: &str) -> ConversationToolResult
         Err(e) => return tool_error(name, format!("参数解析失败: {e}")),
     };
 
-    let registry = match get_mcp_registry().await {
-        Some(r) => r,
-        None => {
-            return ConversationToolResult {
-                tool_call_id: String::new(),
-                tool_name: name.into(),
-                content: serde_json::json!({
-                    "error": "MCP 服务未配置或未启动",
-                    "hint": "检查 PENTA_MCP_SERVERS 环境变量"
-                })
-                .to_string(),
-                success: false,
-            };
-        }
-    };
+    // Tool disclosure, capability-center lifecycle operations and execution
+    // must all observe the same process-wide registry. Database-configured
+    // servers are attached to this registry by the gateway at startup.
+    let registry = crate::tooling::mcp::registry::shared().await;
+    if registry.server_count().await == 0 {
+        return ConversationToolResult {
+            tool_call_id: String::new(),
+            tool_name: name.into(),
+            content: serde_json::json!({
+                "error": "MCP 服务未配置或未启动",
+                "hint": "检查能力中心 MCP 配置或 PENTA_MCP_SERVERS"
+            })
+            .to_string(),
+            success: false,
+        };
+    }
 
-    // Find the server that has this tool
+    // Catalog names are server-qualified (`mcp_{server_id}__{tool_name}`) so
+    // tools with the same name on different providers remain unambiguous.
     let all_tools = registry.all_tools().await;
-    let mcp_tool_name = name.strip_prefix("mcp_").unwrap_or(name);
-    let server_id = match all_tools.iter().find(|(_, t)| t.name == mcp_tool_name) {
+    let (qualified_server, mcp_tool_name) = parse_mcp_tool_name(name);
+    let server_id = match all_tools.iter().find(|(server_id, tool)| {
+        tool.name == mcp_tool_name
+            && qualified_server.is_none_or(|requested| requested == server_id)
+    }) {
         Some((sid, _)) => sid.clone(),
         None => {
             return tool_error(
@@ -369,14 +357,12 @@ async fn execute_mcp_tool(name: &str, arguments: &str) -> ConversationToolResult
                     crate::tooling::mcp::protocol::ContentBlock::Text { text } => {
                         Some(text.clone())
                     }
-                    crate::tooling::mcp::protocol::ContentBlock::Image {
-                        mime_type,
-                        ..
-                    } => Some(format!("[image: {mime_type}]")),
-                    crate::tooling::mcp::protocol::ContentBlock::Resource {
-                        uri,
-                        ..
-                    } => Some(format!("[resource: {uri}]")),
+                    crate::tooling::mcp::protocol::ContentBlock::Image { mime_type, .. } => {
+                        Some(format!("[image: {mime_type}]"))
+                    }
+                    crate::tooling::mcp::protocol::ContentBlock::Resource { uri, .. } => {
+                        Some(format!("[resource: {uri}]"))
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -394,6 +380,20 @@ async fn execute_mcp_tool(name: &str, arguments: &str) -> ConversationToolResult
             }
         }
         Err(error) => tool_error(name, format!("MCP 调用失败: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::parse_mcp_tool_name;
+
+    #[test]
+    fn parses_server_qualified_mcp_tool_name() {
+        assert_eq!(
+            parse_mcp_tool_name("mcp_browser__navigate_page"),
+            (Some("browser"), "navigate_page")
+        );
+        assert_eq!(parse_mcp_tool_name("mcp_search"), (None, "search"));
     }
 }
 
@@ -1273,8 +1273,7 @@ pub async fn execute_tools_parallel(
             let sid = session_id.to_string();
             let rid = run_id.map(str::to_string);
             tokio::spawn(async move {
-                let result =
-                    execute_tool(&n, &a, &scope, &sid, rid.as_deref()).await;
+                let result = execute_tool(&n, &a, &scope, &sid, rid.as_deref()).await;
                 (idx, cid, result)
             })
         })

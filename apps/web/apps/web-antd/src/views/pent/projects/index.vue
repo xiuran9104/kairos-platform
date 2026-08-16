@@ -217,12 +217,12 @@ onMounted(fetchProjects);
 </script>
 
 <template>
-  <div style="padding: 24px; min-height: 100vh">
-    <div style="display: flex; gap: 16px; align-items: stretch">
+  <div style="padding: 24px; height: calc(100vh - 90px); min-height: 480px">
+    <div style="display: flex; gap: 16px; align-items: stretch; height: 100%">
       <!-- 左侧项目列表 -->
       <a-card
         size="small"
-        style="width: 280px; flex-shrink: 0; height: 100%; display: flex; flex-direction: column"
+        style="width: 280px; flex-shrink: 0; display: flex; flex-direction: column"
         :body-style="{ padding: '12px', flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }"
       >
         <div style="display: flex; gap: 8px; margin-bottom: 12px">
@@ -289,7 +289,7 @@ onMounted(fetchProjects);
       </a-card>
 
       <!-- 右侧详情区 -->
-      <div style="flex: 1; min-width: 0">
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column">
         <template v-if="current">
           <a-page-header :title="current.name">
             <template #tags>
@@ -328,8 +328,8 @@ onMounted(fetchProjects);
             </div>
           </a-page-header>
 
-          <a-card size="small" style="margin-top: 16px">
-            <a-tabs v-model:activeKey="activeTab">
+          <a-card size="small" style="margin-top: 16px; flex: 1; display: flex; flex-direction: column">
+            <a-tabs v-model:activeKey="activeTab" style="flex: 1">
               <a-tab-pane key="facts" tab="事实黑板">
                 <FactsBoard :project-id="current.id" />
               </a-tab-pane>

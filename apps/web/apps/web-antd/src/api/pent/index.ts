@@ -171,6 +171,9 @@ export function deletePentSession(id: string) {
 export function createPentSession(data: CreatePentSessionInput) {
   return requestClient.post<PentAgentSession>('/pent/sessions', data);
 }
+export function updatePentSession(id: string, data: Record<string, any>) {
+  return requestClient.put<PentAgentSession>(`/pent/sessions/${id}`, data);
+}
 export function getPentSessionMessages(id: string) {
   return requestClient.get<PentConversationMessage[]>(`/pent/sessions/${id}/messages`);
 }

@@ -14,6 +14,14 @@ pub enum OrchestrationMode {
     Supervisor,
 }
 
+pub fn multi_agent_enabled(policy: &Value) -> bool {
+    policy
+        .pointer("/multi_agent/multi_agent_enabled")
+        .or_else(|| policy.get("multi_agent_enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
 impl OrchestrationMode {
     pub fn from_policy(policy: &Value) -> Self {
         match policy
@@ -180,5 +188,16 @@ mod tests {
         assert!(!is_transient_model_error(&anyhow::anyhow!(
             "HTTP 401 invalid api key"
         )));
+    }
+
+    #[test]
+    fn honors_multi_agent_enabled_policy() {
+        assert!(!multi_agent_enabled(&serde_json::json!({
+            "multi_agent": {"multi_agent_enabled": false}
+        })));
+        assert!(multi_agent_enabled(&serde_json::json!({
+            "multi_agent": {"multi_agent_enabled": true}
+        })));
+        assert!(multi_agent_enabled(&serde_json::json!({})));
     }
 }

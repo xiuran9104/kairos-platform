@@ -19,7 +19,7 @@ pub(crate) fn routes() -> Router<PentState> {
         .route("/pent/sessions", get(list_sessions).post(create_session))
         .route(
             "/pent/sessions/{id}",
-            get(get_session).delete(delete_session),
+            get(get_session).put(update_session).delete(delete_session),
         )
         .route("/pent/sessions/{id}/model", axum::routing::put(update_session_model))
         .route(
@@ -94,6 +94,124 @@ async fn get_session(
     .map_err(internal)?
     .ok_or_else(|| AppError::not_found("Agent Session 不存在"))?;
     Ok(Json(ApiResponse::new(session)))
+}
+
+async fn update_session(
+    State(state): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    security::ensure_session_access(&state.pool, &id, &user).await?;
+
+    let objective = body
+        .get("objective")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let project_id = body
+        .get("project_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let targets: Vec<String> = body
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|t| t.as_str().map(str::trim).map(str::to_owned))
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 目标范围与项目权威来源同步（与 create_session 同口径）
+    let (final_targets, project_id) = if let Some(project_id) = project_id {
+        let scope = sqlx::query_scalar::<_, Value>(
+            "SELECT asset_scope FROM pent_projects
+             WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0",
+        )
+        .bind(&project_id)
+        .bind(tenant_id)
+        .bind(security::tenant_wide(&user))
+        .bind(&user.user_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| AppError::bad_request("项目不存在或无权访问"))?;
+        let project_targets = extract_scope_targets(Some(&scope));
+        let mut resolved = targets.clone();
+        if resolved.is_empty() {
+            resolved = project_targets.clone();
+        }
+        if project_targets.is_empty() && !resolved.is_empty() {
+            sqlx::query(
+                "UPDATE pent_projects SET asset_scope=$2, updated_at=now()
+                 WHERE id=$1 AND tenant_id=$3 AND deleted=0",
+            )
+            .bind(&project_id)
+            .bind(serde_json::Value::Array(
+                resolved.iter().cloned().map(Value::String).collect(),
+            ))
+            .bind(tenant_id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal)?;
+        }
+        (resolved, Some(project_id))
+    } else {
+        (targets, None)
+    };
+
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+    if let Some(objective) = objective {
+        sqlx::query(
+            "UPDATE pent_agent_sessions SET objective=$2, updated_at=now()
+             WHERE id=$1 AND tenant_id=$3",
+        )
+        .bind(&id)
+        .bind(&objective)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    if let Some(project_id) = project_id {
+        sqlx::query(
+            "UPDATE pent_agent_sessions SET project_id=$2, updated_at=now()
+             WHERE id=$1 AND tenant_id=$3",
+        )
+        .bind(&id)
+        .bind(&project_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    if !final_targets.is_empty() {
+        let snapshot = json!({
+            "targets": final_targets,
+            "constraints": {},
+            "confirmed": true,
+            "confirmed_at": chrono::Utc::now(),
+            "confirmed_by": user.user_id
+        });
+        sqlx::query(
+            "UPDATE pent_agent_sessions
+             SET confirmed_scope_snapshot=$2, scope_proposal=$2, updated_at=now()
+             WHERE id=$1 AND tenant_id=$3",
+        )
+        .bind(&id)
+        .bind(&snapshot)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    tx.commit().await.map_err(internal)?;
+
+    Ok(Json(ApiResponse::new(json!({"id": id, "updated": true}))))
 }
 
 async fn delete_session(

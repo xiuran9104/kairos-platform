@@ -105,14 +105,27 @@ async fn connect_redis() -> Option<RedisClient> {
 }
 
 /// Start MCP servers that were configured through the capability center UI
-/// and persisted in `pent_mcp_servers` (stdio transport only).
+/// and persisted in `pent_mcp_servers`.
 async fn load_db_mcp_servers(
     pool: &kairos_platform_framework_database::PgPool,
     registry: &kairos_platform_pent_server::tooling::mcp::registry::McpRegistry,
 ) {
     use kairos_platform_pent_server::tooling::mcp::protocol::McpServerConfig;
-    let rows = sqlx::query_as::<_, (String, String, serde_json::Value, serde_json::Value)>(
-        "SELECT name, command, args, env FROM pent_mcp_servers WHERE enabled AND transport='stdio'",
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            serde_json::Value,
+            serde_json::Value,
+            Option<String>,
+            serde_json::Value,
+        ),
+    >(
+        "SELECT id, name, transport, command, args, env, url, headers
+         FROM pent_mcp_servers WHERE enabled",
     )
     .fetch_all(pool)
     .await;
@@ -123,18 +136,26 @@ async fn load_db_mcp_servers(
             return;
         }
     };
-    for (name, command, args, env) in rows {
+    for (id, name, transport, command, args, env, url, headers) in rows {
         let config = McpServerConfig {
-            id: name,
-            command,
+            id,
+            command: if transport == "stdio" {
+                command.unwrap_or_default()
+            } else {
+                String::new()
+            },
             args: serde_json::from_value(args).unwrap_or_default(),
             env: serde_json::from_value(env).unwrap_or_default(),
             auto_start: true,
-            url: None,
-            headers: Default::default(),
+            url: if matches!(transport.as_str(), "http" | "sse") {
+                url
+            } else {
+                None
+            },
+            headers: serde_json::from_value(headers).unwrap_or_default(),
         };
         if let Err(error) = registry.add_server(config).await {
-            warn!(%error, "failed to start configured MCP server");
+            warn!(%error, server = %name, "failed to start configured MCP server");
         }
     }
 }

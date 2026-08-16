@@ -190,6 +190,15 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
             definitions.push(definition);
         }
     }
+    for definition in finding_tool_definitions() {
+        let name = definition.pointer("/function/name").and_then(Value::as_str);
+        if !definitions
+            .iter()
+            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
+        {
+            definitions.push(definition);
+        }
+    }
     for definition in skill_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
         if !definitions
@@ -210,7 +219,10 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
     }
     for definition in super::plan_board::definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
-        if !definitions.iter().any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name) {
+        if !definitions
+            .iter()
+            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
+        {
             definitions.push(definition);
         }
     }
@@ -220,28 +232,83 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
 
 /// DesRed-style dynamic tool disclosure: keep control/evidence tools visible
 /// and retrieve the remaining tools against the current user intent.
-pub async fn load_tools_for_intent(pool: &PgPool, intent: &str, config: &Value) -> anyhow::Result<Vec<Value>> {
+pub async fn load_tools_for_intent(
+    pool: &PgPool,
+    intent: &str,
+    config: &Value,
+) -> anyhow::Result<Vec<Value>> {
     let all = load_conversation_tool_definitions(pool).await?;
-    if config.get("tool_search_enabled").and_then(Value::as_bool) == Some(false) { return Ok(all); }
+    if config.get("tool_search_enabled").and_then(Value::as_bool) == Some(false) {
+        return Ok(all);
+    }
     let threshold = std::env::var("PENTA_TOOL_SEARCH_MIN_TOOLS")
-        .ok().and_then(|v| v.parse::<usize>().ok()).or_else(|| config.get("tool_search_min_tools").and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(20);
-    if all.len() < threshold { return Ok(all); }
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| {
+            config
+                .get("tool_search_min_tools")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+        })
+        .unwrap_or(20);
+    if all.len() < threshold {
+        return Ok(all);
+    }
     let top_k = std::env::var("PENTA_TOOL_SEARCH_TOP_K")
-        .ok().and_then(|v| v.parse::<usize>().ok()).or_else(|| config.get("tool_search_top_k").and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(24).clamp(8, 80);
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| {
+            config
+                .get("tool_search_top_k")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+        })
+        .unwrap_or(24)
+        .clamp(8, 80);
     let retrieved: std::collections::HashSet<String> = retrieve_tool_ids(pool, intent, top_k)
-        .await.into_iter().map(|(id, _)| id.to_ascii_lowercase()).collect();
-    if retrieved.is_empty() { return Ok(all); }
+        .await
+        .into_iter()
+        .map(|(id, _)| id.to_ascii_lowercase())
+        .collect();
+    if retrieved.is_empty() {
+        return Ok(all);
+    }
     const ALWAYS: &[&str] = &[
-        "knowledge_search", "evidence_list", "evidence_search", "evidence_view",
-        "traffic_list", "traffic_view", "skill_list", "skill_load", "agent_spawn",
-        "agent_status", "agent_collect", "agent_list", "read_file", "glob", "grep",
+        "knowledge_search",
+        "evidence_list",
+        "evidence_search",
+        "evidence_view",
+        "traffic_list",
+        "traffic_view",
+        "skill_list",
+        "skill_load",
+        "agent_spawn",
+        "agent_status",
+        "agent_collect",
+        "agent_list",
+        "record_finding",
+        "read_file",
+        "glob",
+        "grep",
     ];
-    let selected = all.into_iter().filter(|definition| {
-        let name = definition.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-        let lower = name.to_ascii_lowercase();
-        ALWAYS.contains(&lower.as_str()) || lower.starts_with("mcp_") || retrieved.contains(&lower)
-    }).collect::<Vec<_>>();
-    tracing::debug!(available = selected.len(), retrieved = retrieved.len(), "dynamic tool disclosure applied");
+    let selected = all
+        .into_iter()
+        .filter(|definition| {
+            let name = definition
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let lower = name.to_ascii_lowercase();
+            ALWAYS.contains(&lower.as_str())
+                || lower.starts_with("mcp_")
+                || retrieved.contains(&lower)
+        })
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        available = selected.len(),
+        retrieved = retrieved.len(),
+        "dynamic tool disclosure applied"
+    );
     Ok(selected)
 }
 
@@ -294,6 +361,34 @@ fn evidence_tool_definitions() -> Vec<Value> {
             }
         }),
     ]
+}
+
+fn finding_tool_definitions() -> Vec<Value> {
+    vec![json!({
+        "type": "function",
+        "function": {
+            "name": "record_finding",
+            "description": "验证确认漏洞后立即写入当前 Run。必须引用支撑结论的 Evidence ID；重复的 title+target 会按 fingerprint 幂等忽略。仅记录已验证漏洞，疑似结果不要调用。",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["title", "severity", "target", "description", "confidence", "evidence_ids"],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+                    "target": {"type": "string", "description": "确认受影响的 URL、端点或资产"},
+                    "description": {"type": "string", "description": "简明说明验证方法、实际结果和安全影响"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "evidence_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {"type": "string", "minLength": 1}
+                    }
+                }
+            }
+        }
+    })]
 }
 
 fn traffic_tool_definitions() -> Vec<Value> {
@@ -413,6 +508,12 @@ fn skill_tool_definitions() -> Vec<Value> {
 }
 
 fn agent_tool_definitions() -> Vec<Value> {
+    let agent_roles = super::agent_profiles::list()
+        .map(|profiles| profiles.into_iter().map(|profile| profile.id).collect::<Vec<_>>())
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to enumerate agent profiles for tool schema");
+            Vec::new()
+        });
     vec![
         json!({
             "type": "function",
@@ -425,7 +526,7 @@ fn agent_tool_definitions() -> Vec<Value> {
                     "properties": {
                         "description": {"type": "string", "description": "子代理简短描述，如'扫描 target1.com 的 SQL 注入'"},
                         "prompt": {"type": "string", "description": "子代理要完成的具体任务描述，包含目标和验证方法"},
-                        "role": {"type": "string", "enum":["web-recon","vulnerability-validator","report-reviewer"], "description":"可选 Markdown 专家角色"},
+                        "role": {"type": "string", "enum": agent_roles, "description":"可选 Markdown 专家角色"},
                         "target": {"type": "string", "description": "可选，子代理聚焦的单个目标 URL"}
                     }
                 }
@@ -535,7 +636,8 @@ fn file_upload_validator_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        evidence_tool_definitions, file_upload_validator_definition, knowledge_search_definition,
+        agent_tool_definitions, evidence_tool_definitions, file_upload_validator_definition,
+        finding_tool_definitions, knowledge_search_definition,
     };
     use crate::conversation::tool_executor::has_conversation_handler;
 
@@ -589,6 +691,38 @@ mod tests {
             definitions[1]["function"]["parameters"]["required"],
             serde_json::json!(["query"])
         );
+    }
+
+    #[test]
+    fn record_finding_requires_evidence() {
+        let definitions = finding_tool_definitions();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0]["function"]["parameters"]["required"],
+            serde_json::json!([
+                "title",
+                "severity",
+                "target",
+                "description",
+                "confidence",
+                "evidence_ids"
+            ])
+        );
+        assert_eq!(
+            definitions[0]["function"]["parameters"]["properties"]["evidence_ids"]["minItems"],
+            1
+        );
+    }
+
+    #[test]
+    fn agent_spawn_schema_lists_all_available_profiles() {
+        let definitions = agent_tool_definitions();
+        let roles = definitions[0]["function"]["parameters"]["properties"]["role"]["enum"]
+            .as_array()
+            .expect("agent role enum");
+        assert!(roles.len() >= 12, "expected all shipped agent profiles");
+        assert!(roles.contains(&serde_json::json!("recon")));
+        assert!(roles.contains(&serde_json::json!("vulnerability-validator")));
     }
 
     #[tokio::test]
@@ -855,6 +989,7 @@ pub async fn load_routed_tool_definitions(
     for definition in evidence_tool_definitions()
         .into_iter()
         .chain(traffic_tool_definitions())
+        .chain(finding_tool_definitions())
         .chain(skill_tool_definitions())
         .chain(agent_tool_definitions())
     {

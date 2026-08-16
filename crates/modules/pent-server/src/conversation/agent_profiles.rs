@@ -7,7 +7,15 @@ pub struct AgentProfile { pub id: String, pub name: String, pub description: Str
 
 /// Root directory holding the markdown agent profiles.
 pub(crate) fn agents_dir() -> PathBuf {
-    std::env::var("PENTA_AGENTS_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("agents"))
+    if let Ok(configured) = std::env::var("PENTA_AGENTS_DIR") {
+        return PathBuf::from(configured);
+    }
+    let working_directory = PathBuf::from("agents");
+    if working_directory.is_dir() {
+        working_directory
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../agents")
+    }
 }
 
 /// Agent ids double as file names; restrict them to path-safe characters.
@@ -23,6 +31,32 @@ pub fn load(role: &str) -> anyhow::Result<Option<AgentProfile>> {
     let path = root.join(format!("{safe}.md"));
     if !path.exists() { return Ok(None); }
     parse(&path, safe).map(Some)
+}
+
+/// List every valid Markdown-backed specialist profile available to the
+/// runtime. This is also used to build the model's `agent_spawn.role` schema,
+/// keeping tool disclosure in sync with the profiles on disk.
+pub fn list() -> anyhow::Result<Vec<AgentProfile>> {
+    let root = agents_dir();
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut profiles = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if is_valid_id(id) {
+            profiles.push(parse(&path, id)?);
+        }
+    }
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(profiles)
 }
 
 pub(crate) fn parse(path: &Path, fallback_id: &str) -> anyhow::Result<AgentProfile> {

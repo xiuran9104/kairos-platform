@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { message, Modal } from 'ant-design-vue';
 
@@ -14,6 +14,7 @@ import {
   startPentSessionRun,
   streamPentRunEvents,
   streamPentTurn,
+  updatePentSession,
 } from '#/api/pent';
 
 import { parseTurnStreamEvent } from './turn-stream';
@@ -112,8 +113,10 @@ async function doCreate() {
     message.warning('请输入对话目标');
     return;
   }
-  if (!targets.length) {
-    message.warning('请输入至少一个授权目标');
+  const project = projects.value.find((p) => p.id === createForm.value.project_id);
+  const hasProjectTargets = project ? projectTargetsOf(project).length > 0 : false;
+  if (!targets.length && !hasProjectTargets) {
+    message.warning('请输入至少一个授权目标，或选择已配置目标范围的项目');
     return;
   }
   creating.value = true;
@@ -123,7 +126,8 @@ async function doCreate() {
       constraints: {},
       objective: createForm.value.objective.trim(),
       project_id: createForm.value.project_id || undefined,
-      targets,
+      // 目标为空时交由后端继承项目资产范围
+      targets: targets.length ? targets : [],
     });
     message.success('对话已创建');
     showCreate.value = false;
@@ -133,6 +137,61 @@ async function doCreate() {
     message.error(error?.message || '创建失败');
   } finally {
     creating.value = false;
+  }
+}
+
+// ── 编辑会话 ────────────────────────────────────────────────────────────────
+const showEdit = ref(false);
+const saving = ref(false);
+const editForm = ref({
+  id: '',
+  objective: '',
+  project_id: undefined as string | undefined,
+  targetsText: '',
+});
+
+function openEdit(s: any) {
+  const targets = s.scope_proposal?.targets || s.confirmed_scope_snapshot?.targets || [];
+  editForm.value = {
+    id: s.id,
+    objective: s.objective || '',
+    project_id: s.project_id || undefined,
+    targetsText: Array.isArray(targets) ? targets.join('\n') : '',
+  };
+  showEdit.value = true;
+}
+
+function onEditProjectChange() {
+  const project = projects.value.find((p) => p.id === editForm.value.project_id);
+  const targets = projectTargetsOf(project);
+  if (targets.length > 0) {
+    editForm.value.targetsText = targets.join('\n');
+  }
+}
+
+async function doUpdate() {
+  const targets = editForm.value.targetsText
+    .split(/[\n,]/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (!editForm.value.objective.trim()) {
+    message.warning('请输入对话目标');
+    return;
+  }
+  saving.value = true;
+  try {
+    await updatePentSession(editForm.value.id, {
+      objective: editForm.value.objective.trim(),
+      project_id: editForm.value.project_id || undefined,
+      targets,
+    });
+    message.success('对话已更新');
+    showEdit.value = false;
+    await loadSessions();
+  } catch (error: any) {
+    message.error(error?.message || '更新失败');
+  } finally {
+    saving.value = false;
   }
 }
 
@@ -174,6 +233,16 @@ function selectSession(id: string) {
   currentId.value = id;
   liveEvents.value = [];
   loadMessages(id);
+  resumeActiveRun();
+}
+
+// 若当前会话存在活跃 Run（切页面返回后仍在执行），恢复流式监听
+function resumeActiveRun() {
+  const runId = sessions.value.find((s) => s.id === currentId.value)?.active_run_id;
+  if (runId && !running.value) {
+    running.value = true;
+    streamRunEvents(runId);
+  }
 }
 
 function scrollToBottom() {
@@ -287,6 +356,27 @@ function onComposerKeydown(e: KeyboardEvent) {
 const running = ref(false);
 const streamCtrl = ref<AbortController | null>(null);
 
+// Run 执行期间定期刷新对话消息，确保切页/恢复后消息持续更新
+let messagesTimer: ReturnType<typeof setInterval> | null = null;
+function startMessagesPolling() {
+  stopMessagesPolling();
+  messagesTimer = setInterval(() => {
+    if (currentId.value && running.value) {
+      loadMessages(currentId.value);
+    }
+  }, 2000);
+}
+function stopMessagesPolling() {
+  if (messagesTimer) {
+    clearInterval(messagesTimer);
+    messagesTimer = null;
+  }
+}
+watch(running, (value) => {
+  if (value) startMessagesPolling();
+  else stopMessagesPolling();
+});
+
 async function startRun() {
   if (!current.value || running.value) return;
   running.value = true;
@@ -328,7 +418,9 @@ function streamRunEvents(runId: string) {
     runId,
     ctrl,
     (event: any) => {
-      const data = JSON.parse(event.data || '{}');
+      // 跳过 SSE keep-alive 心跳（空 data 的注释/占位事件）
+      if (!event.data) return;
+      const data = JSON.parse(event.data);
       liveEvents.value.push({
         occurred_at: data.occurred_at || data.created_at,
         payload: data.payload || data,
@@ -356,6 +448,7 @@ function stopStream() {
 onUnmounted(() => {
   stopStream();
   stopTurnStream();
+  stopMessagesPolling();
 });
 
 // ── rendering helpers ────────────────────────────────────────────────────────
@@ -468,6 +561,10 @@ onMounted(async () => {
                     flex: 1;
                   "
                 >{{ s.objective || s.id?.slice(0, 12) }}</span>
+                <a
+                  style="font-size: 12px; color: var(--ant-color-text-tertiary)"
+                  @click.stop="openEdit(s)"
+                >编辑</a>
                 <a
                   style="font-size: 12px; color: var(--ant-color-text-tertiary)"
                   @click.stop="removeSession(s)"
@@ -721,6 +818,37 @@ onMounted(async () => {
             v-model:value="createForm.targetsText"
             :rows="3"
             placeholder="每行一个 URL 或 IP，例如 http://localhost:13000；选择项目后自动继承项目目标"
+          />
+        </a-form-item>
+      </a-form>
+    </a-modal>
+
+    <!-- 编辑对话弹窗 -->
+    <a-modal
+      v-model:open="showEdit"
+      title="编辑对话"
+      :confirm-loading="saving"
+      ok-text="保存"
+      @ok="doUpdate"
+    >
+      <a-form layout="vertical">
+        <a-form-item label="对话目标" required>
+          <a-input v-model:value="editForm.objective" placeholder="例如：对 DVWA 做 Web 渗透测试" />
+        </a-form-item>
+        <a-form-item label="关联项目">
+          <a-select
+            v-model:value="editForm.project_id"
+            allow-clear
+            placeholder="可选（选择后自动继承项目目标）"
+            :options="projects.map((p) => ({ label: p.name || p.id, value: p.id }))"
+            @change="onEditProjectChange"
+          />
+        </a-form-item>
+        <a-form-item label="授权目标">
+          <a-textarea
+            v-model:value="editForm.targetsText"
+            :rows="3"
+            placeholder="每行一个 URL 或 IP；选择项目后自动继承项目目标"
           />
         </a-form-item>
       </a-form>

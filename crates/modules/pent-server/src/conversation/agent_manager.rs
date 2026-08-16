@@ -300,6 +300,56 @@ fn parse_sub_agent_directive(content: &str) -> SubAgentDirective {
     SubAgentDirective::Candidate(content.to_string())
 }
 
+async fn execute_sub_agent_inline_tool(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &str,
+    run_id: &str,
+    repository: &Arc<dyn ConversationRepository>,
+    knowledge_source: &Arc<dyn ConversationKnowledgeSource>,
+    pool: &kairos_platform_framework_database::PgPool,
+) -> super::tool_executor::ConversationToolResult {
+    let content = match tool_name {
+        "knowledge_search" => {
+            let parsed = serde_json::from_str::<serde_json::Value>(arguments)
+                .unwrap_or_default();
+            let query = parsed
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if query.is_empty() {
+                Err(anyhow::anyhow!("query 不能为空"))
+            } else {
+                knowledge_source
+                    .search_guides(query, 5)
+                    .await
+                    .map(|guides| serde_json::json!({"query":query,"guides":guides}))
+            }
+        }
+        "evidence_list" | "evidence_search" | "evidence_view" => repository
+            .execute_evidence_tool(run_id, tool_name, arguments)
+            .await,
+        "skill_list" | "skill_load" => repository
+            .execute_skill_tool(tool_name, arguments)
+            .await,
+        "record_finding" => super::run_bridge::record_finding(pool, run_id, arguments)
+            .await
+            .map_err(anyhow::Error::msg),
+        _ => Err(anyhow::anyhow!("未知的子代理内联工具: {tool_name}")),
+    };
+    super::tool_executor::ConversationToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        success: content.is_ok(),
+        content: content
+            .map(|value| value.to_string())
+            .unwrap_or_else(|error| {
+                serde_json::json!({"error":error.to_string(),"retryable":false}).to_string()
+            }),
+    }
+}
+
 /// Execute a sub-agent's autonomous tool loop independently.
 /// Reuses the parent's Run for evidence isolation, supports parallel tool execution.
 async fn execute_sub_agent(
@@ -515,14 +565,17 @@ async fn execute_sub_agent(
                     continue;
                 }
 
-                // Hard-block agent_spawn in sub-agents
-                if tc.name == "agent_spawn" {
+                // Sub-agents cannot manage siblings or create descendants.
+                if matches!(
+                    tc.name.as_str(),
+                    "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
+                ) {
                     fast_results.push((
                         i,
                         super::tool_executor::ConversationToolResult {
                             tool_call_id: tc.id.clone(),
                             tool_name: tc.name.clone(),
-                            content: serde_json::json!({"error":"子代理不允许创建孙代理","blocked":true}).to_string(),
+                            content: serde_json::json!({"error":"子代理不允许调用智能体管理工具","blocked":true}).to_string(),
                             success: false,
                         },
                         tc.id.clone(),
@@ -539,17 +592,16 @@ async fn execute_sub_agent(
                         | "evidence_view"
                         | "skill_list"
                         | "skill_load"
-                        | "agent_status"
-                        | "agent_collect"
-                        | "agent_list"
+                        | "record_finding"
                 ) {
-                    // Fast inline tools
-                    let result = super::tool_executor::execute_tool(
+                    let result = execute_sub_agent_inline_tool(
+                        &tc.id,
                         &tc.name,
                         &tc.arguments,
-                        &context.scope_snapshot,
-                        session_id,
-                        Some(&run_id),
+                        &run_id,
+                        &repository,
+                        &knowledge_source,
+                        &pool,
                     )
                     .await;
                     fast_results.push((i, result, tc.id.clone(), tc.name.clone()));
@@ -743,6 +795,7 @@ fn has_effective_observation(tool_name: &str, content: &str) -> bool {
         | "evidence_view"
         | "skill_list"
         | "skill_load"
+        | "record_finding"
         | "agent_status"
         | "agent_collect"
         | "agent_list" => false,

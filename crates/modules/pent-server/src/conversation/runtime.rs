@@ -6,14 +6,14 @@ use kairos_platform_pent_api::{
     ConversationMessageType, ConversationTurnStatus,
 };
 
+use super::rmos::{
+    AttackGraph, KnowledgeCache, PentestMemory,
+    injector::{build_injected_context, prepare_injection},
+};
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationInstructionSink,
     ConversationIntentDetector, ConversationKnowledgeSource, ConversationModelGateway,
     ConversationRepository, ModelTurnOutput,
-};
-use super::rmos::{
-    AttackGraph, KnowledgeCache, PentestMemory,
-    injector::{build_injected_context, prepare_injection},
 };
 
 /// Maximum tool-calling rounds before forcing a stop.
@@ -305,6 +305,37 @@ impl ConversationRuntime {
                 serde_json::to_value(&result)?,
             )
             .await?;
+
+        // 交互式会话路径也要在 Run 完成后提取并落库已确认漏洞。
+        // 自主 Worker 路径由 `execute_session_run` 负责提取，这里只兜底 UI 路径。
+        if let Some(run_id) = result.run_id.as_deref() {
+            match super::run_bridge::extract_and_persist_findings(
+                &self.pool,
+                run_id,
+                &request.session_id,
+            )
+            .await
+            {
+                Ok(count) if count > 0 => {
+                    if let Err(error) = self
+                        .repository
+                        .record_run_event(
+                            run_id,
+                            "run.findings.persisted",
+                            &serde_json::json!({"count": count}),
+                        )
+                        .await
+                    {
+                        tracing::warn!(run_id, error = %error, "failed to record findings event");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(run_id, error = %error, "vulnerability extraction failed");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -420,14 +451,30 @@ impl ConversationRuntime {
         {
             budget.max_tool_rounds = (max_iterations as usize).clamp(1, 10_000);
         }
-        let checkpoint = context.policy_snapshot.get("_checkpoint").cloned().unwrap_or_default();
-        let mut request_count = checkpoint.get("request_count").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
-        let start_round = checkpoint.get("round").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        let checkpoint = context
+            .policy_snapshot
+            .get("_checkpoint")
+            .cloned()
+            .unwrap_or_default();
+        let mut request_count = checkpoint
+            .get("request_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let start_round = checkpoint
+            .get("round")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
         // Per-turn budget counts actual model API usage below. Historical
         // messages are windowed by the model gateway and are already included
         // in each provider-reported input_tokens value.
-        let mut token_count = checkpoint.get("token_count").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        let mut successful_observations = checkpoint.get("successful_observations").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        let mut token_count = checkpoint
+            .get("token_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let mut successful_observations = checkpoint
+            .get("successful_observations")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
         let mut stopped_by_budget: Option<&'static str> = None;
         let mut rounds_used = 0usize;
         let mut finished_normally = false;
@@ -454,13 +501,19 @@ impl ConversationRuntime {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4),
         ));
-        let orchestration = super::agent_pipeline::OrchestrationMode::from_policy(
+        let orchestration =
+            super::agent_pipeline::OrchestrationMode::from_policy(&context.policy_snapshot);
+        let orchestration_instruction = if super::agent_pipeline::multi_agent_enabled(
             &context.policy_snapshot,
-        );
+        ) {
+            orchestration.instruction()
+        } else {
+            "多智能体已关闭：当前代理直接完成任务，不要尝试调用 agent_spawn/agent_collect。"
+        };
         context.recent_messages.push(AgentMessage {
             message_id: "runtime_orchestration_mode".into(),
             role: "user".into(),
-            content: orchestration.instruction().into(),
+            content: orchestration_instruction.into(),
             format: "text".into(),
         });
         if let Some(run_id) = context.run_id.as_deref() {
@@ -572,8 +625,7 @@ impl ConversationRuntime {
                         let backoff = (500_u64
                             .saturating_mul(1_u64 << consecutive_model_errors.saturating_sub(1)))
                         .min(30_000);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                         continue;
                     }
                     self.repository
@@ -629,7 +681,9 @@ impl ConversationRuntime {
                 let plan_required = orchestration
                     == super::agent_pipeline::OrchestrationMode::PlanExecute
                     && if let Some(run_id) = context.run_id.as_deref() {
-                        !super::plan_board::exists(&self.pool, run_id).await.unwrap_or(false)
+                        !super::plan_board::exists(&self.pool, run_id)
+                            .await
+                            .unwrap_or(false)
                     } else {
                         false
                     };
@@ -742,19 +796,24 @@ impl ConversationRuntime {
                 // ── Phase pushes: guide the model through a systematic workflow ──
                 if round == 2 {
                     context.recent_messages.push(AgentMessage {
-                        message_id: "runtime_push_js".into(), role: "user".into(),
+                        message_id: "runtime_push_js".into(),
+                        role: "user".into(),
                         content: "第一步存活确认已完成。请立即对网站进行 JavaScript 分析：\
                                   用 js_collect 收集所有 JS 文件，然后用 js_analyze 分析提取 \
-                                  API 端点、密钥、内部路径。这比逐一手工测试高效得多。".into(),
+                                  API 端点、密钥、内部路径。这比逐一手工测试高效得多。"
+                            .into(),
                         format: "text".into(),
                     });
                 }
                 if round == 3 {
                     context.recent_messages.push(AgentMessage {
-                        message_id: "runtime_push_vuln_scan".into(), role: "user".into(),
-                        content: "信息收集阶段基本完成。请立即切换策略：用专项自动扫描工具（漏洞扫描、\
+                        message_id: "runtime_push_vuln_scan".into(),
+                        role: "user".into(),
+                        content:
+                            "信息收集阶段基本完成。请立即切换策略：用专项自动扫描工具（漏洞扫描、\
                                   XSS 检测、SQL 注入检测、目录爆破）批量发现漏洞，\
-                                  用浏览器工具验证交互式漏洞，不要再逐一手工测试。".into(),
+                                  用浏览器工具验证交互式漏洞，不要再逐一手工测试。"
+                                .into(),
                         format: "text".into(),
                     });
                 }
@@ -863,9 +922,14 @@ impl ConversationRuntime {
                         let rid = context.run_id.clone();
                         let handle = tokio::spawn(async move {
                             let start = std::time::Instant::now();
-                            let result =
-                                super::tool_executor::execute_tool(&name, &args, &scope, &sid, rid.as_deref())
-                                    .await;
+                            let result = super::tool_executor::execute_tool(
+                                &name,
+                                &args,
+                                &scope,
+                                &sid,
+                                rid.as_deref(),
+                            )
+                            .await;
                             (
                                 call_id,
                                 name,
@@ -899,7 +963,10 @@ impl ConversationRuntime {
                     match handle.await {
                         Ok((cid, name, _args, result, elapsed_ms)) => {
                             fast_results.push((
-                                0, result, cid, name,
+                                0,
+                                result,
+                                cid,
+                                name,
                                 std::time::Duration::from_millis(elapsed_ms),
                             ));
                         }
@@ -910,10 +977,13 @@ impl ConversationRuntime {
                                 super::tool_executor::ConversationToolResult {
                                     tool_call_id: call_id.clone(),
                                     tool_name: tool_name.clone(),
-                                    content: serde_json::json!({"error": format!("{e}")}).to_string(),
+                                    content: serde_json::json!({"error": format!("{e}")})
+                                        .to_string(),
                                     success: false,
                                 },
-                                call_id, tool_name, std::time::Duration::ZERO,
+                                call_id,
+                                tool_name,
+                                std::time::Duration::ZERO,
                             ));
                         }
                     }
@@ -924,7 +994,10 @@ impl ConversationRuntime {
                     match handle.await {
                         Ok((cid, name, _args, result, elapsed_ms)) => {
                             fast_results.push((
-                                0, result, cid, name,
+                                0,
+                                result,
+                                cid,
+                                name,
                                 std::time::Duration::from_millis(elapsed_ms),
                             ));
                         }
@@ -935,10 +1008,13 @@ impl ConversationRuntime {
                                 super::tool_executor::ConversationToolResult {
                                     tool_call_id: call_id.clone(),
                                     tool_name: tool_name.clone(),
-                                    content: serde_json::json!({"error": format!("{e}")}).to_string(),
+                                    content: serde_json::json!({"error": format!("{e}")})
+                                        .to_string(),
                                     success: false,
                                 },
-                                call_id, tool_name, std::time::Duration::ZERO,
+                                call_id,
+                                tool_name,
+                                std::time::Duration::ZERO,
                             ));
                         }
                     }
@@ -958,7 +1034,9 @@ impl ConversationRuntime {
                             }
                         }
                     }
-                    let tool_args = output.tool_calls.get(*idx)
+                    let tool_args = output
+                        .tool_calls
+                        .get(*idx)
                         .map(|tc| tc.arguments.as_str())
                         .unwrap_or("");
                     // SSE: stream tool result as it arrives
@@ -997,7 +1075,10 @@ impl ConversationRuntime {
                         scan_progress.record_traffic_replay();
                     }
 
-                    let evidence_id = if is_evidence_tool(tool_name) || is_traffic_tool(tool_name) {
+                    let evidence_id = if is_evidence_tool(tool_name)
+                        || is_traffic_tool(tool_name)
+                        || is_finding_tool(tool_name)
+                    {
                         None
                     } else if let Some(run_id) = context.run_id.as_deref() {
                         let eid = self
@@ -1079,9 +1160,7 @@ impl ConversationRuntime {
 
                 // ── RMOS: update memory from tool results ──
                 for (_idx, result, _call_id, tool_name, _elapsed) in &fast_results {
-                    if let Ok(parsed) =
-                        serde_json::from_str::<serde_json::Value>(&result.content)
-                    {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.content) {
                         pentest_memory.absorb_tool_result(tool_name, &parsed);
                     }
                 }
@@ -1174,10 +1253,7 @@ impl ConversationRuntime {
                     // Autonomous mode: treat ASK_USER as a signal to replan.
                     // The model has exhausted its current approach — push it to try
                     // alternative tools or conclude with NO_PATH.
-                    let reason = nonempty_or(
-                        &question,
-                        "模型判断需要补充信息，但当前为全自主模式",
-                    );
+                    let reason = nonempty_or(&question, "模型判断需要补充信息，但当前为全自主模式");
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("assistant_askuser_replan:round_{round}"),
                         role: "assistant".into(),
@@ -1401,13 +1477,10 @@ impl ConversationRuntime {
             "agent_list" => self.execute_agent_list(&tc.id, agent_manager).await,
             "plan_create" | "plan_get" | "plan_update" => {
                 let content = match context.run_id.as_deref() {
-                    Some(run_id) => super::plan_board::execute(
-                        &self.pool,
-                        run_id,
-                        &tc.name,
-                        &tc.arguments,
-                    )
-                    .await,
+                    Some(run_id) => {
+                        super::plan_board::execute(&self.pool, run_id, &tc.name, &tc.arguments)
+                            .await
+                    }
                     None => Err(anyhow::anyhow!("计划工具只能在已有 Run 中使用")),
                 };
                 super::tool_executor::ConversationToolResult {
@@ -1420,6 +1493,24 @@ impl ConversationRuntime {
                             serde_json::json!({"error":error.to_string(),"retryable":false})
                                 .to_string()
                         }),
+                }
+            }
+            "record_finding" => {
+                let content = match context.run_id.as_deref() {
+                    Some(run_id) => {
+                        super::run_bridge::record_finding(&self.pool, run_id, &tc.arguments)
+                            .await
+                            .map(|value| value.to_string())
+                    }
+                    None => Err("record_finding 只能在已有执行 Run 中使用".to_string()),
+                };
+                super::tool_executor::ConversationToolResult {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    success: content.is_ok(),
+                    content: content.unwrap_or_else(|error| {
+                        serde_json::json!({"error":error,"retryable":false}).to_string()
+                    }),
                 }
             }
             name if is_traffic_tool(name) => {
@@ -1514,8 +1605,7 @@ impl ConversationRuntime {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
             .clamp(1, 8);
-        let queries =
-            crate::tooling::reranker::knowledge::expand_queries(query, multi_query_max);
+        let queries = crate::tooling::reranker::knowledge::expand_queries(query, multi_query_max);
         let mut guides: Vec<super::ports::KnowledgeGuide> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for variant in &queries {
@@ -1733,7 +1823,10 @@ impl ConversationRuntime {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&description)
             .to_string();
-        let role = args.get("role").and_then(serde_json::Value::as_str).unwrap_or("");
+        let role = args
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if let Ok(Some(profile)) = super::agent_profiles::load(role) {
             prompt = format!(
                 "## 专家角色：{} ({})\n{}\n\n## 本次委派\n{}",
@@ -2234,7 +2327,10 @@ async fn search_vector_memories(
         .search(&embedding, None, top_k)
         .await
         .unwrap_or_default();
-    Ok(results.into_iter().map(|r| format!("{} v{} (score: {:.2})", r.tool_id, r.version, r.score)).collect())
+    Ok(results
+        .into_iter()
+        .map(|r| format!("{} v{} (score: {:.2})", r.tool_id, r.version, r.score))
+        .collect())
 }
 
 fn compact_runtime_error(error: &str) -> String {
@@ -2432,12 +2528,19 @@ fn is_traffic_tool(tool_name: &str) -> bool {
     )
 }
 
+fn is_finding_tool(tool_name: &str) -> bool {
+    tool_name == "record_finding"
+}
+
 fn is_skill_tool(tool_name: &str) -> bool {
     matches!(tool_name, "skill_list" | "skill_load")
 }
 
 fn is_reference_tool(tool_name: &str) -> bool {
-    tool_name == "knowledge_search" || is_evidence_tool(tool_name) || is_skill_tool(tool_name)
+    tool_name == "knowledge_search"
+        || is_evidence_tool(tool_name)
+        || is_finding_tool(tool_name)
+        || is_skill_tool(tool_name)
 }
 
 /// Tools that execute inline (knowledge, evidence, traffic, skill, agent).
@@ -2445,13 +2548,30 @@ fn is_inline_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "knowledge_search"
-            | "evidence_list" | "evidence_search" | "evidence_view"
-            | "traffic_list" | "traffic_view" | "traffic_sitemap"
-            | "traffic_diff" | "traffic_replay"
-            | "skill_list" | "skill_load"
-            | "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
-            | "plan_create" | "plan_get" | "plan_update"
-            | "read" | "write" | "glob" | "grep" | "bash" | "web_search"
+            | "evidence_list"
+            | "evidence_search"
+            | "evidence_view"
+            | "record_finding"
+            | "traffic_list"
+            | "traffic_view"
+            | "traffic_sitemap"
+            | "traffic_diff"
+            | "traffic_replay"
+            | "skill_list"
+            | "skill_load"
+            | "agent_spawn"
+            | "agent_status"
+            | "agent_collect"
+            | "agent_list"
+            | "plan_create"
+            | "plan_get"
+            | "plan_update"
+            | "read"
+            | "write"
+            | "glob"
+            | "grep"
+            | "bash"
+            | "web_search"
     )
 }
 
