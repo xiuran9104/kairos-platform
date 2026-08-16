@@ -885,6 +885,7 @@ mod tests {
             &json!({"url": format!("{base_url}/")}).to_string(),
             &scope,
             "test-session",
+            None,
         )
         .await;
         assert!(js.success, "{}", js.content);
@@ -907,6 +908,7 @@ mod tests {
             &json!({"url": format!("{base_url}/")}).to_string(),
             &scope,
             "test-session",
+            None,
         )
         .await;
         assert!(discovery.success, "{}", discovery.content);
@@ -930,6 +932,7 @@ mod tests {
             .to_string(),
             &scope,
             "test-session",
+            None,
         )
         .await;
         assert!(upload.success, "{}", upload.content);

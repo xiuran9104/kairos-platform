@@ -549,6 +549,7 @@ async fn execute_sub_agent(
                         &tc.arguments,
                         &context.scope_snapshot,
                         session_id,
+                        Some(&run_id),
                     )
                     .await;
                     fast_results.push((i, result, tc.id.clone(), tc.name.clone()));
@@ -564,7 +565,7 @@ async fn execute_sub_agent(
                     let handle = tokio::spawn(async move {
                         let start = std::time::Instant::now();
                         let result =
-                            super::tool_executor::execute_tool(&name, &args, &scope, &sid).await;
+                            super::tool_executor::execute_tool(&name, &args, &scope, &sid, Some(rid.as_str())).await;
                         let _ = repo
                             .record_tool_result(
                                 &rid,

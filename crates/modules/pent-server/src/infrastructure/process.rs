@@ -19,6 +19,9 @@ pub struct ToolExecutionLimits {
     pub timeout_seconds: u64,
     pub network_access: NetworkPolicy,
     pub allowed_paths: Vec<String>,
+    /// Run id used to tag captured traffic. Injected as `x-kairos-run-id` for
+    /// curl-based tools so the MITM proxy can associate exchanges with a run.
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +94,7 @@ impl Default for ToolExecutionLimits {
             timeout_seconds: 300,
             network_access: NetworkPolicy::Full,
             allowed_paths: vec![],
+            run_id: None,
         }
     }
 }
@@ -105,8 +109,24 @@ pub(crate) async fn execute_tool_direct(
     command: &[String],
     limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
-    let prepared = prepare_tool(tool_name, command, &limits.network_access)?;
+    let mut prepared = prepare_tool(tool_name, command, &limits.network_access)?;
+    inject_run_id_header(&mut prepared, limits.run_id.as_deref());
     execute_prepared_tool(tool_name, &prepared, limits).await
+}
+
+/// Tag curl-based tools with the run id so the MITM proxy can associate
+/// captured traffic with the run.
+pub(crate) fn inject_run_id_header(
+    prepared: &mut super::tool_registry::PreparedTool,
+    run_id: Option<&str>,
+) {
+    if let Some(run_id) = run_id
+        && prepared.program.contains("curl")
+    {
+        prepared
+            .args
+            .extend(["--header".into(), format!("x-kairos-run-id: {run_id}")]);
+    }
 }
 
 /// Execute a recipe from the model's structured JSON arguments using the

@@ -192,6 +192,7 @@ mod tool_execution_tests {
             timeout_seconds: 300,
             network_access: NetworkPolicy::TargetOnly("example.com".into()),
             allowed_paths: vec!["/tmp".into()],
+            run_id: None,
         };
         assert!(limits.cpu_cores > 0.0);
         assert!(limits.memory_mb >= 128);
@@ -207,6 +208,7 @@ mod tool_execution_tests {
             timeout_seconds: 120,
             network_access: NetworkPolicy::Full,
             allowed_paths: vec![],
+            run_id: None,
         };
         assert!(matches!(limits.network_access, NetworkPolicy::Full));
         assert!(limits.allowed_paths.is_empty());
@@ -218,6 +220,34 @@ mod tool_execution_tests {
         let output = vec![b'x'; max_bytes + 1024];
         let truncated: Vec<u8> = output.into_iter().take(max_bytes).collect();
         assert_eq!(truncated.len(), max_bytes);
+    }
+
+    #[test]
+    fn inject_run_id_header_tags_curl_tools_only() {
+        use crate::infrastructure::process::inject_run_id_header;
+        use crate::infrastructure::tool_registry::PreparedTool;
+
+        let mut curl = PreparedTool {
+            program: "/usr/bin/curl",
+            args: vec!["--silent".into()],
+        };
+        inject_run_id_header(&mut curl, Some("run-123"));
+        assert!(curl.args.iter().any(|a| a == "--header"));
+        assert!(curl.args.iter().any(|a| a == "x-kairos-run-id: run-123"));
+
+        let mut nmap = PreparedTool {
+            program: "/usr/bin/nmap",
+            args: vec!["-sV".into()],
+        };
+        inject_run_id_header(&mut nmap, Some("run-123"));
+        assert!(!nmap.args.iter().any(|a| a == "--header"));
+
+        let mut curl_no_run = PreparedTool {
+            program: "/usr/bin/curl",
+            args: vec![],
+        };
+        inject_run_id_header(&mut curl_no_run, None);
+        assert!(curl_no_run.args.is_empty());
     }
 
     #[test]

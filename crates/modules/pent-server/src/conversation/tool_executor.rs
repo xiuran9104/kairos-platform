@@ -153,6 +153,7 @@ pub async fn execute_tool(
     arguments: &str,
     scope_snapshot: &serde_json::Value,
     session_id: &str,
+    run_id: Option<&str>,
 ) -> ConversationToolResult {
     if NETWORK_TOOLS.contains(&name)
         && !conversation_native_tool(name)
@@ -180,10 +181,10 @@ pub async fn execute_tool(
     match name {
         // ── HTTP tools ──────────────────────────────────────────
         "http_request" if !direct_network_tools_enabled() => {
-            execute_isolated_http_request(arguments, scope_snapshot, session_id).await
+            execute_isolated_http_request(arguments, scope_snapshot, session_id, run_id).await
         }
         "http_probe" if !direct_network_tools_enabled() => {
-            execute_isolated_http_probe(arguments, scope_snapshot, session_id).await
+            execute_isolated_http_probe(arguments, scope_snapshot, session_id, run_id).await
         }
         "http_request" => execute_http_request(arguments).await,
         "http_probe" => execute_http_probe(arguments).await,
@@ -400,6 +401,7 @@ async fn execute_isolated_http_request(
     arguments: &str,
     scope_snapshot: &serde_json::Value,
     session_id: &str,
+    run_id: Option<&str>,
 ) -> ConversationToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
@@ -451,7 +453,7 @@ async fn execute_isolated_http_request(
             form.to_string()
         },
     ];
-    let limits = isolated_http_limits(scope_snapshot, url, &state_dir);
+    let limits = isolated_http_limits(scope_snapshot, url, &state_dir, run_id);
     let output =
         match crate::infrastructure::process::execute_tool("http_request", &command, &limits).await
         {
@@ -497,6 +499,7 @@ async fn execute_isolated_http_probe(
     arguments: &str,
     scope_snapshot: &serde_json::Value,
     session_id: &str,
+    run_id: Option<&str>,
 ) -> ConversationToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
@@ -512,7 +515,7 @@ async fn execute_isolated_http_probe(
     let mut results = Vec::new();
     let mut reachable = false;
     for url in http_probe_urls(target) {
-        let limits = isolated_http_limits(scope_snapshot, &url, &state_dir);
+        let limits = isolated_http_limits(scope_snapshot, &url, &state_dir, run_id);
         let command = vec!["probe".into(), url.clone()];
         match crate::infrastructure::process::execute_tool("http_probe", &command, &limits).await {
             Ok(output) => {
@@ -551,13 +554,15 @@ fn isolated_http_limits(
     _scope_snapshot: &serde_json::Value,
     target: &str,
     state_dir: &std::path::Path,
- ) -> crate::infrastructure::process::ToolExecutionLimits {
+    run_id: Option<&str>,
+) -> crate::infrastructure::process::ToolExecutionLimits {
     crate::infrastructure::process::ToolExecutionLimits {
         timeout_seconds: 30,
         network_access: crate::infrastructure::process::NetworkPolicy::TargetOnly(
             target.to_string(),
         ),
         allowed_paths: vec![state_dir.to_string_lossy().into_owned()],
+        run_id: run_id.map(str::to_string),
         ..Default::default()
     }
 }
@@ -1255,6 +1260,7 @@ pub async fn execute_tools_parallel(
     tool_calls: &[(String, String, String)], // (call_id, name, arguments_json)
     scope_snapshot: &serde_json::Value,
     session_id: &str,
+    run_id: Option<&str>,
 ) -> Vec<ConversationToolResult> {
     let handles: Vec<_> = tool_calls
         .iter()
@@ -1265,9 +1271,10 @@ pub async fn execute_tools_parallel(
             let a = args.clone();
             let scope = scope_snapshot.clone();
             let sid = session_id.to_string();
+            let rid = run_id.map(str::to_string);
             tokio::spawn(async move {
                 let result =
-                    execute_tool(&n, &a, &scope, &sid).await;
+                    execute_tool(&n, &a, &scope, &sid, rid.as_deref()).await;
                 (idx, cid, result)
             })
         })

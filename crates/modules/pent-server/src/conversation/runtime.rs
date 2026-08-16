@@ -860,10 +860,11 @@ impl ConversationRuntime {
                         let destructive = is_destructive_tool(&name);
                         let scope = context.scope_snapshot.clone();
                         let sid = session_id.to_string();
+                        let rid = context.run_id.clone();
                         let handle = tokio::spawn(async move {
                             let start = std::time::Instant::now();
                             let result =
-                                super::tool_executor::execute_tool(&name, &args, &scope, &sid)
+                                super::tool_executor::execute_tool(&name, &args, &scope, &sid, rid.as_deref())
                                     .await;
                             (
                                 call_id,
@@ -1469,6 +1470,7 @@ impl ConversationRuntime {
                     &tc.arguments,
                     &context.scope_snapshot,
                     session_id,
+                    context.run_id.as_deref(),
                 )
                 .await
             }
@@ -1958,6 +1960,7 @@ impl ConversationRuntime {
             &replay_args.to_string(),
             scope_snapshot,
             session_id,
+            Some(run_id),
         )
         .await;
         let traffic_ids = self
