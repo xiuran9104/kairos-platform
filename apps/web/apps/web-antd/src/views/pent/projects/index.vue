@@ -218,9 +218,13 @@ onMounted(fetchProjects);
 
 <template>
   <div style="padding: 24px; min-height: 100vh">
-    <div style="display: flex; gap: 16px; align-items: flex-start">
+    <div style="display: flex; gap: 16px; align-items: stretch">
       <!-- 左侧项目列表 -->
-      <a-card size="small" style="width: 280px; flex-shrink: 0" :body-style="{ padding: '12px' }">
+      <a-card
+        size="small"
+        style="width: 280px; flex-shrink: 0; height: 100%; display: flex; flex-direction: column"
+        :body-style="{ padding: '12px', flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }"
+      >
         <div style="display: flex; gap: 8px; margin-bottom: 12px">
           <a-input-search
             v-model:value="searchText"
@@ -235,8 +239,8 @@ onMounted(fetchProjects);
         <a-checkbox v-model:checked="showArchived" style="margin-bottom: 8px; font-size: 12px">
           显示已归档
         </a-checkbox>
-        <a-spin :spinning="loading">
-          <div style="max-height: calc(100vh - 260px); overflow-y: auto">
+        <a-spin :spinning="loading" style="flex: 1; min-height: 0; display: flex; flex-direction: column">
+          <div style="flex: 1; min-height: 0; overflow-y: auto">
             <div
               v-for="p in filteredProjects"
               :key="p.id"
