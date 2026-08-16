@@ -99,6 +99,22 @@ pub trait ToolApprovalGate: Send + Sync {
     async fn review(&self, request: &ToolApprovalRequest) -> anyhow::Result<ToolApprovalOutcome>;
 }
 
+#[async_trait]
+pub trait FindingRecorder: Send + Sync {
+    async fn record(&self, run_id: &str, arguments: &str) -> anyhow::Result<serde_json::Value>;
+}
+
+#[async_trait]
+pub trait PlanStore: Send + Sync {
+    async fn exists(&self, run_id: &str) -> anyhow::Result<bool>;
+    async fn execute(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        arguments: &str,
+    ) -> anyhow::Result<serde_json::Value>;
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSpawnRequest {
     pub description: String,
@@ -342,6 +358,37 @@ mod tests {
 
     struct StubToolApprovalGate;
 
+    struct StubFindingRecorder;
+
+    #[async_trait]
+    impl FindingRecorder for StubFindingRecorder {
+        async fn record(
+            &self,
+            _run_id: &str,
+            _arguments: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"recorded": true}))
+        }
+    }
+
+    struct StubPlanStore;
+
+    #[async_trait]
+    impl PlanStore for StubPlanStore {
+        async fn exists(&self, _run_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn execute(
+            &self,
+            _run_id: &str,
+            _tool_name: &str,
+            _arguments: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
     #[async_trait]
     impl ToolApprovalGate for StubToolApprovalGate {
         async fn review(
@@ -378,6 +425,14 @@ mod tests {
     fn tool_approval_gate_is_object_safe() {
         let gate = StubToolApprovalGate;
         let _: &dyn ToolApprovalGate = &gate;
+    }
+
+    #[test]
+    fn persistence_ports_are_object_safe() {
+        let recorder = StubFindingRecorder;
+        let _: &dyn FindingRecorder = &recorder;
+        let plans = StubPlanStore;
+        let _: &dyn PlanStore = &plans;
     }
 
     #[test]

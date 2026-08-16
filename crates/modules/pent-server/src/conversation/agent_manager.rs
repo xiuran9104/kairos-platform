@@ -14,8 +14,8 @@ use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessa
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
-    ConversationToolExecutor, RuntimeToolCall, ToolApprovalGate, ToolApprovalOutcome,
-    ToolApprovalRequest, ToolExecutionContext,
+    ConversationToolExecutor, FindingRecorder, RuntimeToolCall, ToolApprovalGate,
+    ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
@@ -98,9 +98,9 @@ impl AgentManager {
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         tool_executor: Arc<dyn ConversationToolExecutor>,
         approval_gate: Arc<dyn ToolApprovalGate>,
+        finding_recorder: Arc<dyn FindingRecorder>,
         events: Arc<dyn ConversationEventSink>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
-        pool: kairos_platform_framework_database::PgPool,
     ) -> anyhow::Result<String> {
         let active = self.active_count().await;
         if active >= self.max_concurrent {
@@ -159,9 +159,9 @@ impl AgentManager {
                 knowledge_source,
                 tool_executor,
                 approval_gate,
+                finding_recorder,
                 events,
                 intent_detector,
-                pool,
             )
             .await;
 
@@ -248,9 +248,9 @@ pub struct ServerAgentSessionFactory {
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
     approval_gate: Arc<dyn ToolApprovalGate>,
+    finding_recorder: Arc<dyn FindingRecorder>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
-    pool: kairos_platform_framework_database::PgPool,
 }
 
 impl ServerAgentSessionFactory {
@@ -262,9 +262,9 @@ impl ServerAgentSessionFactory {
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         tool_executor: Arc<dyn ConversationToolExecutor>,
         approval_gate: Arc<dyn ToolApprovalGate>,
+        finding_recorder: Arc<dyn FindingRecorder>,
         events: Arc<dyn ConversationEventSink>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
-        pool: kairos_platform_framework_database::PgPool,
     ) -> Self {
         Self {
             repository,
@@ -273,9 +273,9 @@ impl ServerAgentSessionFactory {
             knowledge_source,
             tool_executor,
             approval_gate,
+            finding_recorder,
             events,
             intent_detector,
-            pool,
         }
     }
 }
@@ -290,9 +290,9 @@ impl AgentSessionFactory for ServerAgentSessionFactory {
             knowledge_source: self.knowledge_source.clone(),
             tool_executor: self.tool_executor.clone(),
             approval_gate: self.approval_gate.clone(),
+            finding_recorder: self.finding_recorder.clone(),
             events: self.events.clone(),
             intent_detector: self.intent_detector.clone(),
-            pool: self.pool.clone(),
         })
     }
 }
@@ -305,9 +305,9 @@ struct ServerAgentSession {
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
     approval_gate: Arc<dyn ToolApprovalGate>,
+    finding_recorder: Arc<dyn FindingRecorder>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
-    pool: kairos_platform_framework_database::PgPool,
 }
 
 #[async_trait::async_trait]
@@ -330,9 +330,9 @@ impl AgentSession for ServerAgentSession {
                 self.knowledge_source.clone(),
                 self.tool_executor.clone(),
                 self.approval_gate.clone(),
+                self.finding_recorder.clone(),
                 self.events.clone(),
                 self.intent_detector.clone(),
-                self.pool.clone(),
             )
             .await
     }
@@ -384,7 +384,7 @@ async fn execute_sub_agent_inline_tool(
     run_id: &str,
     repository: &Arc<dyn ConversationRepository>,
     knowledge_source: &Arc<dyn ConversationKnowledgeSource>,
-    pool: &kairos_platform_framework_database::PgPool,
+    finding_recorder: &Arc<dyn FindingRecorder>,
 ) -> super::tool_executor::ConversationToolResult {
     let content = match tool_name {
         "knowledge_search" => {
@@ -409,9 +409,7 @@ async fn execute_sub_agent_inline_tool(
                 .await
         }
         "skill_list" | "skill_load" => repository.execute_skill_tool(tool_name, arguments).await,
-        "record_finding" => super::run_bridge::record_finding(pool, run_id, arguments)
-            .await
-            .map_err(anyhow::Error::msg),
+        "record_finding" => finding_recorder.record(run_id, arguments).await,
         _ => Err(anyhow::anyhow!("未知的子代理内联工具: {tool_name}")),
     };
     super::tool_executor::ConversationToolResult {
@@ -440,9 +438,9 @@ async fn execute_sub_agent(
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
     approval_gate: Arc<dyn ToolApprovalGate>,
+    finding_recorder: Arc<dyn FindingRecorder>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
-    pool: kairos_platform_framework_database::PgPool,
 ) -> anyhow::Result<String> {
     let objective = if let Some(t) = target {
         format!("对 {} 执行：{}", t, prompt)
@@ -679,7 +677,7 @@ async fn execute_sub_agent(
                         &run_id,
                         &repository,
                         &knowledge_source,
-                        &pool,
+                        &finding_recorder,
                     )
                     .await;
                     fast_results.push((i, result, tc.id.clone(), tc.name.clone()));

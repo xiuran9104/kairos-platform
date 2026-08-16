@@ -1,8 +1,36 @@
 //! Persistent Plan → Execute → Replan task board.
 
 use kairos_platform_framework_database::PgPool;
+use kairos_platform_pent_runtime::ports::PlanStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+#[derive(Clone)]
+pub struct PgPlanStore {
+    pool: PgPool,
+}
+
+impl PgPlanStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl PlanStore for PgPlanStore {
+    async fn exists(&self, run_id: &str) -> anyhow::Result<bool> {
+        exists(&self.pool, run_id).await
+    }
+
+    async fn execute(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        arguments: &str,
+    ) -> anyhow::Result<Value> {
+        execute(&self.pool, run_id, tool_name, arguments).await
+    }
+}
 
 pub fn definitions() -> Vec<Value> {
     vec![

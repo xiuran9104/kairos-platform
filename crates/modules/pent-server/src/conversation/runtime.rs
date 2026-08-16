@@ -14,8 +14,9 @@ use super::{
     AgentSession, AgentSessionFactory, AgentSpawnRequest, ConversationContextSource,
     ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
-    ConversationToolExecutor, ModelTurnOutput, RuntimeAgentStatus, RuntimeToolCall,
-    ToolApprovalGate, ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
+    ConversationToolExecutor, FindingRecorder, ModelTurnOutput, PlanStore, RuntimeAgentStatus,
+    RuntimeToolCall, ToolApprovalGate, ToolApprovalOutcome, ToolApprovalRequest,
+    ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
@@ -161,6 +162,8 @@ pub struct ConversationRuntime {
     instruction_sink: Arc<dyn ConversationInstructionSink>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
     approval_gate: Arc<dyn ToolApprovalGate>,
+    finding_recorder: Arc<dyn FindingRecorder>,
+    plan_store: Arc<dyn PlanStore>,
     agent_sessions: Arc<dyn AgentSessionFactory>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
@@ -177,6 +180,8 @@ impl ConversationRuntime {
         instruction_sink: Arc<dyn ConversationInstructionSink>,
         tool_executor: Arc<dyn ConversationToolExecutor>,
         approval_gate: Arc<dyn ToolApprovalGate>,
+        finding_recorder: Arc<dyn FindingRecorder>,
+        plan_store: Arc<dyn PlanStore>,
         agent_sessions: Arc<dyn AgentSessionFactory>,
         events: Arc<dyn ConversationEventSink>,
         pool: kairos_platform_framework_database::PgPool,
@@ -190,6 +195,8 @@ impl ConversationRuntime {
             instruction_sink,
             tool_executor,
             approval_gate,
+            finding_recorder,
+            plan_store,
             agent_sessions,
             events,
             nats: None,
@@ -684,9 +691,7 @@ impl ConversationRuntime {
                 let plan_required = orchestration
                     == super::agent_pipeline::OrchestrationMode::PlanExecute
                     && if let Some(run_id) = context.run_id.as_deref() {
-                        !super::plan_board::exists(&self.pool, run_id)
-                            .await
-                            .unwrap_or(false)
+                        !self.plan_store.exists(run_id).await.unwrap_or(false)
                     } else {
                         false
                     };
@@ -1491,7 +1496,8 @@ impl ConversationRuntime {
             "plan_create" | "plan_get" | "plan_update" => {
                 let content = match context.run_id.as_deref() {
                     Some(run_id) => {
-                        super::plan_board::execute(&self.pool, run_id, &tc.name, &tc.arguments)
+                        self.plan_store
+                            .execute(run_id, &tc.name, &tc.arguments)
                             .await
                     }
                     None => Err(anyhow::anyhow!("计划工具只能在已有 Run 中使用")),
@@ -1510,19 +1516,19 @@ impl ConversationRuntime {
             }
             "record_finding" => {
                 let content = match context.run_id.as_deref() {
-                    Some(run_id) => {
-                        super::run_bridge::record_finding(&self.pool, run_id, &tc.arguments)
-                            .await
-                            .map(|value| value.to_string())
-                    }
-                    None => Err("record_finding 只能在已有执行 Run 中使用".to_string()),
+                    Some(run_id) => self
+                        .finding_recorder
+                        .record(run_id, &tc.arguments)
+                        .await
+                        .map(|value| value.to_string()),
+                    None => Err(anyhow::anyhow!("record_finding 只能在已有执行 Run 中使用")),
                 };
                 super::tool_executor::ConversationToolResult {
                     tool_call_id: tc.id.clone(),
                     tool_name: tc.name.clone(),
                     success: content.is_ok(),
                     content: content.unwrap_or_else(|error| {
-                        serde_json::json!({"error":error,"retryable":false}).to_string()
+                        serde_json::json!({"error":error.to_string(),"retryable":false}).to_string()
                     }),
                 }
             }

@@ -2,8 +2,29 @@ use kairos_platform_ai_api::{ChatMessage, ChatRequest};
 use kairos_platform_ai_server::AiModelFactory;
 use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::{AgentTurnRequest, ConversationMessageType};
+use kairos_platform_pent_runtime::ports::FindingRecorder;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+#[derive(Clone)]
+pub struct PgFindingRecorder {
+    pool: PgPool,
+}
+
+impl PgFindingRecorder {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl FindingRecorder for PgFindingRecorder {
+    async fn record(&self, run_id: &str, arguments: &str) -> anyhow::Result<Value> {
+        record_finding(&self.pool, run_id, arguments)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+}
 
 /// Execute a session-backed Run through the same autonomous conversation
 /// runtime used by the UI. Returns `false` for legacy task-only runs.
