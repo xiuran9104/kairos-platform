@@ -242,7 +242,7 @@ const recommendations = computed(() => {
     list.push({ action: '新建项目', path: '/pent/projects', title: '还没有项目，先创建一个' });
   }
   if (sessions.value.length === 0) {
-    list.push({ action: '发起对话', path: '/pent/agent', title: '还没有对话，发起一次渗透测试对话' });
+    list.push({ action: '发起对话', path: '/pent/chat', title: '还没有对话，发起一次渗透测试对话' });
   }
   return list;
 });
@@ -273,7 +273,7 @@ const capabilityItems = computed(() => [
   { label: '角色', path: '/pent/capability/roles', value: counts.value.roles },
   { label: 'MCP 工具', path: '/pent/capability/mcp-management', value: counts.value.tools },
   { label: '外部 MCP', path: '/pent/capability/mcp-management', value: counts.value.mcpServers },
-  { label: '会话', path: '/pent/agent', value: sessions.value.length },
+  { label: '会话', path: '/pent/chat', value: sessions.value.length },
 ]);
 
 function go(path: string) {
@@ -309,7 +309,7 @@ function go(path: string) {
     <!-- KPI 行 -->
     <a-row :gutter="[12, 12]" style="margin-top: 16px">
       <a-col :xs="12" :lg="6">
-        <a-tooltip title="点击查看对话"><a-card hoverable size="small" @click="go('/pent/agent')">
+        <a-tooltip title="点击查看对话"><a-card hoverable size="small" @click="go('/pent/chat')">
           <div style="font-size: 13px; color: var(--ant-color-text-secondary)">运行中对话</div>
           <div style="font-size: 28px; font-weight: 700">{{ runningSessions }}</div>
           <div style="font-size: 12px; color: var(--ant-color-text-tertiary)">

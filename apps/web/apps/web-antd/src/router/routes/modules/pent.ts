@@ -13,12 +13,6 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '仪表盘', icon: 'lucide:gauge' },
       },
       {
-        path: '/pent/agent',
-        component: () => import('#/views/pent/agent-start/index.vue'),
-        name: 'PentAgentStart',
-        meta: { title: '启动 Agent', icon: 'lucide:message-square-code' },
-      },
-      {
         path: '/pent/chat',
         component: () => import('#/views/pent/chat/index.vue'),
         name: 'PentChat',

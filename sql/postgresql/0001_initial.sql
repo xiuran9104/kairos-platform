@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict oMHDCRNdLvibHxDbQOE3jl8MJCdXRYlvdt9tda0Ja9TI8fQNbeFhymu2KyVHCR8
+\restrict gbAcs6z5dFitzQBw1WPZdc5gmldUYxu91LctKsqHtqzZif6PKC8tevhD7mWTg5w
 
 -- Dumped from database version 18.4 (Debian 18.4-1.pgdg12+1)
 -- Dumped by pg_dump version 18.4 (Debian 18.4-1)
@@ -4607,8 +4607,8 @@ COPY public.pent_tool_quality_metrics (tool_id, version, capability, target_type
 --
 
 COPY public.pent_workers (worker_id, capacity, status, last_heartbeat, registered_at) FROM stdin;
-worker-pent-agent-worker-01	1	active	2026-08-16 09:04:29.171518+00	2026-08-05 07:39:53.190075+00
-worker-gateway	1	active	2026-08-16 09:04:32.557774+00	2026-07-28 18:16:12.056932+00
+worker-pent-agent-worker-01	1	active	2026-08-16 09:13:59.780547+00	2026-08-05 07:39:53.190075+00
+worker-gateway	1	active	2026-08-16 09:14:03.211517+00	2026-07-28 18:16:12.056932+00
 \.
 
 
@@ -6388,7 +6388,6 @@ COPY public.system_menu (id, name, permission, type, sort, parent_id, path, icon
 30511	资产概览		2	1	30510	asset-overview	lucide:layout-dashboard	pent/ops/asset-overview/index	PentOpsAssetOverview	0	t	t	t	migration	2026-08-12 07:36:26.394619	migration	2026-08-12 07:47:15.970504	0	\N
 30509	角色维护	pent:role:manage	3	1	30508		#			0	f	t	t	migration	2026-08-14 08:44:14.419272	migration	2026-08-14 08:44:14.419272	0	\N
 30412	流量记录	pent:traffic:read	2	10	30400	traffic	lucide:network	pent/traffic/index	PentTraffic	0	t	t	t	admin	2026-07-23 11:33:32.505246	admin	2026-08-16 09:00:44.121807	0	\N
-30520	启动 Agent		2	1	30400	agent	lucide:message-square-code	pent/agent-start/index	PentAgentStart	0	t	t	t	admin	2026-08-16 09:04:05.481114	admin	2026-08-16 09:04:05.481114	0	\N
 \.
 
 
@@ -7586,7 +7585,7 @@ COPY public.yudao_demo03_student (id, name, sex, birthday, description, creator,
 -- Name: infra_api_access_log_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.infra_api_access_log_seq', 92448, true);
+SELECT pg_catalog.setval('public.infra_api_access_log_seq', 92503, true);
 
 
 --
@@ -9979,5 +9978,5 @@ ALTER TABLE ONLY public.scan_tasks
 -- PostgreSQL database dump complete
 --
 
-\unrestrict oMHDCRNdLvibHxDbQOE3jl8MJCdXRYlvdt9tda0Ja9TI8fQNbeFhymu2KyVHCR8
+\unrestrict gbAcs6z5dFitzQBw1WPZdc5gmldUYxu91LctKsqHtqzZif6PKC8tevhD7mWTg5w
 

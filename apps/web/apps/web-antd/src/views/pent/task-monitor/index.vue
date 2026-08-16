@@ -190,7 +190,7 @@ watch(taskId, () => { if (taskId.value) loadTask(); });
           >
             取消任务
           </a-button>
-          <a-button size="small" @click="router.push('/pent/agent')">
+          <a-button size="small" @click="router.push('/pent/chat')">
             新建任务
           </a-button>
         </a-space>
