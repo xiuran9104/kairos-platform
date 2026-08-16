@@ -16,12 +16,15 @@ use super::{
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
     ConversationToolExecutor, FindingRecorder, ModelTurnOutput, PlanStore, RoleResolver,
     RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall, SkillStore, ToolApprovalGate,
-    ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
+    ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopCheckpoint, AgentLoopLimits, parse_agent_directive,
 };
 use kairos_platform_pent_runtime::orchestrator::{AgentOrchestrator, ModelAttemptOutcome};
+use kairos_platform_pent_runtime::tool_dispatch::{
+    ToolDispatchContext, ToolDispatchPolicy, ToolDispatcher, ToolExecutionClass,
+};
 
 /// Maximum tool-calling rounds before forcing a stop.
 /// PentAGI CLI uses 3 hours default runtime; the conversation agent
@@ -699,7 +702,6 @@ impl ConversationRuntime {
             if !output.tool_calls.is_empty() {
                 // Every tool path, including inline tools and agent_spawn, crosses
                 // the same DesRed-compatible HITL fence before execution.
-                let mut hitl_rejections = std::collections::HashMap::new();
                 let plan_required = orchestration
                     == super::agent_pipeline::OrchestrationMode::PlanExecute
                     && if let Some(run_id) = context.run_id.as_deref() {
@@ -707,67 +709,23 @@ impl ConversationRuntime {
                     } else {
                         false
                     };
-                for tool_call in &mut output.tool_calls {
-                    if orchestration == super::agent_pipeline::OrchestrationMode::Supervisor
-                        && !matches!(
-                            tool_call.name.as_str(),
-                            "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
-                        )
-                    {
-                        hitl_rejections.insert(
-                            tool_call.id.clone(),
-                            "supervisor 模式的主代理只能路由、监督和汇总子代理；请使用 agent_spawn/agent_collect"
-                                .into(),
-                        );
-                        continue;
-                    }
-                    if plan_required && tool_call.name != "plan_create" {
-                        hitl_rejections.insert(
-                            tool_call.id.clone(),
-                            "plan_execute 模式必须先调用 plan_create 创建持久化计划".into(),
-                        );
-                        continue;
-                    }
-                    match super::agent_pipeline::validate_tool_call(tool_call) {
-                        super::agent_pipeline::ToolCallValidation::Valid => {}
-                        super::agent_pipeline::ToolCallValidation::Repairable(reason) => {
-                            tracing::warn!(tool_call_id = %tool_call.id, %reason, "repaired malformed model tool arguments");
-                        }
-                        super::agent_pipeline::ToolCallValidation::Rejected(reason) => {
-                            hitl_rejections.insert(tool_call.id.clone(), reason);
-                        }
-                    }
-                }
-                if let Some(run_id) = context.run_id.as_deref() {
-                    for tool_call in &mut output.tool_calls {
-                        if hitl_rejections.contains_key(&tool_call.id) {
-                            continue;
-                        }
-                        match self
-                            .approval_gate
-                            .review(&ToolApprovalRequest {
-                                run_id: run_id.to_string(),
-                                session_id: session_id.to_string(),
-                                tool_call_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                                arguments: tool_call.arguments.clone(),
-                            })
-                            .await
-                        {
-                            Ok(ToolApprovalOutcome::Approved(arguments)) => {
-                                tool_call.arguments = arguments;
-                            }
-                            Ok(ToolApprovalOutcome::Rejected(reason)) => {
-                                hitl_rejections.insert(tool_call.id.clone(), reason);
-                            }
-                            Err(error) => {
-                                // Fail closed when policy loading or persistence fails.
-                                hitl_rejections.insert(
-                                    tool_call.id.clone(),
-                                    format!("AI 围栏处理失败：{error}"),
-                                );
-                            }
-                        }
+                let dispatch_plan = ToolDispatcher::new(self.approval_gate.as_ref())
+                    .prepare(
+                        &mut output.tool_calls,
+                        &ToolDispatchContext {
+                            run_id: context.run_id.clone(),
+                            session_id: session_id.to_string(),
+                            policy: ToolDispatchPolicy {
+                                agent_management_only: orchestration
+                                    == super::agent_pipeline::OrchestrationMode::Supervisor,
+                                plan_required,
+                            },
+                        },
+                    )
+                    .await;
+                for decision in &dispatch_plan.decisions {
+                    if let Some(reason) = decision.repair.as_deref() {
+                        tracing::warn!(tool_call_id = %decision.tool_call_id, %reason, "repaired malformed model tool arguments");
                     }
                 }
                 // Write assistant tool_calls message to DB so SSE can stream it
@@ -899,7 +857,7 @@ impl ConversationRuntime {
                         break;
                     }
                     let tool_started = std::time::Instant::now();
-                    if let Some(reason) = hitl_rejections.get(&tc.id) {
+                    if let Some(reason) = dispatch_plan.blocked_reason(&tc.id) {
                         fast_results.push((
                             i,
                             super::tool_executor::ConversationToolResult {
@@ -919,7 +877,11 @@ impl ConversationRuntime {
                         ));
                         continue;
                     }
-                    if is_inline_tool(&tc.name) {
+                    let execution_class = dispatch_plan
+                        .decision(&tc.id)
+                        .map(|decision| decision.class)
+                        .unwrap_or(ToolExecutionClass::ReadOnly);
+                    if execution_class == ToolExecutionClass::Inline {
                         let result = self
                             .execute_fast_tool(tc, session_id, &context, &agent_session)
                             .await;
@@ -934,7 +896,7 @@ impl ConversationRuntime {
                         let call_id = tc.id.clone();
                         let name = tc.name.clone();
                         let args = tc.arguments.clone();
-                        let destructive = is_destructive_tool(&name);
+                        let destructive = execution_class == ToolExecutionClass::Destructive;
                         let scope = context.scope_snapshot.clone();
                         let sid = session_id.to_string();
                         let rid = context.run_id.clone();
@@ -2451,59 +2413,6 @@ fn is_reference_tool(tool_name: &str) -> bool {
         || is_evidence_tool(tool_name)
         || is_finding_tool(tool_name)
         || is_skill_tool(tool_name)
-}
-
-/// Tools that execute inline (knowledge, evidence, traffic, skill, agent).
-fn is_inline_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "knowledge_search"
-            | "evidence_list"
-            | "evidence_search"
-            | "evidence_view"
-            | "record_finding"
-            | "traffic_list"
-            | "traffic_view"
-            | "traffic_sitemap"
-            | "traffic_diff"
-            | "traffic_replay"
-            | "skill_list"
-            | "skill_load"
-            | "agent_spawn"
-            | "agent_status"
-            | "agent_collect"
-            | "agent_list"
-            | "plan_create"
-            | "plan_get"
-            | "plan_update"
-            | "read"
-            | "write"
-            | "glob"
-            | "grep"
-            | "bash"
-            | "web_search"
-    )
-}
-
-/// Destructive tools that modify target state — must run sequentially.
-/// These include vulnerability scanners, injection tools, and exploit tools.
-fn is_destructive_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        // Vulnerability scanners
-        "nuclei" | "web_vuln_scan"
-            | "sqli_validate" | "xss_validate" | "csrf_validate"
-            | "command_injection_validate" | "file_inclusion_validate"
-            | "file_upload_validate"
-            | "afrog" | "wapiti" | "skipfish"
-            // Injection tools
-            | "sqlmap" | "sqlmap_scan" | "xsser" | "dalfox" | "web_xss_scan"
-            | "commix"
-            // Brute force / fuzzing (high traffic)
-            | "ffuf" | "wfuzz" | "gobuster" | "feroxbuster" | "dirb" | "dirsearch" | "dir_fuzz"
-            // Exploit
-            | "ssh_exec"
-    )
 }
 
 /// Detect "target unreachable" errors in tool output.

@@ -15,12 +15,15 @@ use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
     ConversationToolExecutor, FindingRecorder, RuntimeToolCall, SkillStore, ToolApprovalGate,
-    ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
+    ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{AgentDirective, AgentLoopLimits, AgentLoopStop};
 use kairos_platform_pent_runtime::orchestrator::AgentOrchestrator;
 use kairos_platform_pent_runtime::ports::{
     AgentSession, AgentSessionFactory, AgentSpawnRequest, RuntimeAgentStatus, RuntimeSubAgent,
+};
+use kairos_platform_pent_runtime::tool_dispatch::{
+    ToolDispatchContext, ToolDispatchPolicy, ToolDispatcher,
 };
 
 const SUB_AGENT_MAX_TOOL_ROUNDS: usize = 12;
@@ -558,43 +561,24 @@ async fn execute_sub_agent(
         );
 
         if !output.tool_calls.is_empty() {
-            let mut hitl_rejections = std::collections::HashMap::new();
             let mut output = output;
-            for tool_call in &mut output.tool_calls {
-                match super::agent_pipeline::validate_tool_call(tool_call) {
-                    super::agent_pipeline::ToolCallValidation::Valid => {}
-                    super::agent_pipeline::ToolCallValidation::Repairable(reason) => {
-                        tracing::warn!(tool_call_id = %tool_call.id, %reason, "repaired malformed sub-agent tool arguments");
-                    }
-                    super::agent_pipeline::ToolCallValidation::Rejected(reason) => {
-                        hitl_rejections.insert(tool_call.id.clone(), reason);
-                    }
-                }
-            }
-            for tool_call in &mut output.tool_calls {
-                if hitl_rejections.contains_key(&tool_call.id) {
-                    continue;
-                }
-                match approval_gate
-                    .review(&ToolApprovalRequest {
-                        run_id: run_id.clone(),
+            let dispatch_plan = ToolDispatcher::new(approval_gate.as_ref())
+                .prepare(
+                    &mut output.tool_calls,
+                    &ToolDispatchContext {
+                        run_id: Some(run_id.clone()),
                         session_id: session_id.to_string(),
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.clone(),
-                    })
-                    .await
-                {
-                    Ok(ToolApprovalOutcome::Approved(arguments)) => {
-                        tool_call.arguments = arguments;
-                    }
-                    Ok(ToolApprovalOutcome::Rejected(reason)) => {
-                        hitl_rejections.insert(tool_call.id.clone(), reason);
-                    }
-                    Err(error) => {
-                        hitl_rejections
-                            .insert(tool_call.id.clone(), format!("AI 围栏处理失败：{error}"));
-                    }
+                        policy: ToolDispatchPolicy::default(),
+                    },
+                )
+                .await;
+            for decision in &dispatch_plan.decisions {
+                if let Some(reason) = decision.repair.as_deref() {
+                    tracing::warn!(
+                        tool_call_id = %decision.tool_call_id,
+                        %reason,
+                        "repaired malformed sub-agent tool arguments"
+                    );
                 }
             }
             context.recent_messages.push(AgentMessage {
@@ -639,7 +623,7 @@ async fn execute_sub_agent(
                     break;
                 }
 
-                if let Some(reason) = hitl_rejections.get(&tc.id) {
+                if let Some(reason) = dispatch_plan.blocked_reason(&tc.id) {
                     fast_results.push((
                         i,
                         super::tool_executor::ConversationToolResult {

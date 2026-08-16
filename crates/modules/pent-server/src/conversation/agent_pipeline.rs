@@ -2,11 +2,6 @@
 
 use serde_json::Value;
 
-use super::ModelToolCall;
-
-pub const DEFAULT_MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
-pub const DEFAULT_MAX_SHELL_COMMAND_BYTES: usize = 64 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrchestrationMode {
     Deep,
@@ -51,47 +46,6 @@ impl OrchestrationMode {
             }
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolCallValidation {
-    Valid,
-    Repairable(String),
-    Rejected(String),
-}
-
-/// Validate freshly generated tool calls before any approval or execution.
-pub fn validate_tool_call(call: &mut ModelToolCall) -> ToolCallValidation {
-    if call.arguments.len() > DEFAULT_MAX_TOOL_ARGUMENT_BYTES {
-        return ToolCallValidation::Rejected(format!(
-            "工具参数超过 {} 字节限制",
-            DEFAULT_MAX_TOOL_ARGUMENT_BYTES
-        ));
-    }
-    let parsed = match serde_json::from_str::<Value>(&call.arguments) {
-        Ok(Value::Object(object)) => Value::Object(object),
-        Ok(_) => {
-            call.arguments = "{}".into();
-            return ToolCallValidation::Repairable("工具参数不是 JSON 对象，已替换为空对象".into());
-        }
-        Err(_) => {
-            call.arguments = "{}".into();
-            return ToolCallValidation::Repairable("工具参数 JSON 损坏，已替换为空对象".into());
-        }
-    };
-    if matches!(
-        call.name.trim().to_ascii_lowercase().as_str(),
-        "exec" | "execute"
-    ) {
-        let command = parsed.get("command").and_then(Value::as_str).unwrap_or("");
-        if command.len() > DEFAULT_MAX_SHELL_COMMAND_BYTES {
-            return ToolCallValidation::Rejected(format!(
-                "Shell 命令超过 {} 字节限制；应先写入文件再执行短命令",
-                DEFAULT_MAX_SHELL_COMMAND_BYTES
-            ));
-        }
-    }
-    ToolCallValidation::Valid
 }
 
 pub fn is_transient_model_error(error: &anyhow::Error) -> bool {
@@ -167,19 +121,6 @@ pub fn user_context_supplement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn repairs_non_object_arguments() {
-        let mut call = ModelToolCall {
-            id: "1".into(),
-            name: "nmap".into(),
-            arguments: "[]".into(),
-        };
-        assert!(matches!(
-            validate_tool_call(&mut call),
-            ToolCallValidation::Repairable(_)
-        ));
-        assert_eq!(call.arguments, "{}");
-    }
     #[test]
     fn classifies_retryable_errors() {
         assert!(is_transient_model_error(&anyhow::anyhow!(
