@@ -19,6 +19,9 @@ use super::{
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
 };
+use kairos_platform_pent_runtime::ports::{
+    AgentSession, AgentSessionFactory, AgentSpawnRequest, RuntimeAgentStatus, RuntimeSubAgent,
+};
 
 const SUB_AGENT_MAX_TOOL_ROUNDS: usize = 12;
 const SUB_AGENT_MAX_REQUESTS: usize = 80;
@@ -232,6 +235,134 @@ impl AgentManager {
                 agent.completed_at = Some(Utc::now().to_rfc3339());
             }
         }
+    }
+}
+
+pub struct ServerAgentSessionFactory {
+    repository: Arc<dyn ConversationRepository>,
+    gateway: Arc<dyn ConversationModelGateway>,
+    context_source: Arc<dyn ConversationContextSource>,
+    knowledge_source: Arc<dyn ConversationKnowledgeSource>,
+    tool_executor: Arc<dyn ConversationToolExecutor>,
+    events: Arc<dyn ConversationEventSink>,
+    intent_detector: Arc<dyn ConversationIntentDetector>,
+    pool: kairos_platform_framework_database::PgPool,
+}
+
+impl ServerAgentSessionFactory {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repository: Arc<dyn ConversationRepository>,
+        gateway: Arc<dyn ConversationModelGateway>,
+        context_source: Arc<dyn ConversationContextSource>,
+        knowledge_source: Arc<dyn ConversationKnowledgeSource>,
+        tool_executor: Arc<dyn ConversationToolExecutor>,
+        events: Arc<dyn ConversationEventSink>,
+        intent_detector: Arc<dyn ConversationIntentDetector>,
+        pool: kairos_platform_framework_database::PgPool,
+    ) -> Self {
+        Self {
+            repository,
+            gateway,
+            context_source,
+            knowledge_source,
+            tool_executor,
+            events,
+            intent_detector,
+            pool,
+        }
+    }
+}
+
+impl AgentSessionFactory for ServerAgentSessionFactory {
+    fn create(&self, max_concurrent: usize) -> Arc<dyn AgentSession> {
+        Arc::new(ServerAgentSession {
+            manager: AgentManager::new(max_concurrent),
+            repository: self.repository.clone(),
+            gateway: self.gateway.clone(),
+            context_source: self.context_source.clone(),
+            knowledge_source: self.knowledge_source.clone(),
+            tool_executor: self.tool_executor.clone(),
+            events: self.events.clone(),
+            intent_detector: self.intent_detector.clone(),
+            pool: self.pool.clone(),
+        })
+    }
+}
+
+struct ServerAgentSession {
+    manager: AgentManager,
+    repository: Arc<dyn ConversationRepository>,
+    gateway: Arc<dyn ConversationModelGateway>,
+    context_source: Arc<dyn ConversationContextSource>,
+    knowledge_source: Arc<dyn ConversationKnowledgeSource>,
+    tool_executor: Arc<dyn ConversationToolExecutor>,
+    events: Arc<dyn ConversationEventSink>,
+    intent_detector: Arc<dyn ConversationIntentDetector>,
+    pool: kairos_platform_framework_database::PgPool,
+}
+
+#[async_trait::async_trait]
+impl AgentSession for ServerAgentSession {
+    async fn active_count(&self) -> usize {
+        self.manager.active_count().await
+    }
+
+    async fn spawn(&self, request: AgentSpawnRequest) -> anyhow::Result<String> {
+        self.manager
+            .spawn(
+                request.description,
+                request.prompt,
+                request.session_id,
+                request.parent_run_id,
+                request.target,
+                self.repository.clone(),
+                self.gateway.clone(),
+                self.context_source.clone(),
+                self.knowledge_source.clone(),
+                self.tool_executor.clone(),
+                self.events.clone(),
+                self.intent_detector.clone(),
+                self.pool.clone(),
+            )
+            .await
+    }
+
+    async fn status(&self, agent_id: &str) -> Option<RuntimeSubAgent> {
+        self.manager.status(agent_id).await.map(runtime_sub_agent)
+    }
+
+    async fn collect(&self, agent_id: &str) -> Option<String> {
+        self.manager.collect(agent_id).await
+    }
+
+    async fn list(&self) -> Vec<RuntimeSubAgent> {
+        self.manager
+            .list()
+            .await
+            .into_iter()
+            .map(runtime_sub_agent)
+            .collect()
+    }
+
+    async fn abort_all(&self) {
+        self.manager.abort_all().await;
+    }
+}
+
+fn runtime_sub_agent(agent: SubAgent) -> RuntimeSubAgent {
+    RuntimeSubAgent {
+        agent_id: agent.agent_id,
+        description: agent.description,
+        status: match agent.status {
+            AgentStatus::Running => RuntimeAgentStatus::Running,
+            AgentStatus::Completed => RuntimeAgentStatus::Completed,
+            AgentStatus::Failed => RuntimeAgentStatus::Failed,
+        },
+        result: agent.result,
+        error: agent.error,
+        started_at: agent.started_at,
+        completed_at: agent.completed_at,
     }
 }
 

@@ -79,6 +79,48 @@ pub trait ConversationToolExecutor: Send + Sync {
     ) -> RuntimeToolResult;
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentSpawnRequest {
+    pub description: String,
+    pub prompt: String,
+    pub session_id: String,
+    pub parent_run_id: String,
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAgentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuntimeSubAgent {
+    pub agent_id: String,
+    pub description: String,
+    pub status: RuntimeAgentStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
+pub trait AgentSessionFactory: Send + Sync {
+    fn create(&self, max_concurrent: usize) -> std::sync::Arc<dyn AgentSession>;
+}
+
+#[async_trait]
+pub trait AgentSession: Send + Sync {
+    async fn active_count(&self) -> usize;
+    async fn spawn(&self, request: AgentSpawnRequest) -> anyhow::Result<String>;
+    async fn status(&self, agent_id: &str) -> Option<RuntimeSubAgent>;
+    async fn collect(&self, agent_id: &str) -> Option<String>;
+    async fn list(&self) -> Vec<RuntimeSubAgent>;
+    async fn abort_all(&self);
+}
+
 #[async_trait]
 pub trait ConversationRepository: Send + Sync {
     async fn begin_turn(
@@ -241,6 +283,41 @@ pub trait ConversationEventSink: Send + Sync {
 mod tests {
     use super::*;
 
+    struct StubAgentSession;
+
+    #[async_trait]
+    impl AgentSession for StubAgentSession {
+        async fn active_count(&self) -> usize {
+            0
+        }
+
+        async fn spawn(&self, _request: AgentSpawnRequest) -> anyhow::Result<String> {
+            Ok("sub-test".into())
+        }
+
+        async fn status(&self, _agent_id: &str) -> Option<RuntimeSubAgent> {
+            None
+        }
+
+        async fn collect(&self, _agent_id: &str) -> Option<String> {
+            None
+        }
+
+        async fn list(&self) -> Vec<RuntimeSubAgent> {
+            Vec::new()
+        }
+
+        async fn abort_all(&self) {}
+    }
+
+    struct StubAgentSessionFactory;
+
+    impl AgentSessionFactory for StubAgentSessionFactory {
+        fn create(&self, _max_concurrent: usize) -> std::sync::Arc<dyn AgentSession> {
+            std::sync::Arc::new(StubAgentSession)
+        }
+    }
+
     struct StubToolExecutor;
 
     #[async_trait]
@@ -263,5 +340,13 @@ mod tests {
     fn conversation_tool_executor_is_object_safe() {
         let executor = StubToolExecutor;
         let _: &dyn ConversationToolExecutor = &executor;
+    }
+
+    #[test]
+    fn agent_session_ports_are_object_safe() {
+        let factory = StubAgentSessionFactory;
+        let _: &dyn AgentSessionFactory = &factory;
+        let session = factory.create(2);
+        let _: &dyn AgentSession = session.as_ref();
     }
 }

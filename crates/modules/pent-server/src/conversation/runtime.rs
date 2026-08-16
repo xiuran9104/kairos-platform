@@ -11,9 +11,10 @@ use super::rmos::{
     injector::{build_injected_context, prepare_injection},
 };
 use super::{
-    ConversationContextSource, ConversationEventSink, ConversationInstructionSink,
-    ConversationIntentDetector, ConversationKnowledgeSource, ConversationModelGateway,
-    ConversationRepository, ConversationToolExecutor, ModelTurnOutput, RuntimeToolCall,
+    AgentSession, AgentSessionFactory, AgentSpawnRequest, ConversationContextSource,
+    ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
+    ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
+    ConversationToolExecutor, ModelTurnOutput, RuntimeAgentStatus, RuntimeToolCall,
     ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
@@ -159,6 +160,7 @@ pub struct ConversationRuntime {
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     instruction_sink: Arc<dyn ConversationInstructionSink>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
+    agent_sessions: Arc<dyn AgentSessionFactory>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
     pool: kairos_platform_framework_database::PgPool,
@@ -173,6 +175,7 @@ impl ConversationRuntime {
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         instruction_sink: Arc<dyn ConversationInstructionSink>,
         tool_executor: Arc<dyn ConversationToolExecutor>,
+        agent_sessions: Arc<dyn AgentSessionFactory>,
         events: Arc<dyn ConversationEventSink>,
         pool: kairos_platform_framework_database::PgPool,
     ) -> Self {
@@ -184,6 +187,7 @@ impl ConversationRuntime {
             knowledge_source,
             instruction_sink,
             tool_executor,
+            agent_sessions,
             events,
             nats: None,
             pool,
@@ -499,12 +503,12 @@ impl ConversationRuntime {
             .unwrap_or_default();
         let scan_goal = format!("{user_input}\n{}", context.objective_snapshot);
         let mut scan_progress = super::scan_progress::ScanProgress::new(&scan_goal);
-        let agent_manager = std::sync::Arc::new(super::agent_manager::AgentManager::new(
+        let agent_session = self.agent_sessions.create(
             std::env::var("PENTA_MAX_AGENTS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4),
-        ));
+        );
         let orchestration =
             super::agent_pipeline::OrchestrationMode::from_policy(&context.policy_snapshot);
         let orchestration_instruction =
@@ -898,7 +902,7 @@ impl ConversationRuntime {
                     }
                     if is_inline_tool(&tc.name) {
                         let result = self
-                            .execute_fast_tool(tc, session_id, &context, &agent_manager)
+                            .execute_fast_tool(tc, session_id, &context, &agent_session)
                             .await;
                         fast_results.push((
                             i,
@@ -1426,7 +1430,7 @@ impl ConversationRuntime {
         };
 
         // Clean up any still-running sub-agents before returning
-        agent_manager.abort_all().await;
+        agent_session.abort_all().await;
 
         Ok(final_content)
     }
@@ -1437,7 +1441,7 @@ impl ConversationRuntime {
         tc: &super::ports::ModelToolCall,
         session_id: &str,
         context: &ConversationContext,
-        agent_manager: &std::sync::Arc<super::agent_manager::AgentManager>,
+        agent_session: &std::sync::Arc<dyn AgentSession>,
     ) -> super::tool_executor::ConversationToolResult {
         match tc.name.as_str() {
             "knowledge_search" => {
@@ -1469,18 +1473,18 @@ impl ConversationRuntime {
                 }
             }
             "agent_spawn" => {
-                self.execute_agent_spawn(&tc.id, &tc.arguments, session_id, context, agent_manager)
+                self.execute_agent_spawn(&tc.id, &tc.arguments, session_id, context, agent_session)
                     .await
             }
             "agent_status" => {
-                self.execute_agent_status(&tc.id, &tc.arguments, agent_manager)
+                self.execute_agent_status(&tc.id, &tc.arguments, agent_session)
                     .await
             }
             "agent_collect" => {
-                self.execute_agent_collect(&tc.id, &tc.arguments, agent_manager)
+                self.execute_agent_collect(&tc.id, &tc.arguments, agent_session)
                     .await
             }
-            "agent_list" => self.execute_agent_list(&tc.id, agent_manager).await,
+            "agent_list" => self.execute_agent_list(&tc.id, agent_session).await,
             "plan_create" | "plan_get" | "plan_update" => {
                 let content = match context.run_id.as_deref() {
                     Some(run_id) => {
@@ -1812,7 +1816,7 @@ impl ConversationRuntime {
         arguments: &str,
         session_id: &str,
         context: &ConversationContext,
-        agent_manager: &std::sync::Arc<super::agent_manager::AgentManager>,
+        agent_session: &std::sync::Arc<dyn AgentSession>,
     ) -> super::tool_executor::ConversationToolResult {
         let args: serde_json::Value = match serde_json::from_str(arguments) {
             Ok(v) => v,
@@ -1859,7 +1863,7 @@ impl ConversationRuntime {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
 
-        let active = agent_manager.active_count().await;
+        let active = agent_session.active_count().await;
         let max_concurrent = std::env::var("PENTA_MAX_AGENTS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1878,22 +1882,14 @@ impl ConversationRuntime {
             };
         }
 
-        match agent_manager
-            .spawn(
-                description.clone(),
-                prompt.clone(),
-                session_id.to_string(),
-                context.run_id.clone().unwrap_or_else(|| "unknown".into()),
+        match agent_session
+            .spawn(AgentSpawnRequest {
+                description: description.clone(),
+                prompt: prompt.clone(),
+                session_id: session_id.to_string(),
+                parent_run_id: context.run_id.clone().unwrap_or_else(|| "unknown".into()),
                 target,
-                self.repository.clone(),
-                self.model_gateway.clone(),
-                self.context_source.clone(),
-                self.knowledge_source.clone(),
-                self.tool_executor.clone(),
-                self.events.clone(),
-                self.intent_detector.clone(),
-                self.pool.clone(),
-            )
+            })
             .await
         {
             Ok(agent_id) => super::tool_executor::ConversationToolResult {
@@ -1923,7 +1919,7 @@ impl ConversationRuntime {
         &self,
         tool_call_id: &str,
         arguments: &str,
-        agent_manager: &std::sync::Arc<super::agent_manager::AgentManager>,
+        agent_session: &std::sync::Arc<dyn AgentSession>,
     ) -> super::tool_executor::ConversationToolResult {
         let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
         let agent_id = args
@@ -1940,7 +1936,7 @@ impl ConversationRuntime {
             };
         }
 
-        match agent_manager.status(agent_id).await {
+        match agent_session.status(agent_id).await {
             Some(agent) => super::tool_executor::ConversationToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 tool_name: "agent_status".into(),
@@ -1961,7 +1957,7 @@ impl ConversationRuntime {
         &self,
         tool_call_id: &str,
         arguments: &str,
-        agent_manager: &std::sync::Arc<super::agent_manager::AgentManager>,
+        agent_session: &std::sync::Arc<dyn AgentSession>,
     ) -> super::tool_executor::ConversationToolResult {
         let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
         let agent_id = args
@@ -1979,7 +1975,7 @@ impl ConversationRuntime {
         }
 
         // Check if agent exists
-        if agent_manager.status(agent_id).await.is_none() {
+        if agent_session.status(agent_id).await.is_none() {
             return super::tool_executor::ConversationToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 tool_name: "agent_collect".into(),
@@ -1989,7 +1985,7 @@ impl ConversationRuntime {
             };
         }
 
-        match agent_manager.collect(agent_id).await {
+        match agent_session.collect(agent_id).await {
             Some(result) => super::tool_executor::ConversationToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 tool_name: "agent_collect".into(),
@@ -2016,16 +2012,16 @@ impl ConversationRuntime {
     async fn execute_agent_list(
         &self,
         tool_call_id: &str,
-        agent_manager: &std::sync::Arc<super::agent_manager::AgentManager>,
+        agent_session: &std::sync::Arc<dyn AgentSession>,
     ) -> super::tool_executor::ConversationToolResult {
-        let agents = agent_manager.list().await;
+        let agents = agent_session.list().await;
         super::tool_executor::ConversationToolResult {
             tool_call_id: tool_call_id.to_string(),
             tool_name: "agent_list".into(),
             content: serde_json::json!({
                 "agents": agents,
                 "count": agents.len(),
-                "active": agents.iter().filter(|a| a.status == super::agent_manager::AgentStatus::Running).count(),
+                "active": agents.iter().filter(|a| a.status == RuntimeAgentStatus::Running).count(),
             })
             .to_string(),
             success: true,

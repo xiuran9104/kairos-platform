@@ -23,15 +23,42 @@ pub(crate) fn build_runtime(
     pool: &kairos_platform_framework_database::PgPool,
     nats: Option<crate::transport::mq::NatsHandle>,
 ) -> ConversationRuntime {
+    let repository: Arc<dyn ConversationRepository> =
+        Arc::new(PgConversationRepository::new(pool.clone()));
+    let context_source: Arc<dyn ConversationContextSource> =
+        Arc::new(PgContextSource::new(pool.clone()));
+    let intent_detector: Arc<dyn ConversationIntentDetector> =
+        Arc::new(DeterministicIntentDetector);
+    let model_gateway: Arc<dyn ConversationModelGateway> =
+        Arc::new(AiModelGateway::new(pool.clone()));
+    let knowledge_source: Arc<dyn ConversationKnowledgeSource> =
+        Arc::new(MemoryAdapter::new(pool.clone()));
+    let instruction_sink: Arc<dyn ConversationInstructionSink> =
+        Arc::new(InstructionSink::new(pool.clone()));
+    let tool_executor: Arc<dyn ConversationToolExecutor> =
+        Arc::new(tool_executor::ServerConversationToolExecutor);
+    let events: Arc<dyn ConversationEventSink> = Arc::new(LoggingConversationEventSink);
+    let agent_sessions: Arc<dyn AgentSessionFactory> =
+        Arc::new(agent_manager::ServerAgentSessionFactory::new(
+            repository.clone(),
+            model_gateway.clone(),
+            context_source.clone(),
+            knowledge_source.clone(),
+            tool_executor.clone(),
+            events.clone(),
+            intent_detector.clone(),
+            pool.clone(),
+        ));
     let rt = ConversationRuntime::new(
-        Arc::new(PgConversationRepository::new(pool.clone())),
-        Arc::new(PgContextSource::new(pool.clone())),
-        Arc::new(DeterministicIntentDetector),
-        Arc::new(AiModelGateway::new(pool.clone())),
-        Arc::new(MemoryAdapter::new(pool.clone())),
-        Arc::new(InstructionSink::new(pool.clone())),
-        Arc::new(tool_executor::ServerConversationToolExecutor),
-        Arc::new(LoggingConversationEventSink),
+        repository,
+        context_source,
+        intent_detector,
+        model_gateway,
+        knowledge_source,
+        instruction_sink,
+        tool_executor,
+        agent_sessions,
+        events,
         pool.clone(),
     );
     if let Some(n) = nats {
