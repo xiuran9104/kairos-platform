@@ -17,9 +17,8 @@ use super::{
     ConversationToolExecutor, FindingRecorder, RuntimeToolCall, SkillStore, ToolApprovalGate,
     ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
 };
-use kairos_platform_pent_runtime::agent_loop::{
-    AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
-};
+use kairos_platform_pent_runtime::agent_loop::{AgentDirective, AgentLoopLimits, AgentLoopStop};
+use kairos_platform_pent_runtime::orchestrator::AgentOrchestrator;
 use kairos_platform_pent_runtime::ports::{
     AgentSession, AgentSessionFactory, AgentSpawnRequest, RuntimeAgentStatus, RuntimeSubAgent,
 };
@@ -499,7 +498,7 @@ async fn execute_sub_agent(
         max_tokens: u64::MAX,
         stall_limit: Some(SUB_AGENT_STALL_LIMIT),
     };
-    let mut loop_engine = AgentLoopEngine::new(budget);
+    let mut orchestrator = AgentOrchestrator::new(budget, 1);
     let mut context = context;
     context.run_id = Some(run_id.clone());
 
@@ -522,19 +521,19 @@ async fn execute_sub_agent(
              - 子代理预算有限（{} 轮），请高效执行\n\n\
              **工具选择**：优先用专项工具（nuclei/sqlmap/dalfox/dir_fuzz/ffuf/js_analyze/browser MCP），\
              curl/http_request 仅用于特殊测试。先探测后攻击，工具失败就换工具不要重试。",
-            loop_engine.limits().max_rounds
+            orchestrator.limits().max_rounds
         ),
         format: "text".into(),
     });
 
     let mut final_output: Option<String> = None;
-    for round in loop_engine.next_round()..loop_engine.limits().max_rounds {
-        if let Err(reason) = loop_engine.begin_round(round) {
-            let state = loop_engine.checkpoint();
+    for round in orchestrator.next_round()..orchestrator.limits().max_rounds {
+        if let Err(reason) = orchestrator.begin_round(round) {
+            let state = orchestrator.checkpoint();
             final_output = Some(match reason {
                 AgentLoopStop::Requests => format!(
                     "子代理请求数耗尽（{}），未完成子任务",
-                    loop_engine.limits().max_requests
+                    orchestrator.limits().max_requests
                 ),
                 AgentLoopStop::Stalled => format!(
                     "子代理连续 {} 次工具失败，判定为阻塞",
@@ -552,7 +551,11 @@ async fn execute_sub_agent(
                 return Err(anyhow::anyhow!("子代理模型调用失败: {e}"));
             }
         };
-        loop_engine.record_model_usage(output.usage.input_tokens, output.usage.output_tokens);
+        orchestrator.record_model_output(
+            output.usage.input_tokens,
+            output.usage.output_tokens,
+            false,
+        );
 
         if !output.tool_calls.is_empty() {
             let mut hitl_rejections = std::collections::HashMap::new();
@@ -632,7 +635,7 @@ async fn execute_sub_agent(
             )> = Vec::new();
 
             for (i, tc) in output.tool_calls.iter().enumerate() {
-                if loop_engine.start_request().is_err() {
+                if orchestrator.start_request().is_err() {
                     break;
                 }
 
@@ -756,7 +759,7 @@ async fn execute_sub_agent(
             // Process all results
             for (_idx, result, call_id, tool_name) in &fast_results {
                 let effective = has_effective_observation(tool_name, &result.content);
-                loop_engine.record_tool_result(result.success, effective);
+                orchestrator.record_tool_result(result.success, effective);
 
                 let compact = if result.content.chars().count() > 4000 {
                     format!(
@@ -782,8 +785,8 @@ async fn execute_sub_agent(
 
         // ── No tool calls — parse lifecycle action ──
         let content = output.content.trim();
-        let directive = parse_agent_directive(content);
-        let loop_checkpoint = loop_engine.checkpoint();
+        let directive = orchestrator.directive(content);
+        let loop_checkpoint = orchestrator.checkpoint();
 
         match directive {
             AgentDirective::Final(text) => {
@@ -810,6 +813,7 @@ async fn execute_sub_agent(
                     continue;
                 }
                 final_output = Some(text);
+                orchestrator.finish();
                 break;
             }
             AgentDirective::Replan(reason) => {
@@ -838,10 +842,12 @@ async fn execute_sub_agent(
                     continue;
                 }
                 final_output = Some(format!("NO_PATH: {reason}"));
+                orchestrator.finish();
                 break;
             }
             AgentDirective::AskUser(question) => {
                 final_output = Some(format!("ASK_USER: {question}"));
+                orchestrator.finish();
                 break;
             }
             AgentDirective::Candidate(text) => {
@@ -849,6 +855,7 @@ async fn execute_sub_agent(
                     && loop_checkpoint.effective_observations > 0
                 {
                     final_output = Some(text);
+                    orchestrator.finish();
                 } else {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("sub_no_tools:{}", agent_id),
@@ -863,12 +870,12 @@ async fn execute_sub_agent(
         }
     }
 
-    let loop_checkpoint = loop_engine.checkpoint();
+    let loop_checkpoint = orchestrator.checkpoint();
     let result = final_output.unwrap_or_else(|| {
         format!(
             "子代理 {}: {} 轮 {} 次请求后未生成结论（工具调用 {} 次，有效观察 {} 次）",
             description,
-            loop_engine.limits().max_rounds,
+            orchestrator.limits().max_rounds,
             loop_checkpoint.request_count,
             loop_checkpoint.tool_call_count,
             loop_checkpoint.effective_observations

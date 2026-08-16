@@ -19,8 +19,9 @@ use super::{
     ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
-    AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
+    AgentDirective, AgentLoopCheckpoint, AgentLoopLimits, parse_agent_directive,
 };
+use kairos_platform_pent_runtime::orchestrator::{AgentOrchestrator, ModelAttemptOutcome};
 
 /// Maximum tool-calling rounds before forcing a stop.
 /// PentAGI CLI uses 3 hours default runtime; the conversation agent
@@ -479,7 +480,12 @@ impl ConversationRuntime {
         // Per-turn budget counts actual model API usage below. Historical
         // messages are windowed by the model gateway and are already included
         // in each provider-reported input_tokens value.
-        let mut loop_engine = AgentLoopEngine::from_checkpoint(
+        let max_consecutive_model_errors = std::env::var("PENTA_MAX_CONSECUTIVE_MODEL_ERRORS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_CONSECUTIVE_MODEL_ERRORS)
+            .clamp(1, 5);
+        let mut orchestrator = AgentOrchestrator::from_checkpoint(
             budget.loop_limits(),
             AgentLoopCheckpoint {
                 next_round: start_round,
@@ -497,17 +503,10 @@ impl ConversationRuntime {
                     .unwrap_or(0) as usize,
                 ..Default::default()
             },
+            max_consecutive_model_errors,
         );
-        let mut stopped_by_budget: Option<&'static str> = None;
-        let mut finished_normally = false;
         let mut evidence_ids = Vec::new();
         let mut run_summary = context.run_summary.clone();
-        let max_consecutive_model_errors = std::env::var("PENTA_MAX_CONSECUTIVE_MODEL_ERRORS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MAX_CONSECUTIVE_MODEL_ERRORS)
-            .clamp(1, 5);
-        let mut consecutive_model_errors = 0;
         let mut stall_terminal_prompted = false;
 
         let user_input = context
@@ -592,9 +591,8 @@ impl ConversationRuntime {
             });
         }
 
-        for round in loop_engine.next_round()..loop_engine.limits().max_rounds {
-            if let Err(reason) = loop_engine.begin_round(round) {
-                stopped_by_budget = Some(reason.as_str());
+        for round in orchestrator.next_round()..orchestrator.limits().max_rounds {
+            if orchestrator.begin_round(round).is_err() {
                 break;
             }
 
@@ -619,46 +617,59 @@ impl ConversationRuntime {
             let mut output = match self.model_gateway.generate(&context, intent).await {
                 Ok(output) => output,
                 Err(error) => {
-                    consecutive_model_errors += 1;
                     let transient = super::agent_pipeline::is_transient_model_error(&error);
-                    if transient && consecutive_model_errors < max_consecutive_model_errors {
-                        tracing::warn!(
-                            error = %error,
-                            attempt = consecutive_model_errors,
-                            max_attempts = max_consecutive_model_errors,
-                            "model call failed inside agent loop; retrying"
-                        );
-                        context.recent_messages.push(AgentMessage {
-                            message_id: format!("runtime_model_error:round_{round}"),
-                            role: "user".into(),
-                            content: format!(
-                                "运行时报告：上一次模型调用发生临时错误（{}）。\
-                                 请保持当前目标和已有 Evidence，继续执行；不要重复已经失败的策略。",
-                                compact_runtime_error(&error.to_string())
-                            ),
-                            format: "text".into(),
-                        });
-                        let backoff = (500_u64
-                            .saturating_mul(1_u64 << consecutive_model_errors.saturating_sub(1)))
-                        .min(30_000);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                        continue;
+                    match orchestrator.record_model_error(transient) {
+                        ModelAttemptOutcome::Retry {
+                            attempt,
+                            backoff_ms,
+                        } => {
+                            tracing::warn!(
+                                error = %error,
+                                attempt,
+                                max_attempts = orchestrator.max_consecutive_model_errors(),
+                                "model call failed inside agent loop; retrying"
+                            );
+                            context.recent_messages.push(AgentMessage {
+                                message_id: format!("runtime_model_error:round_{round}"),
+                                role: "user".into(),
+                                content: format!(
+                                    "运行时报告：上一次模型调用发生临时错误（{}）。\
+                                     请保持当前目标和已有 Evidence，继续执行；不要重复已经失败的策略。",
+                                    compact_runtime_error(&error.to_string())
+                                ),
+                                format: "text".into(),
+                            });
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        }
+                        ModelAttemptOutcome::Exhausted { attempts } => {
+                            self.repository
+                                .fail_turn(
+                                    turn_id,
+                                    "MODEL_UNAVAILABLE",
+                                    &error.to_string(),
+                                    transient,
+                                )
+                                .await?;
+                            return Err(anyhow::anyhow!("模型调用连续失败 {attempts} 次: {error}"));
+                        }
+                        ModelAttemptOutcome::Accepted => unreachable!(),
                     }
-                    self.repository
-                        .fail_turn(turn_id, "MODEL_UNAVAILABLE", &error.to_string(), transient)
-                        .await?;
-                    return Err(anyhow::anyhow!(
-                        "模型调用连续失败 {consecutive_model_errors} 次: {error}"
-                    ));
                 }
             };
-            loop_engine.record_model_usage(output.usage.input_tokens, output.usage.output_tokens);
 
             // An empty completion is recoverable: keep the agent loop alive and
             // explicitly ask the next model attempt to resume from its context.
-            if output.tool_calls.is_empty() && output.content.trim().is_empty() {
-                consecutive_model_errors += 1;
-                if consecutive_model_errors < max_consecutive_model_errors {
+            let empty_output = output.tool_calls.is_empty() && output.content.trim().is_empty();
+            match orchestrator.record_model_output(
+                output.usage.input_tokens,
+                output.usage.output_tokens,
+                empty_output,
+            ) {
+                ModelAttemptOutcome::Retry {
+                    attempt: _,
+                    backoff_ms,
+                } => {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("runtime_empty_model_response:round_{round}"),
                         role: "user".into(),
@@ -668,25 +679,22 @@ impl ConversationRuntime {
                             .into(),
                         format: "text".into(),
                     });
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        250 * consecutive_model_errors as u64,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
-                self.repository
-                    .fail_turn(
-                        turn_id,
-                        "MODEL_EMPTY_RESPONSE",
-                        &format!("模型连续 {consecutive_model_errors} 次返回了空内容"),
-                        true,
-                    )
-                    .await?;
-                return Err(anyhow::anyhow!(
-                    "模型连续 {consecutive_model_errors} 次返回了空内容"
-                ));
+                ModelAttemptOutcome::Exhausted { attempts } => {
+                    self.repository
+                        .fail_turn(
+                            turn_id,
+                            "MODEL_EMPTY_RESPONSE",
+                            &format!("模型连续 {attempts} 次返回了空内容"),
+                            true,
+                        )
+                        .await?;
+                    return Err(anyhow::anyhow!("模型连续 {attempts} 次返回了空内容"));
+                }
+                ModelAttemptOutcome::Accepted => {}
             }
-            consecutive_model_errors = 0;
 
             if !output.tool_calls.is_empty() {
                 // Every tool path, including inline tools and agent_spawn, crosses
@@ -887,8 +895,7 @@ impl ConversationRuntime {
                 )> = Vec::new();
 
                 for (i, tc) in output.tool_calls.iter().enumerate() {
-                    if let Err(reason) = loop_engine.start_request() {
-                        stopped_by_budget = Some(reason.as_str());
+                    if orchestrator.start_request().is_err() {
                         break;
                     }
                     let tool_started = std::time::Instant::now();
@@ -1078,7 +1085,7 @@ impl ConversationRuntime {
 
                     let effective_observation =
                         result.success && has_effective_observation(tool_name, &result.content);
-                    loop_engine.record_tool_result(result.success, effective_observation);
+                    orchestrator.record_tool_result(result.success, effective_observation);
                     if let Some(diagnostic) = scan_progress.record_tool_result(
                         tool_name,
                         result.success,
@@ -1161,11 +1168,11 @@ impl ConversationRuntime {
                         format: "tool_result".into(),
                     });
                 }
-                if stopped_by_budget.is_some() {
+                if orchestrator.stop_reason().is_some() {
                     break;
                 }
                 context.run_summary = run_summary.clone();
-                let loop_checkpoint = loop_engine.checkpoint();
+                let loop_checkpoint = orchestrator.checkpoint();
                 context.policy_snapshot["_checkpoint"] = serde_json::json!({
                     "round": loop_checkpoint.next_round,
                     "request_count": loop_checkpoint.request_count,
@@ -1233,7 +1240,7 @@ impl ConversationRuntime {
             // A tool-free response must declare, or be treated as, a lifecycle
             // action. The runtime validates the action against actual progress
             // and Evidence rather than forcing a fixed pentest phase template.
-            match parse_agent_directive(&output.content) {
+            match orchestrator.directive(&output.content) {
                 AgentDirective::Replan(reason) => {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("assistant_replan:round_{round}"),
@@ -1362,19 +1369,22 @@ impl ConversationRuntime {
                 }
             }
             final_output = Some(output);
-            finished_normally = true;
+            orchestrator.finish();
             break;
         }
 
-        if !finished_normally {
-            let stop_reason = stopped_by_budget.unwrap_or("rounds");
-            let loop_checkpoint = loop_engine.checkpoint();
+        if !orchestrator.finished_normally() {
+            let stop_reason = orchestrator
+                .stop_reason()
+                .map(|reason| reason.as_str())
+                .unwrap_or("rounds");
+            let loop_checkpoint = orchestrator.checkpoint();
             context.recent_messages.push(AgentMessage {
                 message_id: "runtime_budget_finalization".into(),
                 role: "user".into(),
                 content: budget_finalization_prompt(
                     stop_reason,
-                    loop_engine.rounds_used(),
+                    orchestrator.rounds_used(),
                     loop_checkpoint.request_count,
                     loop_checkpoint.token_count,
                     &run_summary,
@@ -1412,7 +1422,7 @@ impl ConversationRuntime {
             }
         }
         let output = final_output.ok_or_else(|| anyhow::anyhow!("模型未返回有效响应"))?;
-        let loop_checkpoint = loop_engine.checkpoint();
+        let loop_checkpoint = orchestrator.checkpoint();
 
         let final_content = if context.run_id.is_some() {
             let report = if output.content.trim().is_empty() {
