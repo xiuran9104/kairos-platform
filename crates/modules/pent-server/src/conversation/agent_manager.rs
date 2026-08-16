@@ -11,11 +11,12 @@ use tokio::sync::Mutex;
 use chrono::Utc;
 use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessageType};
 
+use super::tool_execution_coordinator::ToolExecutionCoordinator;
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
-    ConversationToolExecutor, FindingRecorder, RuntimeToolCall, SkillStore, ToolApprovalGate,
-    ToolExecutionContext,
+    ConversationToolExecutor, FindingRecorder, InlineToolExecutor, RuntimeToolCall,
+    RuntimeToolResult, SkillStore, ToolApprovalGate, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{AgentDirective, AgentLoopLimits, AgentLoopStop};
 use kairos_platform_pent_runtime::orchestrator::AgentOrchestrator;
@@ -435,6 +436,67 @@ async fn execute_sub_agent_inline_tool(
     }
 }
 
+struct SubAgentInlineToolExecutor<'a> {
+    run_id: &'a str,
+    repository: &'a Arc<dyn ConversationRepository>,
+    knowledge_source: &'a Arc<dyn ConversationKnowledgeSource>,
+    finding_recorder: &'a Arc<dyn FindingRecorder>,
+    skill_store: &'a Arc<dyn SkillStore>,
+}
+
+#[async_trait::async_trait]
+impl InlineToolExecutor for SubAgentInlineToolExecutor<'_> {
+    fn supports(&self, tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "knowledge_search"
+                | "evidence_list"
+                | "evidence_search"
+                | "evidence_view"
+                | "skill_list"
+                | "skill_load"
+                | "record_finding"
+                | "agent_spawn"
+                | "agent_status"
+                | "agent_collect"
+                | "agent_list"
+        )
+    }
+
+    async fn execute(
+        &self,
+        call: &RuntimeToolCall,
+        _context: &ToolExecutionContext,
+    ) -> RuntimeToolResult {
+        if matches!(
+            call.name.as_str(),
+            "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
+        ) {
+            return RuntimeToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: serde_json::json!({
+                    "error": "子代理不允许调用智能体管理工具",
+                    "blocked": true
+                })
+                .to_string(),
+                success: false,
+            };
+        }
+        execute_sub_agent_inline_tool(
+            &call.id,
+            &call.name,
+            &call.arguments,
+            self.run_id,
+            self.repository,
+            self.knowledge_source,
+            self.finding_recorder,
+            self.skill_store,
+        )
+        .await
+    }
+}
+
 /// Execute a sub-agent's autonomous tool loop independently.
 /// Reuses the parent's Run for evidence isolation, supports parallel tool execution.
 async fn execute_sub_agent(
@@ -598,150 +660,50 @@ async fn execute_sub_agent(
                 format: "tool_calls".into(),
             });
 
-            // ── Parallel tool execution (fast/slow split) ──
-            let mut fast_results: Vec<(
-                usize,
-                super::tool_executor::ConversationToolResult,
-                String,
-                String,
-            )> = Vec::new();
-            let mut slow_spawns: Vec<(
-                usize,
-                String,
-                String,
-                String,
-                tokio::task::JoinHandle<(
-                    String,
-                    String,
-                    super::tool_executor::ConversationToolResult,
-                    u64,
-                )>,
-            )> = Vec::new();
-
-            for (i, tc) in output.tool_calls.iter().enumerate() {
-                if orchestrator.start_request().is_err() {
-                    break;
-                }
-
-                if let Some(reason) = dispatch_plan.blocked_reason(&tc.id) {
-                    fast_results.push((
-                        i,
-                        super::tool_executor::ConversationToolResult {
-                            tool_call_id: tc.id.clone(),
-                            tool_name: tc.name.clone(),
-                            content: serde_json::json!({"error":reason,"blocked":true,"blocked_by":"hitl"}).to_string(),
-                            success: false,
-                        },
-                        tc.id.clone(),
-                        tc.name.clone(),
-                    ));
-                    continue;
-                }
-
-                // Sub-agents cannot manage siblings or create descendants.
-                if matches!(
-                    tc.name.as_str(),
-                    "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
-                ) {
-                    fast_results.push((
-                        i,
-                        super::tool_executor::ConversationToolResult {
-                            tool_call_id: tc.id.clone(),
-                            tool_name: tc.name.clone(),
-                            content: serde_json::json!({"error":"子代理不允许调用智能体管理工具","blocked":true}).to_string(),
-                            success: false,
-                        },
-                        tc.id.clone(),
-                        tc.name.clone(),
-                    ));
-                    continue;
-                }
-
-                if matches!(
-                    tc.name.as_str(),
-                    "knowledge_search"
-                        | "evidence_list"
-                        | "evidence_search"
-                        | "evidence_view"
-                        | "skill_list"
-                        | "skill_load"
-                        | "record_finding"
-                ) {
-                    let result = execute_sub_agent_inline_tool(
-                        &tc.id,
-                        &tc.name,
-                        &tc.arguments,
-                        &run_id,
-                        &repository,
-                        &knowledge_source,
-                        &finding_recorder,
-                        &skill_store,
-                    )
-                    .await;
-                    fast_results.push((i, result, tc.id.clone(), tc.name.clone()));
-                } else {
-                    // Slow network tools — run in parallel via spawn
-                    let call_id = tc.id.clone();
-                    let name = tc.name.clone();
-                    let args = tc.arguments.clone();
-                    let scope = context.scope_snapshot.clone();
-                    let sid = session_id.to_string();
-                    let rid = run_id.clone();
-                    let repo = repository.clone();
-                    let executor = tool_executor.clone();
-                    let handle = tokio::spawn(async move {
-                        let start = std::time::Instant::now();
-                        let result = executor
-                            .execute(
-                                &RuntimeToolCall {
-                                    id: call_id.clone(),
-                                    name: name.clone(),
-                                    arguments: args.clone(),
-                                },
-                                &ToolExecutionContext {
-                                    scope_snapshot: scope,
-                                    session_id: sid,
-                                    run_id: Some(rid.clone()),
-                                },
-                            )
-                            .await;
-                        let _ = repo
-                            .record_tool_result(
-                                &rid,
-                                &call_id,
-                                &name,
-                                &args,
-                                result.success,
-                                &result.content,
-                                start.elapsed().as_millis() as u64,
-                            )
-                            .await;
-                        (call_id, name, result, start.elapsed().as_millis() as u64)
-                    });
-                    slow_spawns.push((
-                        i,
-                        tc.id.clone(),
-                        tc.name.clone(),
-                        tc.arguments.clone(),
-                        handle,
-                    ));
-                }
-            }
-
-            // Await slow tools
-            for (_idx, _call_id, _tool_name, _tool_args, handle) in slow_spawns {
-                match handle.await {
-                    Ok((cid, name, result, _elapsed)) => {
-                        fast_results.push((0, result, cid, name));
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "sub-agent parallel tool panicked");
-                    }
-                }
-            }
+            let allowed_calls = output
+                .tool_calls
+                .iter()
+                .take_while(|_| orchestrator.start_request().is_ok())
+                .count();
+            let inline_executor = SubAgentInlineToolExecutor {
+                run_id: &run_id,
+                repository: &repository,
+                knowledge_source: &knowledge_source,
+                finding_recorder: &finding_recorder,
+                skill_store: &skill_store,
+            };
+            let execution_context = ToolExecutionContext {
+                scope_snapshot: context.scope_snapshot.clone(),
+                session_id: session_id.to_string(),
+                run_id: Some(run_id.clone()),
+            };
+            let tool_results = ToolExecutionCoordinator::from_env(tool_executor.clone())
+                .execute(
+                    &output.tool_calls[..allowed_calls],
+                    &dispatch_plan,
+                    &execution_context,
+                    &inline_executor,
+                )
+                .await;
 
             // Process all results
-            for (_idx, result, call_id, tool_name) in &fast_results {
+            for item in &tool_results {
+                let result = &item.result;
+                let call_id = &item.call_id;
+                let tool_name = &item.tool_name;
+                if !item.inline {
+                    let _ = repository
+                        .record_tool_result(
+                            &run_id,
+                            call_id,
+                            tool_name,
+                            &item.arguments,
+                            result.success,
+                            &result.content,
+                            item.elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+                        )
+                        .await;
+                }
                 let effective = has_effective_observation(tool_name, &result.content);
                 orchestrator.record_tool_result(result.success, effective);
 

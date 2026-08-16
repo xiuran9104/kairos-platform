@@ -114,6 +114,7 @@ pub mod stream;
 pub mod structured_output;
 pub mod tool_bus;
 pub mod tool_catalog;
+mod tool_execution_coordinator;
 pub mod tool_executor;
 pub mod tool_guard;
 mod tool_extensions;

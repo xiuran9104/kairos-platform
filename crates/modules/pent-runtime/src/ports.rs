@@ -79,6 +79,17 @@ pub trait ConversationToolExecutor: Send + Sync {
     ) -> RuntimeToolResult;
 }
 
+#[async_trait]
+pub trait InlineToolExecutor: Send + Sync {
+    fn supports(&self, tool_name: &str) -> bool;
+
+    async fn execute(
+        &self,
+        call: &RuntimeToolCall,
+        context: &ToolExecutionContext,
+    ) -> RuntimeToolResult;
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolApprovalRequest {
     pub run_id: String,
@@ -424,6 +435,28 @@ mod tests {
 
     struct StubToolExecutor;
 
+    struct StubInlineToolExecutor;
+
+    #[async_trait]
+    impl InlineToolExecutor for StubInlineToolExecutor {
+        fn supports(&self, _tool_name: &str) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            call: &RuntimeToolCall,
+            _context: &ToolExecutionContext,
+        ) -> RuntimeToolResult {
+            RuntimeToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: "{}".into(),
+                success: true,
+            }
+        }
+    }
+
     struct StubToolApprovalGate;
 
     struct StubFindingRecorder;
@@ -552,6 +585,8 @@ mod tests {
     fn conversation_tool_executor_is_object_safe() {
         let executor = StubToolExecutor;
         let _: &dyn ConversationToolExecutor = &executor;
+        let inline = StubInlineToolExecutor;
+        let _: &dyn InlineToolExecutor = &inline;
     }
 
     #[test]

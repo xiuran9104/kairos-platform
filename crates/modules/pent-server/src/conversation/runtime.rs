@@ -10,20 +10,21 @@ use super::rmos::{
     AttackGraph, KnowledgeCache, PentestMemory,
     injector::{build_injected_context, prepare_injection},
 };
+use super::tool_execution_coordinator::ToolExecutionCoordinator;
 use super::{
     AgentSession, AgentSessionFactory, AgentSpawnRequest, ConversationContextSource,
     ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
-    ConversationToolExecutor, FindingRecorder, ModelTurnOutput, PlanStore, RoleResolver,
-    RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall, SkillStore, ToolApprovalGate,
-    ToolExecutionContext,
+    ConversationToolExecutor, FindingRecorder, InlineToolExecutor, ModelTurnOutput, PlanStore,
+    RoleResolver, RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall, RuntimeToolResult,
+    SkillStore, ToolApprovalGate, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopCheckpoint, AgentLoopLimits, parse_agent_directive,
 };
 use kairos_platform_pent_runtime::orchestrator::{AgentOrchestrator, ModelAttemptOutcome};
 use kairos_platform_pent_runtime::tool_dispatch::{
-    ToolDispatchContext, ToolDispatchPolicy, ToolDispatcher, ToolExecutionClass,
+    ToolDispatchContext, ToolDispatchPolicy, ToolDispatcher,
 };
 
 /// Maximum tool-calling rounds before forcing a stop.
@@ -174,6 +175,30 @@ pub struct ConversationRuntime {
     agent_sessions: Arc<dyn AgentSessionFactory>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
+}
+
+struct MainInlineToolExecutor<'a> {
+    runtime: &'a ConversationRuntime,
+    session_id: &'a str,
+    context: &'a ConversationContext,
+    agent_session: &'a Arc<dyn AgentSession>,
+}
+
+#[async_trait::async_trait]
+impl InlineToolExecutor for MainInlineToolExecutor<'_> {
+    fn supports(&self, _tool_name: &str) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        call: &RuntimeToolCall,
+        _context: &ToolExecutionContext,
+    ) -> RuntimeToolResult {
+        self.runtime
+            .execute_fast_tool(call, self.session_id, self.context, self.agent_session)
+            .await
+    }
 }
 
 impl ConversationRuntime {
@@ -817,201 +842,40 @@ impl ConversationRuntime {
 
                 // ── Phase 1: group tools by capability ──
                 // Read/info tools → concurrent. Destructive/write tools → sequential.
-                // Inline tools (knowledge, evidence, traffic, skill, agent) → immediate.
-                let mut fast_results: Vec<(
-                    usize,
-                    super::tool_executor::ConversationToolResult,
-                    String,
-                    String,
-                    std::time::Duration,
-                )> = Vec::new();
-                let mut read_spawns: Vec<(
-                    usize,
-                    String,
-                    String,
-                    String,
-                    tokio::task::JoinHandle<(
-                        String,
-                        String,
-                        String,
-                        super::tool_executor::ConversationToolResult,
-                        u64,
-                    )>,
-                )> = Vec::new();
-                let mut destructive_spawns: Vec<(
-                    usize,
-                    String,
-                    String,
-                    String,
-                    tokio::task::JoinHandle<(
-                        String,
-                        String,
-                        String,
-                        super::tool_executor::ConversationToolResult,
-                        u64,
-                    )>,
-                )> = Vec::new();
-
-                for (i, tc) in output.tool_calls.iter().enumerate() {
-                    if orchestrator.start_request().is_err() {
-                        break;
-                    }
-                    let tool_started = std::time::Instant::now();
-                    if let Some(reason) = dispatch_plan.blocked_reason(&tc.id) {
-                        fast_results.push((
-                            i,
-                            super::tool_executor::ConversationToolResult {
-                                tool_call_id: tc.id.clone(),
-                                tool_name: tc.name.clone(),
-                                content: serde_json::json!({
-                                    "error": reason,
-                                    "blocked": true,
-                                    "blocked_by": "hitl"
-                                })
-                                .to_string(),
-                                success: false,
-                            },
-                            tc.id.clone(),
-                            tc.name.clone(),
-                            tool_started.elapsed(),
-                        ));
-                        continue;
-                    }
-                    let execution_class = dispatch_plan
-                        .decision(&tc.id)
-                        .map(|decision| decision.class)
-                        .unwrap_or(ToolExecutionClass::ReadOnly);
-                    if execution_class == ToolExecutionClass::Inline {
-                        let result = self
-                            .execute_fast_tool(tc, session_id, &context, &agent_session)
-                            .await;
-                        fast_results.push((
-                            i,
-                            result,
-                            tc.id.clone(),
-                            tc.name.clone(),
-                            tool_started.elapsed(),
-                        ));
-                    } else {
-                        let call_id = tc.id.clone();
-                        let name = tc.name.clone();
-                        let args = tc.arguments.clone();
-                        let destructive = execution_class == ToolExecutionClass::Destructive;
-                        let scope = context.scope_snapshot.clone();
-                        let sid = session_id.to_string();
-                        let rid = context.run_id.clone();
-                        let executor = self.tool_executor.clone();
-                        let handle = tokio::spawn(async move {
-                            let start = std::time::Instant::now();
-                            let result = executor
-                                .execute(
-                                    &RuntimeToolCall {
-                                        id: call_id.clone(),
-                                        name: name.clone(),
-                                        arguments: args.clone(),
-                                    },
-                                    &ToolExecutionContext {
-                                        scope_snapshot: scope,
-                                        session_id: sid,
-                                        run_id: rid,
-                                    },
-                                )
-                                .await;
-                            (
-                                call_id,
-                                name,
-                                args,
-                                result,
-                                start.elapsed().as_millis() as u64,
-                            )
-                        });
-                        if destructive {
-                            destructive_spawns.push((
-                                i,
-                                tc.id.clone(),
-                                tc.name.clone(),
-                                tc.arguments.clone(),
-                                handle,
-                            ));
-                        } else {
-                            read_spawns.push((
-                                i,
-                                tc.id.clone(),
-                                tc.name.clone(),
-                                tc.arguments.clone(),
-                                handle,
-                            ));
-                        }
-                    }
-                }
-
-                // ── Phase 2a: await read/info tools concurrently ──────
-                for (_idx, call_id, tool_name, _tool_args, handle) in read_spawns {
-                    match handle.await {
-                        Ok((cid, name, _args, result, elapsed_ms)) => {
-                            fast_results.push((
-                                0,
-                                result,
-                                cid,
-                                name,
-                                std::time::Duration::from_millis(elapsed_ms),
-                            ));
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, tool = %tool_name, "parallel read tool panicked");
-                            fast_results.push((
-                                0,
-                                super::tool_executor::ConversationToolResult {
-                                    tool_call_id: call_id.clone(),
-                                    tool_name: tool_name.clone(),
-                                    content: serde_json::json!({"error": format!("{e}")})
-                                        .to_string(),
-                                    success: false,
-                                },
-                                call_id,
-                                tool_name,
-                                std::time::Duration::ZERO,
-                            ));
-                        }
-                    }
-                }
-
-                // ── Phase 2b: await destructive tools sequentially ────
-                for (_idx, call_id, tool_name, _tool_args, handle) in destructive_spawns {
-                    match handle.await {
-                        Ok((cid, name, _args, result, elapsed_ms)) => {
-                            fast_results.push((
-                                0,
-                                result,
-                                cid,
-                                name,
-                                std::time::Duration::from_millis(elapsed_ms),
-                            ));
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, tool = %tool_name, "destructive tool panicked");
-                            fast_results.push((
-                                0,
-                                super::tool_executor::ConversationToolResult {
-                                    tool_call_id: call_id.clone(),
-                                    tool_name: tool_name.clone(),
-                                    content: serde_json::json!({"error": format!("{e}")})
-                                        .to_string(),
-                                    success: false,
-                                },
-                                call_id,
-                                tool_name,
-                                std::time::Duration::ZERO,
-                            ));
-                        }
-                    }
-                }
+                let allowed_calls = output
+                    .tool_calls
+                    .iter()
+                    .take_while(|_| orchestrator.start_request().is_ok())
+                    .count();
+                let inline_executor = MainInlineToolExecutor {
+                    runtime: self,
+                    session_id,
+                    context: &context,
+                    agent_session: &agent_session,
+                };
+                let execution_context = ToolExecutionContext {
+                    scope_snapshot: context.scope_snapshot.clone(),
+                    session_id: session_id.to_string(),
+                    run_id: context.run_id.clone(),
+                };
+                let tool_results = ToolExecutionCoordinator::from_env(self.tool_executor.clone())
+                    .execute(
+                        &output.tool_calls[..allowed_calls],
+                        &dispatch_plan,
+                        &execution_context,
+                        &inline_executor,
+                    )
+                    .await;
 
                 // ── Track unreachable targets for diagnostic ──
                 let mut unreachable_targets: Vec<String> = Vec::new();
 
                 // ── Phase 3: process all results (SSE + evidence + traffic + summary) ──
-                for (idx, result, call_id, tool_name, elapsed) in &fast_results {
+                for item in &tool_results {
+                    let result = &item.result;
+                    let call_id = &item.call_id;
+                    let tool_name = &item.tool_name;
+                    let elapsed = item.elapsed;
                     // Detect unreachable targets so the model doesn't retry dead hosts
                     if !result.success && is_unreachable_error(&result.content) {
                         if let Some(target) = extract_target_from_content(&result.content) {
@@ -1021,11 +885,7 @@ impl ConversationRuntime {
                             }
                         }
                     }
-                    let tool_args = output
-                        .tool_calls
-                        .get(*idx)
-                        .map(|tc| tc.arguments.as_str())
-                        .unwrap_or("");
+                    let tool_args = item.arguments.as_str();
                     // SSE: stream tool result as it arrives
                     let event_payload = serde_json::json!({
                         "turn_id": turn_id,
@@ -1072,7 +932,7 @@ impl ConversationRuntime {
                                 run_id,
                                 call_id,
                                 tool_name,
-                                &tool_args,
+                                tool_args,
                                 result.success,
                                 &result.content,
                                 elapsed.as_millis().try_into().unwrap_or(u64::MAX),
@@ -1093,7 +953,7 @@ impl ConversationRuntime {
                                 run_id,
                                 call_id,
                                 tool_name,
-                                &tool_args,
+                                tool_args,
                                 &result.content,
                                 None,
                             )
@@ -1145,7 +1005,9 @@ impl ConversationRuntime {
                 });
 
                 // ── RMOS: update memory from tool results ──
-                for (_idx, result, _call_id, tool_name, _elapsed) in &fast_results {
+                for item in &tool_results {
+                    let result = &item.result;
+                    let tool_name = &item.tool_name;
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.content) {
                         pentest_memory.absorb_tool_result(tool_name, &parsed);
                     }
@@ -1422,7 +1284,7 @@ impl ConversationRuntime {
     /// Execute a fast inline tool (knowledge, skill, traffic, evidence) synchronously.
     async fn execute_fast_tool(
         &self,
-        tc: &super::ports::ModelToolCall,
+        tc: &RuntimeToolCall,
         session_id: &str,
         context: &ConversationContext,
         agent_session: &std::sync::Arc<dyn AgentSession>,
