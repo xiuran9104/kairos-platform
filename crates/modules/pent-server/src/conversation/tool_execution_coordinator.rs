@@ -6,6 +6,7 @@ use kairos_platform_pent_runtime::ports::{
     RuntimeToolResult, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::tool_dispatch::{ToolDispatchPlan, ToolExecutionClass};
+use kairos_platform_pent_runtime::tool_result::{NormalizedToolResult, normalize_tool_result};
 use tokio::sync::Semaphore;
 
 pub struct CoordinatedToolResult {
@@ -14,6 +15,7 @@ pub struct CoordinatedToolResult {
     pub tool_name: String,
     pub arguments: String,
     pub result: RuntimeToolResult,
+    pub normalized: NormalizedToolResult,
     pub elapsed: Duration,
     pub inline: bool,
 }
@@ -65,12 +67,14 @@ impl ToolExecutionCoordinator {
             if class == ToolExecutionClass::Inline && inline.supports(&call.name) {
                 let started = Instant::now();
                 let result = inline.execute(&runtime_call, context).await;
+                let normalized = normalize_tool_result(&result);
                 results.push(CoordinatedToolResult {
                     index,
                     call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     result,
+                    normalized,
                     elapsed: started.elapsed(),
                     inline: true,
                 });
@@ -123,17 +127,20 @@ impl ToolExecutionCoordinator {
 }
 
 fn failed_external(index: usize, call: RuntimeToolCall, error: &str) -> CoordinatedToolResult {
+    let result = RuntimeToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        content: serde_json::json!({"error": error, "retryable": false}).to_string(),
+        success: false,
+    };
+    let normalized = normalize_tool_result(&result);
     CoordinatedToolResult {
         index,
         call_id: call.id.clone(),
         tool_name: call.name.clone(),
         arguments: call.arguments,
-        result: RuntimeToolResult {
-            tool_call_id: call.id,
-            tool_name: call.name,
-            content: serde_json::json!({"error": error}).to_string(),
-            success: false,
-        },
+        result,
+        normalized,
         elapsed: Duration::ZERO,
         inline: false,
     }
@@ -155,34 +162,41 @@ async fn execute_external(
 ) -> CoordinatedToolResult {
     let started = Instant::now();
     let result = executor.execute(&call, &context).await;
+    let normalized = normalize_tool_result(&result);
     CoordinatedToolResult {
         index,
         call_id: call.id,
         tool_name: call.name,
         arguments: call.arguments,
         result,
+        normalized,
         elapsed: started.elapsed(),
         inline: false,
     }
 }
 
 fn blocked_result(index: usize, call: &ModelToolCall, reason: &str) -> CoordinatedToolResult {
+    let result = RuntimeToolResult {
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        content: serde_json::json!({
+            "error": reason,
+            "error_code": "TOOL_BLOCKED",
+            "retryable": false,
+            "blocked": true,
+            "blocked_by": "hitl"
+        })
+        .to_string(),
+        success: false,
+    };
+    let normalized = normalize_tool_result(&result);
     CoordinatedToolResult {
         index,
         call_id: call.id.clone(),
         tool_name: call.name.clone(),
         arguments: call.arguments.clone(),
-        result: RuntimeToolResult {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            content: serde_json::json!({
-                "error": reason,
-                "blocked": true,
-                "blocked_by": "hitl"
-            })
-            .to_string(),
-            success: false,
-        },
+        result,
+        normalized,
         elapsed: Duration::ZERO,
         inline: true,
     }

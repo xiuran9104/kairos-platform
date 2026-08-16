@@ -12,6 +12,9 @@ use chrono::Utc;
 use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessageType};
 
 use super::tool_execution_coordinator::ToolExecutionCoordinator;
+use super::tool_result_processor::{
+    ToolResultPersistence, ToolResultProcessingContext, ToolResultProcessor,
+};
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
@@ -688,43 +691,24 @@ async fn execute_sub_agent(
 
             // Process all results
             for item in &tool_results {
-                let result = &item.result;
                 let call_id = &item.call_id;
-                let tool_name = &item.tool_name;
-                if !item.inline {
-                    let _ = repository
-                        .record_tool_result(
-                            &run_id,
-                            call_id,
-                            tool_name,
-                            &item.arguments,
-                            result.success,
-                            &result.content,
-                            item.elapsed.as_millis().try_into().unwrap_or(u64::MAX),
-                        )
-                        .await;
-                }
-                let effective = has_effective_observation(tool_name, &result.content);
-                orchestrator.record_tool_result(result.success, effective);
-
-                let compact = if result.content.chars().count() > 4000 {
-                    format!(
-                        "{}...",
-                        result.content.chars().take(4000).collect::<String>()
+                let processed = ToolResultProcessor::new(repository.as_ref())
+                    .process(
+                        item,
+                        ToolResultProcessingContext {
+                            run_id: Some(&run_id),
+                            turn_id: None,
+                            session_id,
+                            message_id: format!("sub_tool:{agent_id}:{call_id}"),
+                            persistence: ToolResultPersistence::ExternalBestEffort,
+                            emit_completion: false,
+                            capture_http_traffic: false,
+                        },
                     )
-                } else {
-                    result.content.clone()
-                };
-                context.recent_messages.push(AgentMessage {
-                    message_id: format!("sub_tool:{}:{}", agent_id, call_id),
-                    role: "tool".into(),
-                    content: serde_json::json!({
-                        "tool_call_id": call_id,
-                        "result": compact,
-                    })
-                    .to_string(),
-                    format: "tool_result".into(),
-                });
+                    .await?;
+                orchestrator
+                    .record_tool_result(processed.succeeded, processed.effective_observation);
+                context.recent_messages.push(processed.model_message);
             }
             continue;
         }
@@ -829,16 +813,4 @@ async fn execute_sub_agent(
     });
 
     Ok(result)
-}
-
-fn has_effective_observation(tool_name: &str, content: &str) -> bool {
-    if content.contains(r#""blocked":true"#) || content.contains(r#""error":"#) {
-        return false;
-    }
-    match tool_name {
-        "knowledge_search" | "evidence_list" | "evidence_search" | "evidence_view"
-        | "skill_list" | "skill_load" | "record_finding" | "agent_status" | "agent_collect"
-        | "agent_list" => false,
-        _ => !content.trim().is_empty(),
-    }
 }

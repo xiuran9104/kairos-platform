@@ -11,6 +11,10 @@ use super::rmos::{
     injector::{build_injected_context, prepare_injection},
 };
 use super::tool_execution_coordinator::ToolExecutionCoordinator;
+use super::tool_result_processor::{
+    ToolResultPersistence, ToolResultProcessingContext, ToolResultProcessor, is_evidence_tool,
+    is_finding_tool, is_traffic_tool,
+};
 use super::{
     AgentSession, AgentSessionFactory, AgentSpawnRequest, ConversationContextSource,
     ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
@@ -33,9 +37,6 @@ use kairos_platform_pent_runtime::tool_dispatch::{
 const MAX_TOOL_ROUNDS: usize = 50;
 /// Absolute maximum runtime for a conversation turn (2 hours).
 const MAX_TURN_RUNTIME_SECS: u64 = 2 * 60 * 60;
-/// Tool observations sent back to the model are compact. The complete response
-/// has already been persisted as Evidence before this representation is used.
-const MAX_MODEL_TOOL_OBSERVATION_CHARS: usize = 8_000;
 const MAX_RUN_SUMMARY_CHARS: usize = 12_000;
 const DEFAULT_MAX_CONSECUTIVE_MODEL_ERRORS: usize = 3;
 
@@ -875,9 +876,25 @@ impl ConversationRuntime {
                     let result = &item.result;
                     let call_id = &item.call_id;
                     let tool_name = &item.tool_name;
-                    let elapsed = item.elapsed;
+                    let processed = ToolResultProcessor::new(self.repository.as_ref())
+                        .with_events(self.events.as_ref())
+                        .with_nats(self.nats.as_ref())
+                        .process(
+                            item,
+                            ToolResultProcessingContext {
+                                run_id: context.run_id.as_deref(),
+                                turn_id: Some(turn_id),
+                                session_id,
+                                message_id: format!("tool_result:{call_id}"),
+                                persistence: ToolResultPersistence::MainEvidence,
+                                emit_completion: true,
+                                capture_http_traffic: true,
+                            },
+                        )
+                        .await?;
+                    let succeeded = processed.succeeded;
                     // Detect unreachable targets so the model doesn't retry dead hosts
-                    if !result.success && is_unreachable_error(&result.content) {
+                    if !succeeded && is_unreachable_error(&result.content) {
                         if let Some(target) = extract_target_from_content(&result.content) {
                             let host = target_host_from_url(&target);
                             if !unreachable_targets.contains(&host) {
@@ -885,110 +902,34 @@ impl ConversationRuntime {
                             }
                         }
                     }
-                    let tool_args = item.arguments.as_str();
-                    // SSE: stream tool result as it arrives
-                    let event_payload = serde_json::json!({
-                        "turn_id": turn_id,
-                        "tool_name": tool_name,
-                        "tool_call_id": call_id,
-                        "success": result.success,
-                        "summary": result.content.chars().take(300).collect::<String>(),
-                    });
-                    self.events
-                        .emit("conversation.tool.completed", event_payload.clone())
-                        .await
-                        .ok();
-                    // NATS: publish for external subscribers (frontend SSE, monitoring)
-                    if let Some(ref nats) = self.nats {
-                        let payload = serde_json::to_vec(&event_payload).unwrap_or_default();
-                        nats.publish(&format!("penta.conversation.tools.{}", turn_id), &payload)
-                            .await;
-                    }
-
-                    let effective_observation =
-                        result.success && has_effective_observation(tool_name, &result.content);
-                    orchestrator.record_tool_result(result.success, effective_observation);
+                    let effective_observation = processed.effective_observation;
+                    orchestrator.record_tool_result(succeeded, effective_observation);
                     if let Some(diagnostic) = scan_progress.record_tool_result(
                         tool_name,
-                        result.success,
+                        succeeded,
                         effective_observation,
                         &result.content,
                     ) {
                         loop_diagnostic = Some(diagnostic);
                     }
-                    if tool_name == "traffic_replay" && result.success {
+                    if tool_name == "traffic_replay" && succeeded {
                         scan_progress.record_traffic_replay();
                     }
 
-                    let evidence_id = if is_evidence_tool(tool_name)
-                        || is_traffic_tool(tool_name)
-                        || is_finding_tool(tool_name)
-                    {
-                        None
-                    } else if let Some(run_id) = context.run_id.as_deref() {
-                        let eid = self
-                            .repository
-                            .record_tool_result(
-                                run_id,
-                                call_id,
-                                tool_name,
-                                tool_args,
-                                result.success,
-                                &result.content,
-                                elapsed.as_millis().try_into().unwrap_or(u64::MAX),
-                            )
-                            .await?;
+                    let evidence_id = processed.evidence_id;
+                    if let Some(eid) = evidence_id.as_ref() {
                         evidence_ids.push(eid.clone());
                         scan_progress.record_evidence_tool(&eid, tool_name);
-                        Some(eid)
-                    } else {
-                        None
-                    };
-
-                    if let Some(run_id) = context.run_id.as_deref()
-                        && matches!(tool_name.as_str(), "http_request" | "http_probe")
-                    {
-                        self.repository
-                            .record_http_traffic(
-                                run_id,
-                                call_id,
-                                tool_name,
-                                tool_args,
-                                &result.content,
-                                None,
-                            )
-                            .await?;
                     }
                     append_run_summary(
                         &mut run_summary,
                         round + 1,
                         tool_name,
-                        result.success,
+                        succeeded,
                         evidence_id.as_deref(),
                         &result.content,
                     );
-
-                    let display = serde_json::json!({"tool_name":tool_name,"tool_call_id":call_id,"success":result.success,"result":result.content});
-                    self.repository
-                        .write_intermediate_message(
-                            turn_id,
-                            session_id,
-                            "tool",
-                            &display.to_string(),
-                            "tool_result",
-                        )
-                        .await?;
-                    // Also write to pent_run_events so Run detail page shows progress
-                    if let Some(ref run_id) = context.run_id {
-                        self.repository
-                            .record_run_event(run_id, "tool.executed", &display)
-                            .await?;
-                    }
-                    context.recent_messages.push(AgentMessage {
-                        message_id: format!("tool_result:{}", call_id), role: "tool".into(),
-                        content: serde_json::json!({"tool_call_id":call_id,"result":compact_model_observation(&result.content)}).to_string(),
-                        format: "tool_result".into(),
-                    });
+                    context.recent_messages.push(processed.model_message);
                 }
                 if orchestrator.stop_reason().is_some() {
                     break;
@@ -1964,20 +1905,6 @@ fn compact_summary_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn compact_model_observation(content: &str) -> String {
-    if content.chars().count() <= MAX_MODEL_TOOL_OBSERVATION_CHARS {
-        return content.to_string();
-    }
-    let prefix: String = content
-        .chars()
-        .take(MAX_MODEL_TOOL_OBSERVATION_CHARS)
-        .collect();
-    format!(
-        "{prefix}\n...[模型上下文已截断；完整原始响应已保存为 Evidence，共 {} 字符]",
-        content.chars().count()
-    )
-}
-
 fn push_gate_rejection(
     context: &mut ConversationContext,
     round: usize,
@@ -2083,8 +2010,7 @@ fn compact_runtime_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentDirective, MAX_MODEL_TOOL_OBSERVATION_CHARS, compact_model_observation,
-        compact_runtime_error, has_effective_observation, parse_agent_directive,
+        AgentDirective, compact_runtime_error, parse_agent_directive,
     };
 
     #[test]
@@ -2093,42 +2019,6 @@ mod tests {
         let compact = compact_runtime_error(&error);
         assert!(compact.chars().count() <= 501);
         assert!(compact.ends_with('…'));
-    }
-
-    #[test]
-    fn empty_placeholder_js_is_not_an_effective_observation() {
-        assert!(!has_effective_observation(
-            "js_analyze",
-            r#"{"endpoints":[],"security_hints":[],"technology_hints":[]}"#
-        ));
-        assert!(has_effective_observation(
-            "js_analyze",
-            r#"{"endpoints":["/api/users"],"security_hints":[]}"#
-        ));
-    }
-
-    #[test]
-    fn blocked_results_are_not_effective() {
-        assert!(!has_effective_observation(
-            "dir_fuzz",
-            r#"{"blocked":true,"error":"disabled"}"#
-        ));
-    }
-
-    #[test]
-    fn knowledge_guides_do_not_count_as_target_evidence() {
-        assert!(!has_effective_observation(
-            "knowledge_search",
-            r#"{"guide_count":1,"guides":[{"title":"SQL injection"}]}"#
-        ));
-    }
-
-    #[test]
-    fn compacts_tool_observation_for_model_context() {
-        let raw = "a".repeat(MAX_MODEL_TOOL_OBSERVATION_CHARS + 10);
-        let compact = compact_model_observation(&raw);
-        assert!(compact.contains("完整原始响应已保存为 Evidence"));
-        assert!(compact.len() < raw.len() + 100);
     }
 
     #[test]
@@ -2207,63 +2097,6 @@ mod tests {
             AgentDirective::Replan("改用 POST 请求测试".into())
         );
     }
-}
-
-fn has_effective_observation(tool_name: &str, content: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-        return !content.trim().is_empty();
-    };
-    if value.get("blocked").and_then(serde_json::Value::as_bool) == Some(true)
-        || value.get("error").is_some()
-    {
-        return false;
-    }
-    match tool_name {
-        // Knowledge is methodology, not target evidence. It may guide the next
-        // action but cannot by itself satisfy a security completion gate.
-        "knowledge_search" | "evidence_list" | "evidence_search" | "evidence_view" => false,
-        "js_analyze" => ["endpoints", "security_hints", "technology_hints"]
-            .iter()
-            .any(|key| {
-                value
-                    .get(key)
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|items| !items.is_empty())
-            }),
-        "http_probe" => value
-            .get("results")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|results| {
-                results.iter().any(|result| {
-                    result.get("status").is_some()
-                        || result.get("reachable").and_then(serde_json::Value::as_bool)
-                            == Some(true)
-                })
-            }),
-        "dns_lookup" => value
-            .pointer("/records/A")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|records| !records.is_empty()),
-        _ => true,
-    }
-}
-
-fn is_evidence_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "evidence_list" | "evidence_search" | "evidence_view"
-    )
-}
-
-fn is_traffic_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "traffic_list" | "traffic_view" | "traffic_diff" | "traffic_replay" | "traffic_sitemap"
-    )
-}
-
-fn is_finding_tool(tool_name: &str) -> bool {
-    tool_name == "record_finding"
 }
 
 fn is_skill_tool(tool_name: &str) -> bool {

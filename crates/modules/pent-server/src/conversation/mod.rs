@@ -118,5 +118,6 @@ mod tool_execution_coordinator;
 pub mod tool_executor;
 pub mod tool_guard;
 mod tool_extensions;
+mod tool_result_processor;
 pub mod traffic;
 pub(crate) mod turn_tasks;
