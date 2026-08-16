@@ -362,7 +362,7 @@ recipes:
   - ipv4
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -jsonl
     - -silent
@@ -818,7 +818,7 @@ recipes:
   - ipv4
   executor:
     type: host
-    program: /usr/bin/dnsx
+    program: /usr/local/bin/dnsx
     args:
     - -silent
   resource_profile:
@@ -934,7 +934,7 @@ recipes:
     template: -u {value}/FUZZ
   executor:
     type: host
-    program: /usr/bin/ffuf
+    program: /usr/local/bin/ffuf
     args:
     - -w
     - /usr/share/wordlists/dirb/common.txt
@@ -1001,7 +1001,7 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/gobuster
+    program: /usr/local/bin/gobuster
     args:
     - dir
     - -w
@@ -1189,7 +1189,7 @@ recipes:
   - ipv4
   executor:
     type: host
-    program: /usr/bin/naabu
+    program: /usr/local/bin/naabu
     args:
     - -silent
   resource_profile:
@@ -1262,7 +1262,7 @@ recipes:
   - cidr
   executor:
     type: host
-    program: /usr/bin/netdiscover
+    program: /usr/sbin/netdiscover
     args: []
   resource_profile:
     cpu_cores: 0.5
@@ -1631,7 +1631,7 @@ recipes:
   - hostname
   executor:
     type: host
-    program: /usr/bin/subfinder
+    program: /usr/local/bin/subfinder
     args:
     - -silent
   resource_profile:
@@ -1921,7 +1921,7 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -tags
     - cmdi
@@ -1966,7 +1966,7 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -tags
     - csrf
@@ -2011,7 +2011,7 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -tags
     - lfi
@@ -2056,7 +2056,7 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -tags
     - file-upload
@@ -2102,7 +2102,7 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -tags
     - sqli
@@ -2147,7 +2147,7 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -tags
     - xss
@@ -2268,7 +2268,7 @@ recipes:
   - ipv4
   executor:
     type: host
-    program: /usr/bin/nuclei
+    program: /usr/local/bin/nuclei
     args:
     - -jsonl
     - -silent
@@ -2381,7 +2381,7 @@ recipes:
   - hostname
   executor:
     type: host
-    program: /usr/bin/httpx
+    program: /usr/local/bin/httpx
     args:
     - -silent
     - -json
@@ -3566,7 +3566,7 @@ recipes:
   - ipv4
   executor:
     type: host
-    program: /usr/local/bin/impacket-secretsdump
+    program: /usr/bin/impacket-secretsdump
     args: []
   resource_profile:
     cpu_cores: 1.0
@@ -3857,7 +3857,7 @@ recipes:
   approval_policy: conditional
   executor:
     type: host
-    program: /usr/local/bin/trivy
+    program: /usr/bin/trivy
     args:
     - fs
     target_position: first

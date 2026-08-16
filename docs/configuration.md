@@ -23,6 +23,7 @@
 | `PENTA_BWRAP_PATH` | 否 | `/usr/bin/bwrap` | pent-agent 强制使用的 bubblewrap 可执行文件 |
 | `PENTA_SANDBOX_ROOT` | 否 | `/tmp/kairos-pent-sandbox` | run 级 workspace/artifact 宿主机根目录 |
 | `PENTA_SANDBOX_ALLOWED_ROOTS` | 否 | 无 | 额外允许读写挂载到沙箱的绝对目录，逗号分隔 |
+| `PENTA_TOOL_DIR` | 否 | `~/.kairos/tools/bin` | 受控工具目录，pent-agent 启动时把 PATH 上发现的工具软链至此，并只读挂载进沙箱、前置到沙箱 PATH |
 
 ## Pent 本地工具执行
 

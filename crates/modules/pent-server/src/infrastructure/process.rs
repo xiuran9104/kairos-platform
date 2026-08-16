@@ -183,13 +183,14 @@ async fn execute_prepared_tool(
     prepared: &PreparedTool,
     limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
+    let mut resolved_program = resolve_tool_program(tool_name, prepared.program);
     // ── Pre-flight: ensure the binary exists ──────────────────────────
-    if !path_is_executable(prepared.program) {
+    if !path_is_executable(&resolved_program) {
         if auto_install_enabled() {
             if let Some(lifecycle) = super::tool_lifecycle::find(tool_name) {
                 tracing::warn!(
                     tool = tool_name,
-                    path = prepared.program,
+                    path = resolved_program,
                     "tool binary missing; attempting auto-install"
                 );
                 if let Err(error) = lifecycle.ensure_available().await {
@@ -209,7 +210,7 @@ async fn execute_prepared_tool(
                 return Err(format!(
                     "工具 '{tool_name}' 二进制文件不存在: {}\n\
                      请手动安装此工具后重试。",
-                    prepared.program
+                    resolved_program
                 ));
             }
         } else {
@@ -226,15 +227,22 @@ async fn execute_prepared_tool(
                 "工具 '{tool_name}' 二进制文件不存在: {}\n\
                  安装提示: {hint}\n\
                  或设置 PENTA_AUTO_INSTALL_TOOLS=true 启用自动安装。",
-                prepared.program
+                resolved_program
             ));
         }
+    }
+    resolved_program = resolve_tool_program(tool_name, &resolved_program);
+    if !path_is_executable(&resolved_program) {
+        return Err(format!(
+            "工具 '{tool_name}' 安装后仍无法解析可执行文件: {}",
+            resolved_program
+        ));
     }
 
     let started = Instant::now();
     tracing::info!(
         tool = tool_name,
-        program = prepared.program,
+        program = resolved_program,
         "executing allow-listed security tool"
     );
 
@@ -271,7 +279,13 @@ async fn execute_prepared_tool(
             }
         }
     }
-    let sandbox = build_bubblewrap_command(prepared, limits, &sandbox_env, &readonly_paths)?;
+    let sandbox = build_bubblewrap_command(
+        prepared,
+        &resolved_program,
+        limits,
+        &sandbox_env,
+        &readonly_paths,
+    )?;
     let audit = execution_audit(limits, &sandbox.layout);
     let mut cmd = Command::new(&sandbox.program);
     cmd.args(&sandbox.args).env_clear().env("LANG", "C.UTF-8");
@@ -360,6 +374,27 @@ async fn execute_prepared_tool(
     })
 }
 
+fn resolve_tool_program(tool_name: &str, configured_program: &str) -> String {
+    if path_is_executable(configured_program) {
+        return configured_program.to_owned();
+    }
+    if let Some(path) = super::tool_lifecycle::find(tool_name)
+        .and_then(|lifecycle| lifecycle.resolved_binary_path())
+    {
+        return path.to_string_lossy().into_owned();
+    }
+    let mut names = vec![tool_name.to_string()];
+    if let Some(file) = Path::new(configured_program)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    {
+        names.push(file);
+    }
+    super::tool_lifecycle::find_executable(&names)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| configured_program.to_owned())
+}
+
 /// Execute a tool command in a sandboxed environment.
 ///
 /// When a global elastic executor is initialized (via
@@ -414,13 +449,20 @@ struct BubblewrapCommand {
 
 fn build_bubblewrap_command(
     prepared: &PreparedTool,
+    resolved_program: &str,
     limits: &ToolExecutionLimits,
     environment: &[(String, String)],
     readonly_paths: &[(PathBuf, String)],
 ) -> Result<BubblewrapCommand, String> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (prepared, limits, environment, readonly_paths);
+        let _ = (
+            prepared,
+            resolved_program,
+            limits,
+            environment,
+            readonly_paths,
+        );
         return Err("bubblewrap sandbox 仅支持 Linux".into());
     }
 
@@ -468,6 +510,16 @@ fn build_bubblewrap_command(
             "--ro-bind-try".into(),
             "/opt".into(),
             "/opt".into(),
+        ];
+        // Controlled tool directory: consolidated user-writable symlinks,
+        // mounted read-only and prepended to PATH so tools resolve uniformly
+        // without depending on root-owned system paths.
+        if let Some(tool_dir) = super::tool_lifecycle::controlled_tool_dir() {
+            if tool_dir.is_dir() {
+                bind_ro_dir(&mut args, &tool_dir);
+            }
+        }
+        args.extend([
             "--symlink".into(),
             "usr/bin".into(),
             "/bin".into(),
@@ -482,7 +534,7 @@ fn build_bubblewrap_command(
             "/lib64".into(),
             "--dir".into(),
             "/etc".into(),
-        ];
+        ]);
         for path in [
             "/etc/alternatives",
             "/etc/hosts",
@@ -500,6 +552,7 @@ fn build_bubblewrap_command(
         ] {
             args.extend(["--ro-bind-try".into(), path.into(), path.into()]);
         }
+        bind_external_tool_runtime(&mut args, resolved_program)?;
         args.extend([
             "--dir".into(),
             "/workspace".into(),
@@ -531,13 +584,24 @@ fn build_bubblewrap_command(
         for (name, value) in environment {
             args.extend(["--setenv".into(), name.clone(), value.clone()]);
         }
+        let sandbox_path = super::tool_lifecycle::controlled_tool_dir()
+            .filter(|dir| dir.is_dir())
+            .map(|dir| {
+                format!(
+                    "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    dir.display()
+                )
+            })
+            .unwrap_or_else(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+            });
         args.extend([
             "--setenv".into(),
             "HOME".into(),
             "/workspace".into(),
             "--setenv".into(),
             "PATH".into(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+            sandbox_path,
             "--setenv".into(),
             "TMPDIR".into(),
             "/tmp".into(),
@@ -556,7 +620,7 @@ fn build_bubblewrap_command(
             format!("--rss={memory_bytes}"),
             format!("--cpu={cpu_seconds}"),
             "--".into(),
-            prepared.program.into(),
+            resolved_program.into(),
         ]);
         args.extend(prepared.args.clone());
         Ok(BubblewrapCommand {
@@ -567,6 +631,59 @@ fn build_bubblewrap_command(
             seccomp_path,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_ro_dir(args: &mut Vec<String>, dir: &Path) {
+    let mut parents: Vec<PathBuf> = dir
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .filter(|path| *path != Path::new("/"))
+        .map(Path::to_path_buf)
+        .collect();
+    parents.reverse();
+    for parent in parents {
+        args.extend(["--dir".into(), parent.to_string_lossy().into_owned()]);
+    }
+    let target = dir.to_string_lossy().into_owned();
+    args.extend(["--ro-bind-try".into(), target.clone(), target]);
+}
+
+#[cfg(target_os = "linux")]
+fn bind_external_tool_runtime(args: &mut Vec<String>, program: &str) -> Result<(), String> {
+    let program = Path::new(program);
+    if program.starts_with("/usr") || program.starts_with("/opt") {
+        return Ok(());
+    }
+    let program = program
+        .canonicalize()
+        .map_err(|error| format!("无法解析工具路径 {}: {error}", program.display()))?;
+    let prefix = std::fs::read(&program)
+        .ok()
+        .filter(|bytes| bytes.starts_with(b"#!"))
+        .and_then(|_| {
+            program
+                .ancestors()
+                .find(|path| path.file_name().is_some_and(|name| name == "bin"))
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        });
+    let source = prefix.as_deref().unwrap_or(&program);
+    let target = source.to_string_lossy().into_owned();
+    let mut parents: Vec<PathBuf> = source
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .filter(|path| *path != Path::new("/"))
+        .map(Path::to_path_buf)
+        .collect();
+    parents.reverse();
+    for parent in parents {
+        args.extend(["--dir".into(), parent.to_string_lossy().into_owned()]);
+    }
+    args.extend(["--ro-bind".into(), target.clone(), target]);
+    Ok(())
 }
 
 fn prepare_sandbox_layout(limits: &ToolExecutionLimits) -> Result<SandboxLayout, String> {
@@ -980,7 +1097,8 @@ mod tests {
             run_id: Some(format!("sandbox-test-{}", uuid::Uuid::new_v4())),
             ..Default::default()
         };
-        let command = build_bubblewrap_command(&prepared, &limits, &[], &[]).unwrap();
+        let command =
+            build_bubblewrap_command(&prepared, prepared.program, &limits, &[], &[]).unwrap();
         assert_eq!(command.program, "/usr/bin/bwrap");
         assert!(
             command

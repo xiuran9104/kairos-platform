@@ -18,6 +18,16 @@ async fn main() -> anyhow::Result<()> {
     kairos_platform_pent_server::infrastructure::process::verify_bubblewrap()
         .map_err(anyhow::Error::msg)?;
 
+    match kairos_platform_pent_server::infrastructure::tool_lifecycle::sync_tool_directory() {
+        Ok(report) => tracing::info!(
+            linked = report.linked.len(),
+            missing = ?report.missing,
+            errors = ?report.errors,
+            "controlled tool directory synced"
+        ),
+        Err(error) => tracing::warn!(%error, "controlled tool directory sync skipped"),
+    }
+
     let database = connect(&DatabaseConfig::from_env()?).await?;
     ensure_initialized(&database).await?;
     let config = PentConfig::from_env();

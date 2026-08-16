@@ -8,6 +8,7 @@
 //! Before executing a tool, callers should invoke [`ToolLifecycle::ensure_available`]
 //! to verify the binary exists and attempt auto-install if it doesn't.
 
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 // ── Data types ────────────────────────────────────────────────────────────
@@ -44,18 +45,53 @@ pub struct ToolLifecycle {
 // ── Public API ─────────────────────────────────────────────────────────────
 
 impl ToolLifecycle {
+    /// Candidate binary names for this tool: the catalog binary's file name,
+    /// the canonical tool name, and any aliases.
+    pub fn binary_names(&self) -> Vec<String> {
+        let mut names = vec![
+            Path::new(self.binary_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.tool_name.to_string()),
+            self.tool_name.to_string(),
+        ];
+        names.extend(self.aliases.iter().map(|name| (*name).to_string()));
+        if self.tool_name == "volatility3" {
+            names.push("vol".into());
+        }
+        names
+    }
+
+    /// Stable name of the binary (the catalog path's file name).
+    pub fn binary_file_name(&self) -> String {
+        Path::new(self.binary_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.tool_name.to_string())
+    }
+
+    /// Resolve the binary's real path. Lookup order:
+    /// 1. The consolidated controlled tool directory (`PENTA_TOOL_DIR`).
+    /// 2. The catalog preference (`binary_path`).
+    /// 3. The host PATH plus user toolchain directories (`~/.cargo/bin`,
+    ///    `~/go/bin`, `~/.local/bin`, `~/miniconda3/bin`, `~/anaconda3/bin`).
+    ///
+    /// Package managers install tools into /usr/sbin, /usr/local/bin or a
+    /// user toolchain directory, so `binary_path` is a preference rather than
+    /// a second, conflicting source of truth.
+    pub fn resolved_binary_path(&self) -> Option<PathBuf> {
+        let configured = Path::new(self.binary_path);
+        if executable_file(configured) {
+            return configured.canonicalize().ok();
+        }
+        find_executable(&self.binary_names())
+    }
+
     /// Check whether the binary exists and has the executable bit set.
     /// Uses `tokio::fs::metadata` so it can be called from async contexts
     /// without blocking the runtime.
     pub async fn is_installed(&self) -> bool {
-        tokio::fs::metadata(self.binary_path)
-            .await
-            .map(|m| {
-                // On Unix, check the owner execute bit as a quick heuristic.
-                // A full mode check would use std::os::unix::fs::PermissionsExt.
-                m.is_file()
-            })
-            .unwrap_or(false)
+        self.resolved_binary_path().is_some()
     }
 
     /// Attempt to install the tool by trying each install method in order.
@@ -127,7 +163,10 @@ impl ToolLifecycle {
     /// Uninstall the tool. No-op if not installed.
     pub async fn uninstall(&self) -> Result<(), String> {
         if !self.is_installed().await {
-            info!(tool = self.tool_name, "tool not installed; nothing to uninstall");
+            info!(
+                tool = self.tool_name,
+                "tool not installed; nothing to uninstall"
+            );
             return Ok(());
         }
         for cmd in self.uninstall_commands {
@@ -151,6 +190,152 @@ impl ToolLifecycle {
     }
 }
 
+fn executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+// ── Controlled tool directory ──────────────────────────────────────────────
+//
+// Host-native tools land in scattered, often root-owned locations
+// (/usr/bin, /usr/sbin, /usr/local/bin) or user toolchain directories that a
+// systemd-driven pent-agent never sees. We consolidate them into a single
+// user-writable directory that is mounted into the bubblewrap sandbox and
+// prepended to its PATH, so discovery no longer depends on root or on the
+// agent's runtime PATH.
+
+/// The consolidated controlled tool directory: `$PENTA_TOOL_DIR` when set,
+/// otherwise `~/.kairos/tools/bin`. A leading `~/` is expanded against `HOME`.
+pub fn controlled_tool_dir() -> Option<PathBuf> {
+    let raw = std::env::var("PENTA_TOOL_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let path = match raw {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if let Ok(stripped) = dir.strip_prefix("~/") {
+                PathBuf::from(std::env::var_os("HOME")?).join(stripped)
+            } else {
+                dir
+            }
+        }
+        None => {
+            let home = std::env::var_os("HOME")?;
+            PathBuf::from(home)
+                .join(".kairos")
+                .join("tools")
+                .join("bin")
+        }
+    };
+    path.is_absolute().then_some(path)
+}
+
+/// Directories scanned when locating tool binaries: the host PATH, then user
+/// toolchain directories (cargo/go/pip --user/conda), then the standard system
+/// bin/sbin locations.
+pub fn toolchain_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(home.join("go").join("bin"));
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join("miniconda3").join("bin"));
+        dirs.push(home.join("anaconda3").join("bin"));
+    }
+    for directory in [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ] {
+        dirs.push(PathBuf::from(directory));
+    }
+    dirs
+}
+
+/// Find the first executable matching any of `names`, checking the controlled
+/// tool directory first and then the toolchain search directories.
+pub fn find_executable(names: &[String]) -> Option<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(dir) = controlled_tool_dir() {
+        directories.push(dir);
+    }
+    directories.extend(toolchain_search_dirs());
+    directories
+        .into_iter()
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .find(|candidate| executable_file(candidate))
+        .and_then(|candidate| candidate.canonicalize().ok())
+}
+
+/// Summary of a controlled-directory consolidation pass.
+#[derive(Debug, Default)]
+pub struct ToolSyncReport {
+    /// Tools whose symlink was created or refreshed.
+    pub linked: Vec<String>,
+    /// Tools that could not be located anywhere.
+    pub missing: Vec<String>,
+    /// Per-tool errors encountered while linking.
+    pub errors: Vec<String>,
+}
+
+/// Consolidate host-native tools into the controlled tool directory by
+/// creating symlinks to their resolved binaries. Run this at pent-agent
+/// startup (and whenever `PENTA_TOOL_DIR` changes) so discovery and the
+/// sandbox mount contract never depend on root-owned system paths or on the
+/// agent's runtime PATH.
+pub fn sync_tool_directory() -> Result<ToolSyncReport, String> {
+    let dir = controlled_tool_dir().ok_or_else(|| {
+        "无法解析受控工具目录（请设置 PENTA_TOOL_DIR 或确保 HOME 已设置）".to_string()
+    })?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("创建受控工具目录 {} 失败: {error}", dir.display()))?;
+    let mut report = ToolSyncReport::default();
+    for tool in all_host_tools() {
+        let link_path = dir.join(tool.binary_file_name());
+        match resolve_outside_controlled_dir(&tool) {
+            Some(real) => match create_tool_symlink(&real, &link_path) {
+                Ok(()) => report.linked.push(tool.tool_name.to_string()),
+                Err(error) => report.errors.push(format!("{}: {error}", tool.tool_name)),
+            },
+            None => report.missing.push(tool.tool_name.to_string()),
+        }
+    }
+    Ok(report)
+}
+
+/// Resolve a tool's real binary, deliberately ignoring the controlled
+/// directory so a previous symlink never becomes its own target.
+fn resolve_outside_controlled_dir(tool: &ToolLifecycle) -> Option<PathBuf> {
+    let configured = Path::new(tool.binary_path);
+    if executable_file(configured) {
+        return configured.canonicalize().ok();
+    }
+    toolchain_search_dirs()
+        .into_iter()
+        .flat_map(|directory| {
+            tool.binary_names()
+                .into_iter()
+                .map(move |name| directory.join(name))
+        })
+        .find(|candidate| executable_file(candidate))
+        .and_then(|candidate| candidate.canonicalize().ok())
+}
+
+fn create_tool_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(link).is_ok() {
+        let _ = std::fs::remove_file(link);
+    }
+    std::os::unix::fs::symlink(target, link)
+}
+
 // ── Registry ───────────────────────────────────────────────────────────────
 
 /// All known host-native tools with full lifecycle data.
@@ -167,9 +352,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "nmap",
             aliases: &["tcp_scan", "nmap_scan"],
             binary_path: "/usr/bin/nmap",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y nmap" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y nmap",
+            }],
             update_commands: &["apt-get install -y --only-upgrade nmap"],
             uninstall_commands: &["apt-get remove -y nmap"],
         },
@@ -177,9 +363,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "curl",
             aliases: &["http_probe", "http_request"],
             binary_path: "/usr/bin/curl",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y curl" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y curl",
+            }],
             update_commands: &["apt-get install -y --only-upgrade curl"],
             uninstall_commands: &["apt-get remove -y curl"],
         },
@@ -194,7 +381,7 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
                 "command_injection_validate",
                 "file_inclusion_validate",
             ],
-            binary_path: "/usr/bin/nuclei",
+            binary_path: "/usr/local/bin/nuclei",
             install_methods: &[
                 InstallMethod {
                     label: "apt",
@@ -215,15 +402,11 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "afrog",
             aliases: &[],
             binary_path: "/usr/local/bin/afrog",
-            install_methods: &[
-                InstallMethod {
-                    label: "go",
-                    command: "go install -v github.com/zan8th/afrog/v2/cmd/afrog@latest",
-                },
-            ],
-            update_commands: &[
-                "go install -v github.com/zan8th/afrog/v2/cmd/afrog@latest",
-            ],
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install -v github.com/zan8th/afrog/v2/cmd/afrog@latest",
+            }],
+            update_commands: &["go install -v github.com/zan8th/afrog/v2/cmd/afrog@latest"],
             uninstall_commands: &["rm -f /usr/local/bin/afrog"],
         },
         // ── DNS ──────────────────────────────────────────────────────────
@@ -231,9 +414,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "dig",
             aliases: &["dns_lookup"],
             binary_path: "/usr/bin/dig",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y dnsutils" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y dnsutils",
+            }],
             update_commands: &["apt-get install -y --only-upgrade dnsutils"],
             uninstall_commands: &["apt-get remove -y dnsutils"],
         },
@@ -242,9 +426,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "ssh",
             aliases: &["ssh_exec"],
             binary_path: "/usr/bin/ssh",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y openssh-client" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y openssh-client",
+            }],
             update_commands: &["apt-get install -y --only-upgrade openssh-client"],
             uninstall_commands: &["apt-get remove -y openssh-client"],
         },
@@ -252,9 +437,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "psql",
             aliases: &["sql_query"],
             binary_path: "/usr/bin/psql",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y postgresql-client" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y postgresql-client",
+            }],
             update_commands: &["apt-get install -y --only-upgrade postgresql-client"],
             uninstall_commands: &["apt-get remove -y postgresql-client"],
         },
@@ -262,9 +448,12 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
         ToolLifecycle {
             tool_name: "subfinder",
             aliases: &[],
-            binary_path: "/usr/bin/subfinder",
+            binary_path: "/usr/local/bin/subfinder",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y subfinder" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y subfinder",
+                },
                 InstallMethod {
                     label: "go",
                     command: "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
@@ -281,7 +470,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/amass",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y amass" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y amass",
+                },
                 InstallMethod {
                     label: "go",
                     command: "go install -v github.com/owasp-amass/amass/v4/...@master",
@@ -296,50 +488,48 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
         ToolLifecycle {
             tool_name: "dnsx",
             aliases: &[],
-            binary_path: "/usr/bin/dnsx",
-            install_methods: &[
-                InstallMethod {
-                    label: "go",
-                    command: "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
-                },
-            ],
-            update_commands: &[
-                "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
-            ],
-            uninstall_commands: &["rm -f /usr/bin/dnsx"],
+            binary_path: "/usr/local/bin/dnsx",
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
+            }],
+            update_commands: &["go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"],
+            uninstall_commands: &["rm -f /usr/local/bin/dnsx"],
         },
         ToolLifecycle {
             tool_name: "masscan",
             aliases: &[],
             binary_path: "/usr/bin/masscan",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y masscan" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y masscan",
+            }],
             update_commands: &["apt-get install -y --only-upgrade masscan"],
             uninstall_commands: &["apt-get remove -y masscan"],
         },
         ToolLifecycle {
             tool_name: "naabu",
             aliases: &[],
-            binary_path: "/usr/bin/naabu",
-            install_methods: &[
-                InstallMethod {
-                    label: "go",
-                    command: "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest",
-                },
-            ],
+            binary_path: "/usr/local/bin/naabu",
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest",
+            }],
             update_commands: &[
                 "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest",
             ],
-            uninstall_commands: &["rm -f /usr/bin/naabu"],
+            uninstall_commands: &["rm -f /usr/local/bin/naabu"],
         },
         // ── Web discovery / fuzzing ──────────────────────────────────────
         ToolLifecycle {
             tool_name: "ffuf",
             aliases: &[],
-            binary_path: "/usr/bin/ffuf",
+            binary_path: "/usr/local/bin/ffuf",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y ffuf" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y ffuf",
+                },
                 InstallMethod {
                     label: "go",
                     command: "go install github.com/ffuf/ffuf/v2@latest",
@@ -354,9 +544,12 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
         ToolLifecycle {
             tool_name: "gobuster",
             aliases: &[],
-            binary_path: "/usr/bin/gobuster",
+            binary_path: "/usr/local/bin/gobuster",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y gobuster" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y gobuster",
+                },
                 InstallMethod {
                     label: "go",
                     command: "go install github.com/OJ/gobuster/v3@latest",
@@ -373,7 +566,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/feroxbuster",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y feroxbuster" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y feroxbuster",
+                },
                 InstallMethod {
                     label: "cargo",
                     command: "cargo install feroxbuster",
@@ -390,7 +586,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/wfuzz",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y wfuzz" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y wfuzz",
+                },
                 InstallMethod {
                     label: "pip",
                     command: "pip install wfuzz",
@@ -407,7 +606,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &["dir_fuzz"],
             binary_path: "/usr/bin/dirsearch",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y dirsearch" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y dirsearch",
+                },
                 InstallMethod {
                     label: "pip",
                     command: "pip install dirsearch",
@@ -423,9 +625,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "dirb",
             aliases: &[],
             binary_path: "/usr/bin/dirb",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y dirb" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y dirb",
+            }],
             update_commands: &["apt-get install -y --only-upgrade dirb"],
             uninstall_commands: &["apt-get remove -y dirb"],
         },
@@ -434,9 +637,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "nikto",
             aliases: &[],
             binary_path: "/usr/bin/nikto",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y nikto" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y nikto",
+            }],
             update_commands: &["apt-get install -y --only-upgrade nikto"],
             uninstall_commands: &["apt-get remove -y nikto"],
         },
@@ -444,9 +648,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "whatweb",
             aliases: &[],
             binary_path: "/usr/bin/whatweb",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y whatweb" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y whatweb",
+            }],
             update_commands: &["apt-get install -y --only-upgrade whatweb"],
             uninstall_commands: &["apt-get remove -y whatweb"],
         },
@@ -455,7 +660,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/wafw00f",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y wafw00f" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y wafw00f",
+                },
                 InstallMethod {
                     label: "pip",
                     command: "pip install wafw00f",
@@ -471,9 +679,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "wpscan",
             aliases: &["web_wordpress_scan"],
             binary_path: "/usr/bin/wpscan",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y wpscan" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y wpscan",
+            }],
             update_commands: &["apt-get install -y --only-upgrade wpscan"],
             uninstall_commands: &["apt-get remove -y wpscan"],
         },
@@ -481,9 +690,12 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
         ToolLifecycle {
             tool_name: "sqlmap",
             aliases: &["sqlmap_scan"],
-            binary_path: "/usr/bin/sqlmap",
+            binary_path: "/usr/local/bin/sqlmap",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y sqlmap" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y sqlmap",
+                },
                 InstallMethod {
                     label: "git",
                     command: "git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap && ln -sf /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap",
@@ -502,9 +714,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "xsser",
             aliases: &[],
             binary_path: "/usr/bin/xsser",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y xsser" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y xsser",
+            }],
             update_commands: &["apt-get install -y --only-upgrade xsser"],
             uninstall_commands: &["apt-get remove -y xsser"],
         },
@@ -513,7 +726,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &["web_xss_scan"],
             binary_path: "/usr/local/bin/dalfox",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y dalfox" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y dalfox",
+                },
                 InstallMethod {
                     label: "go",
                     command: "go install github.com/hahwul/dalfox/v2@latest",
@@ -523,17 +739,17 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
                 "apt-get install -y --only-upgrade dalfox",
                 "go install github.com/hahwul/dalfox/v2@latest",
             ],
-            uninstall_commands: &[
-                "apt-get remove -y dalfox",
-                "rm -f /usr/local/bin/dalfox",
-            ],
+            uninstall_commands: &["apt-get remove -y dalfox", "rm -f /usr/local/bin/dalfox"],
         },
         ToolLifecycle {
             tool_name: "commix",
             aliases: &[],
             binary_path: "/usr/bin/commix",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y commix" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y commix",
+                },
                 InstallMethod {
                     label: "git",
                     command: "git clone --depth 1 https://github.com/commixproject/commix.git /opt/commix && ln -sf /opt/commix/commix.py /usr/local/bin/commix",
@@ -553,9 +769,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "testssl",
             aliases: &["web_tls_scan"],
             binary_path: "/usr/bin/testssl",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y testssl.sh" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y testssl.sh",
+            }],
             update_commands: &["apt-get install -y --only-upgrade testssl.sh"],
             uninstall_commands: &["apt-get remove -y testssl.sh"],
         },
@@ -564,7 +781,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/sslyze",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y sslyze" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y sslyze",
+                },
                 InstallMethod {
                     label: "pip",
                     command: "pip install sslyze",
@@ -581,7 +801,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/qsslcaudit",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y sslcaudit" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y sslcaudit",
+                },
                 InstallMethod {
                     label: "pip",
                     command: "pip install sslcaudit",
@@ -598,24 +821,21 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "hakrawler",
             aliases: &[],
             binary_path: "/usr/bin/hakrawler",
-            install_methods: &[
-                InstallMethod {
-                    label: "go",
-                    command: "go install github.com/hakluke/hakrawler@latest",
-                },
-            ],
-            update_commands: &[
-                "go install github.com/hakluke/hakrawler@latest",
-            ],
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install github.com/hakluke/hakrawler@latest",
+            }],
+            update_commands: &["go install github.com/hakluke/hakrawler@latest"],
             uninstall_commands: &["rm -f /usr/bin/hakrawler"],
         },
         ToolLifecycle {
             tool_name: "httrack",
             aliases: &[],
             binary_path: "/usr/bin/httrack",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y httrack" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y httrack",
+            }],
             update_commands: &["apt-get install -y --only-upgrade httrack"],
             uninstall_commands: &["apt-get remove -y httrack"],
         },
@@ -623,12 +843,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "arjun",
             aliases: &[],
             binary_path: "/usr/bin/arjun",
-            install_methods: &[
-                InstallMethod {
-                    label: "pip",
-                    command: "pip install arjun",
-                },
-            ],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip install arjun",
+            }],
             update_commands: &["pip install --upgrade arjun"],
             uninstall_commands: &["pip uninstall -y arjun"],
         },
@@ -638,7 +856,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/dnsrecon",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y dnsrecon" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y dnsrecon",
+                },
                 InstallMethod {
                     label: "pip",
                     command: "pip install dnsrecon",
@@ -654,9 +875,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "dnsenum",
             aliases: &[],
             binary_path: "/usr/bin/dnsenum",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y dnsenum" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y dnsenum",
+            }],
             update_commands: &["apt-get install -y --only-upgrade dnsenum"],
             uninstall_commands: &["apt-get remove -y dnsenum"],
         },
@@ -665,7 +887,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/bin/fierce",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y fierce" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y fierce",
+                },
                 InstallMethod {
                     label: "pip",
                     command: "pip install fierce",
@@ -682,9 +907,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "dmitry",
             aliases: &[],
             binary_path: "/usr/bin/dmitry",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y dmitry" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y dmitry",
+            }],
             update_commands: &["apt-get install -y --only-upgrade dmitry"],
             uninstall_commands: &["apt-get remove -y dmitry"],
         },
@@ -692,9 +918,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "theharvester",
             aliases: &[],
             binary_path: "/usr/bin/theharvester",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y theharvester" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y theharvester",
+            }],
             update_commands: &["apt-get install -y --only-upgrade theharvester"],
             uninstall_commands: &["apt-get remove -y theharvester"],
         },
@@ -703,9 +930,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "enum4linux",
             aliases: &[],
             binary_path: "/usr/bin/enum4linux",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y enum4linux" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y enum4linux",
+            }],
             update_commands: &["apt-get install -y --only-upgrade enum4linux"],
             uninstall_commands: &["apt-get remove -y enum4linux"],
         },
@@ -713,9 +941,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "smbmap",
             aliases: &[],
             binary_path: "/usr/bin/smbmap",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y smbmap" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y smbmap",
+            }],
             update_commands: &["apt-get install -y --only-upgrade smbmap"],
             uninstall_commands: &["apt-get remove -y smbmap"],
         },
@@ -723,9 +952,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "smtp-user-enum",
             aliases: &[],
             binary_path: "/usr/bin/smtp-user-enum",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y smtp-user-enum" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y smtp-user-enum",
+            }],
             update_commands: &["apt-get install -y --only-upgrade smtp-user-enum"],
             uninstall_commands: &["apt-get remove -y smtp-user-enum"],
         },
@@ -733,9 +963,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "swaks",
             aliases: &[],
             binary_path: "/usr/bin/swaks",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y swaks" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y swaks",
+            }],
             update_commands: &["apt-get install -y --only-upgrade swaks"],
             uninstall_commands: &["apt-get remove -y swaks"],
         },
@@ -743,9 +974,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "davtest",
             aliases: &[],
             binary_path: "/usr/bin/davtest",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y davtest" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y davtest",
+            }],
             update_commands: &["apt-get install -y --only-upgrade davtest"],
             uninstall_commands: &["apt-get remove -y davtest"],
         },
@@ -753,19 +985,21 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "nbtscan",
             aliases: &[],
             binary_path: "/usr/bin/nbtscan",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y nbtscan" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y nbtscan",
+            }],
             update_commands: &["apt-get install -y --only-upgrade nbtscan"],
             uninstall_commands: &["apt-get remove -y nbtscan"],
         },
         ToolLifecycle {
             tool_name: "netdiscover",
             aliases: &[],
-            binary_path: "/usr/bin/netdiscover",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y netdiscover" },
-            ],
+            binary_path: "/usr/sbin/netdiscover",
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y netdiscover",
+            }],
             update_commands: &["apt-get install -y --only-upgrade netdiscover"],
             uninstall_commands: &["apt-get remove -y netdiscover"],
         },
@@ -774,9 +1008,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "wapiti",
             aliases: &[],
             binary_path: "/usr/bin/wapiti",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y wapiti" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y wapiti",
+            }],
             update_commands: &["apt-get install -y --only-upgrade wapiti"],
             uninstall_commands: &["apt-get remove -y wapiti"],
         },
@@ -784,9 +1019,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "skipfish",
             aliases: &[],
             binary_path: "/usr/bin/skipfish",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y skipfish" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y skipfish",
+            }],
             update_commands: &["apt-get install -y --only-upgrade skipfish"],
             uninstall_commands: &["apt-get remove -y skipfish"],
         },
@@ -794,9 +1030,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "lbd",
             aliases: &[],
             binary_path: "/usr/bin/lbd",
-            install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y lbd" },
-            ],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y lbd",
+            }],
             update_commands: &["apt-get install -y --only-upgrade lbd"],
             uninstall_commands: &["apt-get remove -y lbd"],
         },
@@ -805,7 +1042,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "binwalk",
             aliases: &[],
             binary_path: "/usr/bin/binwalk",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y binwalk" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y binwalk",
+            }],
             update_commands: &["apt-get install -y --only-upgrade binwalk"],
             uninstall_commands: &["apt-get remove -y binwalk"],
         },
@@ -813,7 +1053,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "gdb",
             aliases: &[],
             binary_path: "/usr/bin/gdb",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y gdb" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y gdb",
+            }],
             update_commands: &["apt-get install -y --only-upgrade gdb"],
             uninstall_commands: &["apt-get remove -y gdb"],
         },
@@ -821,7 +1064,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "objdump",
             aliases: &[],
             binary_path: "/usr/bin/objdump",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y binutils" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y binutils",
+            }],
             update_commands: &["apt-get install -y --only-upgrade binutils"],
             uninstall_commands: &["apt-get remove -y binutils"],
         },
@@ -829,7 +1075,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "strings",
             aliases: &[],
             binary_path: "/usr/bin/strings",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y binutils" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y binutils",
+            }],
             update_commands: &["apt-get install -y --only-upgrade binutils"],
             uninstall_commands: &["apt-get remove -y binutils"],
         },
@@ -837,7 +1086,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "xxd",
             aliases: &[],
             binary_path: "/usr/bin/xxd",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y xxd" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y xxd",
+            }],
             update_commands: &["apt-get install -y --only-upgrade xxd"],
             uninstall_commands: &["apt-get remove -y xxd"],
         },
@@ -845,7 +1097,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "checksec",
             aliases: &[],
             binary_path: "/usr/bin/checksec",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y checksec" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y checksec",
+            }],
             update_commands: &["apt-get install -y --only-upgrade checksec"],
             uninstall_commands: &["apt-get remove -y checksec"],
         },
@@ -853,7 +1108,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "ropgadget",
             aliases: &[],
             binary_path: "/usr/local/bin/ROPgadget",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install ROPgadget" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install ROPgadget",
+            }],
             update_commands: &["pip3 install --upgrade ROPgadget"],
             uninstall_commands: &["pip3 uninstall -y ROPgadget"],
         },
@@ -861,7 +1119,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "ropper",
             aliases: &[],
             binary_path: "/usr/local/bin/ropper",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install ropper" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install ropper",
+            }],
             update_commands: &["pip3 install --upgrade ropper"],
             uninstall_commands: &["pip3 uninstall -y ropper"],
         },
@@ -869,7 +1130,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "exiftool",
             aliases: &[],
             binary_path: "/usr/bin/exiftool",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y libimage-exiftool-perl" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y libimage-exiftool-perl",
+            }],
             update_commands: &["apt-get install -y --only-upgrade libimage-exiftool-perl"],
             uninstall_commands: &["apt-get remove -y libimage-exiftool-perl"],
         },
@@ -877,7 +1141,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "foremost",
             aliases: &[],
             binary_path: "/usr/bin/foremost",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y foremost" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y foremost",
+            }],
             update_commands: &["apt-get install -y --only-upgrade foremost"],
             uninstall_commands: &["apt-get remove -y foremost"],
         },
@@ -885,7 +1152,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "steghide",
             aliases: &[],
             binary_path: "/usr/bin/steghide",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y steghide" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y steghide",
+            }],
             update_commands: &["apt-get install -y --only-upgrade steghide"],
             uninstall_commands: &["apt-get remove -y steghide"],
         },
@@ -893,7 +1163,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "zsteg",
             aliases: &[],
             binary_path: "/usr/local/bin/zsteg",
-            install_methods: &[InstallMethod { label: "gem", command: "gem install zsteg" }],
+            install_methods: &[InstallMethod {
+                label: "gem",
+                command: "gem install zsteg",
+            }],
             update_commands: &["gem update zsteg"],
             uninstall_commands: &["gem uninstall zsteg"],
         },
@@ -901,7 +1174,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "volatility3",
             aliases: &["vol3"],
             binary_path: "/usr/local/bin/vol3",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install volatility3" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install volatility3",
+            }],
             update_commands: &["pip3 install --upgrade volatility3"],
             uninstall_commands: &["pip3 uninstall -y volatility3"],
         },
@@ -909,7 +1185,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "hashcat",
             aliases: &[],
             binary_path: "/usr/bin/hashcat",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y hashcat" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y hashcat",
+            }],
             update_commands: &["apt-get install -y --only-upgrade hashcat"],
             uninstall_commands: &["apt-get remove -y hashcat"],
         },
@@ -917,7 +1196,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "john",
             aliases: &[],
             binary_path: "/usr/sbin/john",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y john" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y john",
+            }],
             update_commands: &["apt-get install -y --only-upgrade john"],
             uninstall_commands: &["apt-get remove -y john"],
         },
@@ -925,7 +1207,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "hydra",
             aliases: &[],
             binary_path: "/usr/bin/hydra",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y hydra" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y hydra",
+            }],
             update_commands: &["apt-get install -y --only-upgrade hydra"],
             uninstall_commands: &["apt-get remove -y hydra"],
         },
@@ -933,7 +1218,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "arp-scan",
             aliases: &[],
             binary_path: "/usr/sbin/arp-scan",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y arp-scan" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y arp-scan",
+            }],
             update_commands: &["apt-get install -y --only-upgrade arp-scan"],
             uninstall_commands: &["apt-get remove -y arp-scan"],
         },
@@ -941,7 +1229,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "rpcclient",
             aliases: &[],
             binary_path: "/usr/bin/rpcclient",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y smbclient" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y smbclient",
+            }],
             update_commands: &["apt-get install -y --only-upgrade smbclient"],
             uninstall_commands: &["apt-get remove -y smbclient"],
         },
@@ -949,7 +1240,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "dotdotpwn",
             aliases: &[],
             binary_path: "/usr/bin/dotdotpwn",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y dotdotpwn" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y dotdotpwn",
+            }],
             update_commands: &["apt-get install -y --only-upgrade dotdotpwn"],
             uninstall_commands: &["apt-get remove -y dotdotpwn"],
         },
@@ -958,8 +1252,14 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             aliases: &[],
             binary_path: "/usr/local/bin/rustscan",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y rustscan" },
-                InstallMethod { label: "cargo", command: "cargo install rustscan" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y rustscan",
+                },
+                InstallMethod {
+                    label: "cargo",
+                    command: "cargo install rustscan",
+                },
             ],
             update_commands: &["cargo install --force rustscan"],
             uninstall_commands: &["apt-get remove -y rustscan"],
@@ -968,7 +1268,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "waybackurls",
             aliases: &[],
             binary_path: "/usr/local/bin/waybackurls",
-            install_methods: &[InstallMethod { label: "go", command: "go install github.com/tomnomnom/waybackurls@latest" }],
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install github.com/tomnomnom/waybackurls@latest",
+            }],
             update_commands: &["go install github.com/tomnomnom/waybackurls@latest"],
             uninstall_commands: &["rm -f /usr/local/bin/waybackurls"],
         },
@@ -988,15 +1291,21 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "radare2",
             aliases: &["r2"],
             binary_path: "/usr/bin/r2",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y radare2" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y radare2",
+            }],
             update_commands: &["apt-get install -y --only-upgrade radare2"],
             uninstall_commands: &["apt-get remove -y radare2"],
         },
         ToolLifecycle {
             tool_name: "responder",
             aliases: &[],
-            binary_path: "/usr/bin/responder",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y responder" }],
+            binary_path: "/usr/sbin/responder",
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y responder",
+            }],
             update_commands: &["apt-get install -y --only-upgrade responder"],
             uninstall_commands: &["apt-get remove -y responder"],
         },
@@ -1004,17 +1313,26 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "msfvenom",
             aliases: &[],
             binary_path: "/usr/bin/msfvenom",
-            install_methods: &[InstallMethod { label: "apt", command: "apt-get install -y metasploit-framework" }],
+            install_methods: &[InstallMethod {
+                label: "apt",
+                command: "apt-get install -y metasploit-framework",
+            }],
             update_commands: &["apt-get install -y --only-upgrade metasploit-framework"],
             uninstall_commands: &["apt-get remove -y metasploit-framework"],
         },
         ToolLifecycle {
             tool_name: "trivy",
             aliases: &[],
-            binary_path: "/usr/local/bin/trivy",
+            binary_path: "/usr/bin/trivy",
             install_methods: &[
-                InstallMethod { label: "apt", command: "apt-get install -y trivy" },
-                InstallMethod { label: "go", command: "go install github.com/aquasecurity/trivy/cmd/trivy@latest" },
+                InstallMethod {
+                    label: "apt",
+                    command: "apt-get install -y trivy",
+                },
+                InstallMethod {
+                    label: "go",
+                    command: "go install github.com/aquasecurity/trivy/cmd/trivy@latest",
+                },
             ],
             update_commands: &["apt-get install -y --only-upgrade trivy"],
             uninstall_commands: &["apt-get remove -y trivy"],
@@ -1023,7 +1341,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "checkov",
             aliases: &[],
             binary_path: "/usr/local/bin/checkov",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install checkov" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install checkov",
+            }],
             update_commands: &["pip3 install --upgrade checkov"],
             uninstall_commands: &["pip3 uninstall -y checkov"],
         },
@@ -1031,7 +1352,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "kube-hunter",
             aliases: &[],
             binary_path: "/usr/local/bin/kube-hunter",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install kube-hunter" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install kube-hunter",
+            }],
             update_commands: &["pip3 install --upgrade kube-hunter"],
             uninstall_commands: &["pip3 uninstall -y kube-hunter"],
         },
@@ -1039,7 +1363,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "scout-suite",
             aliases: &["scout"],
             binary_path: "/usr/local/bin/scout",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install scoutsuite" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install scoutsuite",
+            }],
             update_commands: &["pip3 install --upgrade scoutsuite"],
             uninstall_commands: &["pip3 uninstall -y scoutsuite"],
         },
@@ -1047,7 +1374,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "terrascan",
             aliases: &[],
             binary_path: "/usr/local/bin/terrascan",
-            install_methods: &[InstallMethod { label: "go", command: "go install github.com/tenable/terrascan/cmd/terrascan@latest" }],
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install github.com/tenable/terrascan/cmd/terrascan@latest",
+            }],
             update_commands: &["go install github.com/tenable/terrascan/cmd/terrascan@latest"],
             uninstall_commands: &["rm -f /usr/local/bin/terrascan"],
         },
@@ -1055,7 +1385,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "prowler",
             aliases: &[],
             binary_path: "/usr/local/bin/prowler",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install prowler" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install prowler",
+            }],
             update_commands: &["pip3 install --upgrade prowler"],
             uninstall_commands: &["pip3 uninstall -y prowler"],
         },
@@ -1063,7 +1396,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "pacu",
             aliases: &[],
             binary_path: "/usr/local/bin/pacu",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install pacu" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install pacu",
+            }],
             update_commands: &["pip3 install --upgrade pacu"],
             uninstall_commands: &["pip3 uninstall -y pacu"],
         },
@@ -1071,7 +1407,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "jaeles",
             aliases: &[],
             binary_path: "/usr/local/bin/jaeles",
-            install_methods: &[InstallMethod { label: "go", command: "go install github.com/jaeles-project/jaeles@latest" }],
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install github.com/jaeles-project/jaeles@latest",
+            }],
             update_commands: &["go install github.com/jaeles-project/jaeles@latest"],
             uninstall_commands: &["rm -f /usr/local/bin/jaeles"],
         },
@@ -1079,7 +1418,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "pwninit",
             aliases: &[],
             binary_path: "/usr/local/bin/pwninit",
-            install_methods: &[InstallMethod { label: "cargo", command: "cargo install pwninit" }],
+            install_methods: &[InstallMethod {
+                label: "cargo",
+                command: "cargo install pwninit",
+            }],
             update_commands: &["cargo install --force pwninit"],
             uninstall_commands: &["rm -f /usr/local/bin/pwninit"],
         },
@@ -1087,7 +1429,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "one-gadget",
             aliases: &[],
             binary_path: "/usr/local/bin/one_gadget",
-            install_methods: &[InstallMethod { label: "gem", command: "gem install one_gadget" }],
+            install_methods: &[InstallMethod {
+                label: "gem",
+                command: "gem install one_gadget",
+            }],
             update_commands: &["gem update one_gadget"],
             uninstall_commands: &["gem uninstall one_gadget"],
         },
@@ -1095,15 +1440,21 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "hashpump",
             aliases: &[],
             binary_path: "/usr/local/bin/hashpump",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install hashpump" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install hashpump",
+            }],
             update_commands: &["pip3 install --upgrade hashpump"],
             uninstall_commands: &["pip3 uninstall -y hashpump"],
         },
         ToolLifecycle {
             tool_name: "impacket",
             aliases: &["impacket-secretsdump", "impacket-smbclient"],
-            binary_path: "/usr/local/bin/impacket-secretsdump",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install impacket" }],
+            binary_path: "/usr/bin/impacket-secretsdump",
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install impacket",
+            }],
             update_commands: &["pip3 install --upgrade impacket"],
             uninstall_commands: &["pip3 uninstall -y impacket"],
         },
@@ -1111,7 +1462,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "netexec",
             aliases: &["nxc"],
             binary_path: "/usr/local/bin/netexec",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install netexec" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install netexec",
+            }],
             update_commands: &["pip3 install --upgrade netexec"],
             uninstall_commands: &["pip3 uninstall -y netexec"],
         },
@@ -1119,7 +1473,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "bloodhound",
             aliases: &["bloodhound-python"],
             binary_path: "/usr/local/bin/bloodhound-python",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install bloodhound" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install bloodhound",
+            }],
             update_commands: &["pip3 install --upgrade bloodhound"],
             uninstall_commands: &["pip3 uninstall -y bloodhound"],
         },
@@ -1127,7 +1484,10 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             tool_name: "enum4linux-ng",
             aliases: &[],
             binary_path: "/usr/local/bin/enum4linux-ng",
-            install_methods: &[InstallMethod { label: "pip", command: "pip3 install enum4linux-ng" }],
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install enum4linux-ng",
+            }],
             update_commands: &["pip3 install --upgrade enum4linux-ng"],
             uninstall_commands: &["pip3 uninstall -y enum4linux-ng"],
         },
@@ -1137,9 +1497,9 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
 /// Look up a lifecycle entry by tool name. Matches against both the canonical
 /// `tool_name` and any listed `aliases`.
 pub fn find(tool_name: &str) -> Option<ToolLifecycle> {
-    all_host_tools().into_iter().find(|t| {
-        t.tool_name == tool_name || t.aliases.contains(&tool_name)
-    })
+    all_host_tools()
+        .into_iter()
+        .find(|t| t.tool_name == tool_name || t.aliases.contains(&tool_name))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
@@ -1209,30 +1569,82 @@ mod tests {
     }
 
     #[test]
+    fn binary_names_cover_file_name_and_aliases() {
+        let nmap = find("tcp_scan").unwrap();
+        assert_eq!(nmap.binary_file_name(), "nmap");
+        let names = nmap.binary_names();
+        assert!(names.iter().any(|name| name == "nmap"));
+        assert!(names.iter().any(|name| name == "tcp_scan"));
+        assert!(names.iter().any(|name| name == "nmap_scan"));
+    }
+
+    #[test]
     fn all_tools_covered_by_prepare_tool_have_lifecycle() {
         // Every tool name in prepare_tool() must be find-able here.
         // This test mirrors the list in tool_registry.rs.
         let all_names = [
-            "tcp_scan", "nmap", "nmap_scan",
-            "http_probe", "curl", "http_request",
-            "nuclei", "web_vuln_scan",
-            "sqli_validate", "xss_validate", "csrf_validate",
-            "command_injection_validate", "file_inclusion_validate",
+            "tcp_scan",
+            "nmap",
+            "nmap_scan",
+            "http_probe",
+            "curl",
+            "http_request",
+            "nuclei",
+            "web_vuln_scan",
+            "sqli_validate",
+            "xss_validate",
+            "csrf_validate",
+            "command_injection_validate",
+            "file_inclusion_validate",
             "afrog",
             "dns_lookup",
             "ssh_exec",
             "sql_query",
-            "subfinder", "amass", "dnsx", "masscan", "naabu",
-            "ffuf", "gobuster", "feroxbuster", "wfuzz",
-            "dirsearch", "dir_fuzz", "dirb",
-            "nikto", "whatweb", "wafw00f", "wpscan", "web_wordpress_scan",
-            "sqlmap", "sqlmap_scan", "xsser", "dalfox", "web_xss_scan", "commix",
-            "testssl", "web_tls_scan", "sslyze", "qsslcaudit",
-            "hakrawler", "httrack", "arjun",
-            "dnsrecon", "dnsenum", "fierce",
-            "dmitry", "theharvester",
-            "enum4linux", "smbmap", "smtp-user-enum", "swaks", "davtest", "nbtscan", "netdiscover",
-            "wapiti", "skipfish", "lbd",
+            "subfinder",
+            "amass",
+            "dnsx",
+            "masscan",
+            "naabu",
+            "ffuf",
+            "gobuster",
+            "feroxbuster",
+            "wfuzz",
+            "dirsearch",
+            "dir_fuzz",
+            "dirb",
+            "nikto",
+            "whatweb",
+            "wafw00f",
+            "wpscan",
+            "web_wordpress_scan",
+            "sqlmap",
+            "sqlmap_scan",
+            "xsser",
+            "dalfox",
+            "web_xss_scan",
+            "commix",
+            "testssl",
+            "web_tls_scan",
+            "sslyze",
+            "qsslcaudit",
+            "hakrawler",
+            "httrack",
+            "arjun",
+            "dnsrecon",
+            "dnsenum",
+            "fierce",
+            "dmitry",
+            "theharvester",
+            "enum4linux",
+            "smbmap",
+            "smtp-user-enum",
+            "swaks",
+            "davtest",
+            "nbtscan",
+            "netdiscover",
+            "wapiti",
+            "skipfish",
+            "lbd",
         ];
         for name in all_names {
             assert!(
