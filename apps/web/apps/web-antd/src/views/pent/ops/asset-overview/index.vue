@@ -245,7 +245,7 @@ onMounted(fetchStats);
 
       <a-row :gutter="16" style="margin-top: 12px">
         <a-col :xs="24" :lg="12">
-          <a-card size="small" title="资产变化趋势">
+          <a-card size="small" title="资产变化趋势" style="height: 100%">
             <template #extra>
               <span style="font-size: 12px; margin-right: 16px">
                 新增资产
@@ -266,7 +266,7 @@ onMounted(fetchStats);
           </a-card>
         </a-col>
         <a-col :xs="24" :lg="12">
-          <a-card size="small" title="风险发现趋势">
+          <a-card size="small" title="风险发现趋势" style="height: 100%">
             <template #extra>
               <span style="font-size: 12px; margin-right: 16px">
                 新增漏洞

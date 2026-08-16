@@ -256,7 +256,7 @@ onMounted(refresh);
         placeholder="分类"
         allow-clear
         style="width: 130px"
-        :options="categories.map((c) => ({ label: c, value: c }))"
+        :options="categories.map((c) => ({ label: categoryLabel[c] || c, value: c }))"
         @change="fetchFacts"
       />
       <a-select
@@ -357,7 +357,7 @@ onMounted(refresh);
             <a-form-item label="分类">
               <a-select
                 v-model:value="form.category"
-                :options="categories.map((c) => ({ label: c, value: c }))"
+                :options="categories.map((c) => ({ label: categoryLabel[c] || c, value: c }))"
               />
             </a-form-item>
           </a-col>
@@ -404,7 +404,7 @@ onMounted(refresh);
       <template v-if="detail">
         <a-descriptions :column="1" size="small" bordered>
           <a-descriptions-item label="fact_key">{{ detail.fact_key }}</a-descriptions-item>
-          <a-descriptions-item label="分类">{{ detail.category }}</a-descriptions-item>
+          <a-descriptions-item label="分类">{{ categoryLabel[detail.category] || detail.category }}</a-descriptions-item>
           <a-descriptions-item label="置信度">
             {{ confidenceLabel[detail.confidence] || detail.confidence }}
           </a-descriptions-item>
