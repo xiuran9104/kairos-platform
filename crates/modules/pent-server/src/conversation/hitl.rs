@@ -5,6 +5,8 @@ use std::{collections::HashSet, time::Duration};
 use kairos_platform_ai_api::{ChatMessage, ChatRequest};
 use kairos_platform_ai_server::AiModelFactory;
 use kairos_platform_framework_database::PgPool;
+pub use kairos_platform_pent_runtime::ports::ToolApprovalOutcome as HitlOutcome;
+use kairos_platform_pent_runtime::ports::{ToolApprovalGate, ToolApprovalRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -98,12 +100,6 @@ impl HitlPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum HitlOutcome {
-    Approved(String),
-    Rejected(String),
-}
-
 #[derive(Clone)]
 pub struct HitlGate {
     pool: PgPool,
@@ -114,7 +110,7 @@ impl HitlGate {
         Self { pool }
     }
 
-    pub async fn review(
+    async fn review_tool(
         &self,
         run_id: &str,
         session_id: &str,
@@ -287,6 +283,20 @@ impl HitlGate {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolApprovalGate for HitlGate {
+    async fn review(&self, request: &ToolApprovalRequest) -> anyhow::Result<HitlOutcome> {
+        self.review_tool(
+            &request.run_id,
+            &request.session_id,
+            &request.tool_call_id,
+            &request.tool_name,
+            &request.arguments,
+        )
+        .await
     }
 }
 

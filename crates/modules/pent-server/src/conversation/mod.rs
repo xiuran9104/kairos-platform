@@ -37,6 +37,7 @@ pub(crate) fn build_runtime(
         Arc::new(InstructionSink::new(pool.clone()));
     let tool_executor: Arc<dyn ConversationToolExecutor> =
         Arc::new(tool_executor::ServerConversationToolExecutor);
+    let approval_gate: Arc<dyn ToolApprovalGate> = Arc::new(hitl::HitlGate::new(pool.clone()));
     let events: Arc<dyn ConversationEventSink> = Arc::new(LoggingConversationEventSink);
     let agent_sessions: Arc<dyn AgentSessionFactory> =
         Arc::new(agent_manager::ServerAgentSessionFactory::new(
@@ -45,6 +46,7 @@ pub(crate) fn build_runtime(
             context_source.clone(),
             knowledge_source.clone(),
             tool_executor.clone(),
+            approval_gate.clone(),
             events.clone(),
             intent_detector.clone(),
             pool.clone(),
@@ -57,6 +59,7 @@ pub(crate) fn build_runtime(
         knowledge_source,
         instruction_sink,
         tool_executor,
+        approval_gate,
         agent_sessions,
         events,
         pool.clone(),

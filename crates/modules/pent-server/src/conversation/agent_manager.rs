@@ -14,7 +14,8 @@ use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessa
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
-    ConversationToolExecutor, RuntimeToolCall, ToolExecutionContext,
+    ConversationToolExecutor, RuntimeToolCall, ToolApprovalGate, ToolApprovalOutcome,
+    ToolApprovalRequest, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
@@ -96,6 +97,7 @@ impl AgentManager {
         context_source: Arc<dyn ConversationContextSource>,
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         tool_executor: Arc<dyn ConversationToolExecutor>,
+        approval_gate: Arc<dyn ToolApprovalGate>,
         events: Arc<dyn ConversationEventSink>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
         pool: kairos_platform_framework_database::PgPool,
@@ -156,6 +158,7 @@ impl AgentManager {
                 context_source,
                 knowledge_source,
                 tool_executor,
+                approval_gate,
                 events,
                 intent_detector,
                 pool,
@@ -244,6 +247,7 @@ pub struct ServerAgentSessionFactory {
     context_source: Arc<dyn ConversationContextSource>,
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
+    approval_gate: Arc<dyn ToolApprovalGate>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
     pool: kairos_platform_framework_database::PgPool,
@@ -257,6 +261,7 @@ impl ServerAgentSessionFactory {
         context_source: Arc<dyn ConversationContextSource>,
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         tool_executor: Arc<dyn ConversationToolExecutor>,
+        approval_gate: Arc<dyn ToolApprovalGate>,
         events: Arc<dyn ConversationEventSink>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
         pool: kairos_platform_framework_database::PgPool,
@@ -267,6 +272,7 @@ impl ServerAgentSessionFactory {
             context_source,
             knowledge_source,
             tool_executor,
+            approval_gate,
             events,
             intent_detector,
             pool,
@@ -283,6 +289,7 @@ impl AgentSessionFactory for ServerAgentSessionFactory {
             context_source: self.context_source.clone(),
             knowledge_source: self.knowledge_source.clone(),
             tool_executor: self.tool_executor.clone(),
+            approval_gate: self.approval_gate.clone(),
             events: self.events.clone(),
             intent_detector: self.intent_detector.clone(),
             pool: self.pool.clone(),
@@ -297,6 +304,7 @@ struct ServerAgentSession {
     context_source: Arc<dyn ConversationContextSource>,
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
+    approval_gate: Arc<dyn ToolApprovalGate>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
     pool: kairos_platform_framework_database::PgPool,
@@ -321,6 +329,7 @@ impl AgentSession for ServerAgentSession {
                 self.context_source.clone(),
                 self.knowledge_source.clone(),
                 self.tool_executor.clone(),
+                self.approval_gate.clone(),
                 self.events.clone(),
                 self.intent_detector.clone(),
                 self.pool.clone(),
@@ -430,6 +439,7 @@ async fn execute_sub_agent(
     context_source: Arc<dyn ConversationContextSource>,
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
+    approval_gate: Arc<dyn ToolApprovalGate>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
     pool: kairos_platform_framework_database::PgPool,
@@ -537,7 +547,6 @@ async fn execute_sub_agent(
         loop_engine.record_model_usage(output.usage.input_tokens, output.usage.output_tokens);
 
         if !output.tool_calls.is_empty() {
-            let gate = super::hitl::HitlGate::new(pool.clone());
             let mut hitl_rejections = std::collections::HashMap::new();
             let mut output = output;
             for tool_call in &mut output.tool_calls {
@@ -555,20 +564,20 @@ async fn execute_sub_agent(
                 if hitl_rejections.contains_key(&tool_call.id) {
                     continue;
                 }
-                match gate
-                    .review(
-                        &run_id,
-                        session_id,
-                        &tool_call.id,
-                        &tool_call.name,
-                        &tool_call.arguments,
-                    )
+                match approval_gate
+                    .review(&ToolApprovalRequest {
+                        run_id: run_id.clone(),
+                        session_id: session_id.to_string(),
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        arguments: tool_call.arguments.clone(),
+                    })
                     .await
                 {
-                    Ok(super::hitl::HitlOutcome::Approved(arguments)) => {
+                    Ok(ToolApprovalOutcome::Approved(arguments)) => {
                         tool_call.arguments = arguments;
                     }
-                    Ok(super::hitl::HitlOutcome::Rejected(reason)) => {
+                    Ok(ToolApprovalOutcome::Rejected(reason)) => {
                         hitl_rejections.insert(tool_call.id.clone(), reason);
                     }
                     Err(error) => {

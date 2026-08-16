@@ -80,6 +80,26 @@ pub trait ConversationToolExecutor: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+pub struct ToolApprovalRequest {
+    pub run_id: String,
+    pub session_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolApprovalOutcome {
+    Approved(String),
+    Rejected(String),
+}
+
+#[async_trait]
+pub trait ToolApprovalGate: Send + Sync {
+    async fn review(&self, request: &ToolApprovalRequest) -> anyhow::Result<ToolApprovalOutcome>;
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentSpawnRequest {
     pub description: String,
     pub prompt: String,
@@ -320,6 +340,18 @@ mod tests {
 
     struct StubToolExecutor;
 
+    struct StubToolApprovalGate;
+
+    #[async_trait]
+    impl ToolApprovalGate for StubToolApprovalGate {
+        async fn review(
+            &self,
+            request: &ToolApprovalRequest,
+        ) -> anyhow::Result<ToolApprovalOutcome> {
+            Ok(ToolApprovalOutcome::Approved(request.arguments.clone()))
+        }
+    }
+
     #[async_trait]
     impl ConversationToolExecutor for StubToolExecutor {
         async fn execute(
@@ -340,6 +372,12 @@ mod tests {
     fn conversation_tool_executor_is_object_safe() {
         let executor = StubToolExecutor;
         let _: &dyn ConversationToolExecutor = &executor;
+    }
+
+    #[test]
+    fn tool_approval_gate_is_object_safe() {
+        let gate = StubToolApprovalGate;
+        let _: &dyn ToolApprovalGate = &gate;
     }
 
     #[test]

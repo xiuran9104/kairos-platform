@@ -15,7 +15,7 @@ use super::{
     ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
     ConversationToolExecutor, ModelTurnOutput, RuntimeAgentStatus, RuntimeToolCall,
-    ToolExecutionContext,
+    ToolApprovalGate, ToolApprovalOutcome, ToolApprovalRequest, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
@@ -160,6 +160,7 @@ pub struct ConversationRuntime {
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     instruction_sink: Arc<dyn ConversationInstructionSink>,
     tool_executor: Arc<dyn ConversationToolExecutor>,
+    approval_gate: Arc<dyn ToolApprovalGate>,
     agent_sessions: Arc<dyn AgentSessionFactory>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
@@ -175,6 +176,7 @@ impl ConversationRuntime {
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         instruction_sink: Arc<dyn ConversationInstructionSink>,
         tool_executor: Arc<dyn ConversationToolExecutor>,
+        approval_gate: Arc<dyn ToolApprovalGate>,
         agent_sessions: Arc<dyn AgentSessionFactory>,
         events: Arc<dyn ConversationEventSink>,
         pool: kairos_platform_framework_database::PgPool,
@@ -187,6 +189,7 @@ impl ConversationRuntime {
             knowledge_source,
             instruction_sink,
             tool_executor,
+            approval_gate,
             agent_sessions,
             events,
             nats: None,
@@ -719,25 +722,25 @@ impl ConversationRuntime {
                     }
                 }
                 if let Some(run_id) = context.run_id.as_deref() {
-                    let gate = super::hitl::HitlGate::new(self.pool.clone());
                     for tool_call in &mut output.tool_calls {
                         if hitl_rejections.contains_key(&tool_call.id) {
                             continue;
                         }
-                        match gate
-                            .review(
-                                run_id,
-                                session_id,
-                                &tool_call.id,
-                                &tool_call.name,
-                                &tool_call.arguments,
-                            )
+                        match self
+                            .approval_gate
+                            .review(&ToolApprovalRequest {
+                                run_id: run_id.to_string(),
+                                session_id: session_id.to_string(),
+                                tool_call_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                                arguments: tool_call.arguments.clone(),
+                            })
                             .await
                         {
-                            Ok(super::hitl::HitlOutcome::Approved(arguments)) => {
+                            Ok(ToolApprovalOutcome::Approved(arguments)) => {
                                 tool_call.arguments = arguments;
                             }
-                            Ok(super::hitl::HitlOutcome::Rejected(reason)) => {
+                            Ok(ToolApprovalOutcome::Rejected(reason)) => {
                                 hitl_rejections.insert(tool_call.id.clone(), reason);
                             }
                             Err(error) => {
