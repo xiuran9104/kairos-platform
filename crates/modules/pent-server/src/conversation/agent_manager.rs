@@ -11,7 +11,9 @@ use tokio::sync::Mutex;
 use chrono::Utc;
 use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessageType};
 
-use super::agent_loop::{AgentLoopEngine, AgentLoopLimits, AgentLoopStop};
+use super::agent_loop::{
+    AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
+};
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
@@ -231,72 +233,6 @@ impl AgentManager {
 }
 
 // ── Sub-agent execution ─────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SubAgentDirective {
-    Final(String),
-    Replan(String),
-    NoPath(String),
-    AskUser(String),
-    Candidate(String),
-}
-
-fn parse_sub_agent_directive(content: &str) -> SubAgentDirective {
-    let content = content.trim();
-
-    // JSON action protocol
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-        if let Some(action) = parsed.get("action").and_then(serde_json::Value::as_str) {
-            let body = parsed
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let fallback = if body.is_empty() {
-                content.to_string()
-            } else {
-                body
-            };
-            return match action {
-                "final" | "FINAL" => SubAgentDirective::Final(fallback),
-                "replan" | "REPLAN" => SubAgentDirective::Replan(fallback),
-                "no_path" | "NO_PATH" => SubAgentDirective::NoPath(fallback),
-                "ask_user" | "ASK_USER" => SubAgentDirective::AskUser(fallback),
-                _ => SubAgentDirective::Candidate(content.to_string()),
-            };
-        }
-    }
-
-    // Text prefix protocol
-    for marker in ["FINAL:", "Final:", "final:", "最终结果：", "完成："] {
-        if let Some(v) = content.strip_prefix(marker) {
-            return SubAgentDirective::Final(v.trim().to_string());
-        }
-    }
-    for marker in ["REPLAN:", "Replan:", "replan:", "重新规划："] {
-        if let Some(v) = content.strip_prefix(marker) {
-            return SubAgentDirective::Replan(v.trim().to_string());
-        }
-    }
-    for marker in [
-        "NO_PATH:",
-        "no_path:",
-        "无法继续：",
-        "没有可继续验证的路径：",
-    ] {
-        if let Some(v) = content.strip_prefix(marker) {
-            return SubAgentDirective::NoPath(v.trim().to_string());
-        }
-    }
-    for marker in ["ASK_USER:", "ask_user:", "需要用户："] {
-        if let Some(v) = content.strip_prefix(marker) {
-            return SubAgentDirective::AskUser(v.trim().to_string());
-        }
-    }
-
-    SubAgentDirective::Candidate(content.to_string())
-}
 
 async fn execute_sub_agent_inline_tool(
     tool_call_id: &str,
@@ -686,11 +622,11 @@ async fn execute_sub_agent(
 
         // ── No tool calls — parse lifecycle action ──
         let content = output.content.trim();
-        let directive = parse_sub_agent_directive(content);
+        let directive = parse_agent_directive(content);
         let loop_checkpoint = loop_engine.checkpoint();
 
         match directive {
-            SubAgentDirective::Final(text) => {
+            AgentDirective::Final(text) => {
                 if loop_checkpoint.tool_call_count < SUB_AGENT_MIN_TOOL_CALLS {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("sub_gate_reject:{}", agent_id),
@@ -716,7 +652,7 @@ async fn execute_sub_agent(
                 final_output = Some(text);
                 break;
             }
-            SubAgentDirective::Replan(reason) => {
+            AgentDirective::Replan(reason) => {
                 context.recent_messages.push(AgentMessage {
                     message_id: format!("sub_replan:{}:{}", agent_id, round),
                     role: "assistant".into(),
@@ -731,7 +667,7 @@ async fn execute_sub_agent(
                 });
                 continue;
             }
-            SubAgentDirective::NoPath(reason) => {
+            AgentDirective::NoPath(reason) => {
                 if loop_checkpoint.tool_call_count == 0 {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("sub_no_path_reject:{}", agent_id),
@@ -744,11 +680,11 @@ async fn execute_sub_agent(
                 final_output = Some(format!("NO_PATH: {reason}"));
                 break;
             }
-            SubAgentDirective::AskUser(question) => {
+            AgentDirective::AskUser(question) => {
                 final_output = Some(format!("ASK_USER: {question}"));
                 break;
             }
-            SubAgentDirective::Candidate(text) => {
+            AgentDirective::Candidate(text) => {
                 if loop_checkpoint.tool_call_count >= SUB_AGENT_MIN_TOOL_CALLS
                     && loop_checkpoint.effective_observations > 0
                 {

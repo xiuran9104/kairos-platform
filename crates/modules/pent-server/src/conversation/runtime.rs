@@ -6,7 +6,9 @@ use kairos_platform_pent_api::{
     ConversationMessageType, ConversationTurnStatus,
 };
 
-use super::agent_loop::{AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits};
+use super::agent_loop::{
+    AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
+};
 use super::rmos::{
     AttackGraph, KnowledgeCache, PentestMemory,
     injector::{build_injected_context, prepare_injection},
@@ -28,24 +30,6 @@ const MAX_TURN_RUNTIME_SECS: u64 = 2 * 60 * 60;
 const MAX_MODEL_TOOL_OBSERVATION_CHARS: usize = 8_000;
 const MAX_RUN_SUMMARY_CHARS: usize = 12_000;
 const DEFAULT_MAX_CONSECUTIVE_MODEL_ERRORS: usize = 3;
-
-/// Autonomous agent lifecycle actions. The model MUST emit one of these
-/// (as a text prefix or JSON block) when it does not issue tool calls.
-/// Ordinary chat without a security objective does not need these markers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AgentDirective {
-    /// Task complete; factual conclusions cite real Evidence IDs.
-    Final(String),
-    /// Blocked on missing information that only the user can provide.
-    AskUser(String),
-    /// No viable path within current authorization, tools, and budget.
-    NoPath(String),
-    /// Current strategy failed; switch approach and execute immediately.
-    Replan(String),
-    /// Text-only response with no explicit directive — treated as a
-    /// candidate FINAL and subject to the evidence completion gate.
-    CandidateFinal(String),
-}
 
 /// Autonomous loop injection message sent to the model at the start of every
 /// tool loop. This reminds the model it is operating in autonomous mode and
@@ -1278,7 +1262,7 @@ impl ConversationRuntime {
                     });
                     continue;
                 }
-                AgentDirective::Final(candidate) | AgentDirective::CandidateFinal(candidate) => {
+                AgentDirective::Final(candidate) | AgentDirective::Candidate(candidate) => {
                     if let Some(rejection) =
                         scan_progress.final_rejection(&candidate, &evidence_ids)
                     {
@@ -2159,77 +2143,6 @@ fn compact_model_observation(content: &str) -> String {
     )
 }
 
-/// Parse the model's text-only response into an autonomous agent directive.
-///
-/// Supports two formats:
-/// 1. **Text prefix** — `FINAL: <content>`, `ASK_USER: <question>`, etc.
-///    Chinese equivalents like `最终结果：` and `需要用户：` are also accepted.
-/// 2. **JSON action block** — A JSON object with an `action` field:
-///    `{"action":"final","content":"...","evidence_refs":["ev-1"]}`
-///    This format is preferred when the model can produce structured output.
-fn parse_agent_directive(content: &str) -> AgentDirective {
-    let content = content.trim();
-
-    // ── JSON structured action protocol ──────────────────────────
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-        if let Some(action) = parsed.get("action").and_then(serde_json::Value::as_str) {
-            let body = parsed
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let fallback = if body.is_empty() {
-                content.to_string()
-            } else {
-                body
-            };
-            match action {
-                "final" | "FINAL" => return AgentDirective::Final(fallback),
-                "ask_user" | "ASK_USER" => return AgentDirective::AskUser(fallback),
-                "no_path" | "NO_PATH" => return AgentDirective::NoPath(fallback),
-                "replan" | "REPLAN" => return AgentDirective::Replan(fallback),
-                _ => {}
-            }
-        }
-    }
-
-    // ── Text prefix protocol ─────────────────────────────────────
-    for marker in ["FINAL:", "Final:", "final:", "最终结果：", "完成："] {
-        if let Some(value) = content.strip_prefix(marker) {
-            return AgentDirective::Final(value.trim().to_string());
-        }
-    }
-    for marker in [
-        "ASK_USER:",
-        "Ask user:",
-        "ask_user:",
-        "需要用户：",
-        "请用户确认：",
-    ] {
-        if let Some(value) = content.strip_prefix(marker) {
-            return AgentDirective::AskUser(value.trim().to_string());
-        }
-    }
-    for marker in [
-        "NO_PATH:",
-        "No viable path:",
-        "no_path:",
-        "无法继续：",
-        "没有可继续验证的路径：",
-    ] {
-        if let Some(value) = content.strip_prefix(marker) {
-            return AgentDirective::NoPath(value.trim().to_string());
-        }
-    }
-    for marker in ["REPLAN:", "Replan:", "replan:", "重新规划："] {
-        if let Some(value) = content.strip_prefix(marker) {
-            return AgentDirective::Replan(value.trim().to_string());
-        }
-    }
-    AgentDirective::CandidateFinal(content.to_string())
-}
-
 fn push_gate_rejection(
     context: &mut ConversationContext,
     round: usize,
@@ -2285,7 +2198,7 @@ fn normalize_budget_finalization(content: &str, stop_reason: &str) -> String {
         AgentDirective::Final(value)
         | AgentDirective::NoPath(value)
         | AgentDirective::AskUser(value)
-        | AgentDirective::CandidateFinal(value)
+        | AgentDirective::Candidate(value)
         | AgentDirective::Replan(value) => value,
     };
     format!(
@@ -2461,7 +2374,7 @@ mod tests {
         let directive = parse_agent_directive("目标似乎没有开放端口");
         assert_eq!(
             directive,
-            AgentDirective::CandidateFinal("目标似乎没有开放端口".into())
+            AgentDirective::Candidate("目标似乎没有开放端口".into())
         );
     }
 

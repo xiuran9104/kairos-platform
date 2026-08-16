@@ -6,6 +6,73 @@
 
 use std::time::Instant;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentDirective {
+    Final(String),
+    Replan(String),
+    NoPath(String),
+    AskUser(String),
+    Candidate(String),
+}
+
+/// Parse the text or JSON lifecycle protocol shared by every agent loop.
+pub(crate) fn parse_agent_directive(content: &str) -> AgentDirective {
+    let content = content.trim();
+
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content)
+        && let Some(action) = parsed.get("action").and_then(serde_json::Value::as_str)
+    {
+        let body = parsed
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let value = if body.is_empty() { content } else { body }.to_string();
+        return match action.to_ascii_lowercase().as_str() {
+            "final" => AgentDirective::Final(value),
+            "replan" => AgentDirective::Replan(value),
+            "no_path" => AgentDirective::NoPath(value),
+            "ask_user" => AgentDirective::AskUser(value),
+            _ => AgentDirective::Candidate(content.to_string()),
+        };
+    }
+
+    for marker in ["FINAL:", "Final:", "final:", "最终结果：", "完成："] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::Final(value.trim().to_string());
+        }
+    }
+    for marker in ["REPLAN:", "Replan:", "replan:", "重新规划："] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::Replan(value.trim().to_string());
+        }
+    }
+    for marker in [
+        "NO_PATH:",
+        "No viable path:",
+        "no_path:",
+        "无法继续：",
+        "没有可继续验证的路径：",
+    ] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::NoPath(value.trim().to_string());
+        }
+    }
+    for marker in [
+        "ASK_USER:",
+        "Ask user:",
+        "ask_user:",
+        "需要用户：",
+        "请用户确认：",
+    ] {
+        if let Some(value) = content.strip_prefix(marker) {
+            return AgentDirective::AskUser(value.trim().to_string());
+        }
+    }
+
+    AgentDirective::Candidate(content.to_string())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AgentLoopLimits {
     pub max_rounds: usize,
@@ -185,5 +252,21 @@ mod tests {
         assert_eq!(engine.checkpoint().effective_observations, 1);
         assert_eq!(engine.checkpoint().consecutive_failures, 0);
         engine.begin_round(0).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_protocol_is_shared_across_agent_types() {
+        assert_eq!(
+            parse_agent_directive(r#"{"action":"FINAL","content":"done"}"#),
+            AgentDirective::Final("done".into())
+        );
+        assert_eq!(
+            parse_agent_directive("请用户确认：提供测试账号"),
+            AgentDirective::AskUser("提供测试账号".into())
+        );
+        assert_eq!(
+            parse_agent_directive("普通阶段性结论"),
+            AgentDirective::Candidate("普通阶段性结论".into())
+        );
     }
 }
