@@ -6,6 +6,7 @@ use kairos_platform_pent_api::{
     ConversationMessageType, ConversationTurnStatus,
 };
 
+use super::agent_loop::{AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits};
 use super::rmos::{
     AttackGraph, KnowledgeCache, PentestMemory,
     injector::{build_injected_context, prepare_injection},
@@ -146,6 +147,16 @@ impl TurnBudget {
                 .clamp(1, 10_000_000);
         }
         budget
+    }
+
+    fn loop_limits(self) -> AgentLoopLimits {
+        AgentLoopLimits {
+            max_rounds: self.max_tool_rounds,
+            max_duration_seconds: self.max_duration_seconds,
+            max_requests: self.max_requests,
+            max_tokens: self.max_tokens,
+            stall_limit: None,
+        }
     }
 }
 
@@ -442,7 +453,6 @@ impl ConversationRuntime {
         intent: &ConversationIntent,
     ) -> anyhow::Result<String> {
         let mut final_output: Option<super::ports::ModelTurnOutput> = None;
-        let turn_start = std::time::Instant::now();
         let mut budget = TurnBudget::from_snapshot(&context.budget_snapshot);
         if let Some(max_iterations) = context
             .policy_snapshot
@@ -456,10 +466,6 @@ impl ConversationRuntime {
             .get("_checkpoint")
             .cloned()
             .unwrap_or_default();
-        let mut request_count = checkpoint
-            .get("request_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
         let start_round = checkpoint
             .get("round")
             .and_then(serde_json::Value::as_u64)
@@ -467,16 +473,26 @@ impl ConversationRuntime {
         // Per-turn budget counts actual model API usage below. Historical
         // messages are windowed by the model gateway and are already included
         // in each provider-reported input_tokens value.
-        let mut token_count = checkpoint
-            .get("token_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let mut successful_observations = checkpoint
-            .get("successful_observations")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
+        let mut loop_engine = AgentLoopEngine::from_checkpoint(
+            budget.loop_limits(),
+            AgentLoopCheckpoint {
+                next_round: start_round,
+                request_count: checkpoint
+                    .get("request_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize,
+                token_count: checkpoint
+                    .get("token_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                effective_observations: checkpoint
+                    .get("successful_observations")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize,
+                ..Default::default()
+            },
+        );
         let mut stopped_by_budget: Option<&'static str> = None;
-        let mut rounds_used = 0usize;
         let mut finished_normally = false;
         let mut evidence_ids = Vec::new();
         let mut run_summary = context.run_summary.clone();
@@ -503,13 +519,12 @@ impl ConversationRuntime {
         ));
         let orchestration =
             super::agent_pipeline::OrchestrationMode::from_policy(&context.policy_snapshot);
-        let orchestration_instruction = if super::agent_pipeline::multi_agent_enabled(
-            &context.policy_snapshot,
-        ) {
-            orchestration.instruction()
-        } else {
-            "多智能体已关闭：当前代理直接完成任务，不要尝试调用 agent_spawn/agent_collect。"
-        };
+        let orchestration_instruction =
+            if super::agent_pipeline::multi_agent_enabled(&context.policy_snapshot) {
+                orchestration.instruction()
+            } else {
+                "多智能体已关闭：当前代理直接完成任务，不要尝试调用 agent_spawn/agent_collect。"
+            };
         context.recent_messages.push(AgentMessage {
             message_id: "runtime_orchestration_mode".into(),
             role: "user".into(),
@@ -571,14 +586,9 @@ impl ConversationRuntime {
             });
         }
 
-        for round in start_round..budget.max_tool_rounds {
-            rounds_used = round + 1;
-            if turn_start.elapsed().as_secs() >= budget.max_duration_seconds {
-                stopped_by_budget = Some("time");
-                break;
-            }
-            if token_count >= budget.max_tokens {
-                stopped_by_budget = Some("tokens");
+        for round in loop_engine.next_round()..loop_engine.limits().max_rounds {
+            if let Err(reason) = loop_engine.begin_round(round) {
+                stopped_by_budget = Some(reason.as_str());
                 break;
             }
 
@@ -636,9 +646,7 @@ impl ConversationRuntime {
                     ));
                 }
             };
-            token_count = token_count
-                .saturating_add(output.usage.input_tokens)
-                .saturating_add(output.usage.output_tokens);
+            loop_engine.record_model_usage(output.usage.input_tokens, output.usage.output_tokens);
 
             // An empty completion is recoverable: keep the agent loop alive and
             // explicitly ask the next model attempt to resume from its context.
@@ -875,11 +883,10 @@ impl ConversationRuntime {
                 )> = Vec::new();
 
                 for (i, tc) in output.tool_calls.iter().enumerate() {
-                    if request_count >= budget.max_requests {
-                        stopped_by_budget = Some("requests");
+                    if let Err(reason) = loop_engine.start_request() {
+                        stopped_by_budget = Some(reason.as_str());
                         break;
                     }
-                    request_count += 1;
                     let tool_started = std::time::Instant::now();
                     if let Some(reason) = hitl_rejections.get(&tc.id) {
                         fast_results.push((
@@ -1060,9 +1067,7 @@ impl ConversationRuntime {
 
                     let effective_observation =
                         result.success && has_effective_observation(tool_name, &result.content);
-                    if effective_observation {
-                        successful_observations += 1;
-                    }
+                    loop_engine.record_tool_result(result.success, effective_observation);
                     if let Some(diagnostic) = scan_progress.record_tool_result(
                         tool_name,
                         result.success,
@@ -1149,11 +1154,12 @@ impl ConversationRuntime {
                     break;
                 }
                 context.run_summary = run_summary.clone();
+                let loop_checkpoint = loop_engine.checkpoint();
                 context.policy_snapshot["_checkpoint"] = serde_json::json!({
-                    "round": round + 1,
-                    "request_count": request_count,
-                    "token_count": token_count,
-                    "successful_observations": successful_observations,
+                    "round": loop_checkpoint.next_round,
+                    "request_count": loop_checkpoint.request_count,
+                    "token_count": loop_checkpoint.token_count,
+                    "successful_observations": loop_checkpoint.effective_observations,
                     "orchestration": format!("{:?}", orchestration).to_ascii_lowercase(),
                     "updated_at": chrono::Utc::now()
                 });
@@ -1351,14 +1357,15 @@ impl ConversationRuntime {
 
         if !finished_normally {
             let stop_reason = stopped_by_budget.unwrap_or("rounds");
+            let loop_checkpoint = loop_engine.checkpoint();
             context.recent_messages.push(AgentMessage {
                 message_id: "runtime_budget_finalization".into(),
                 role: "user".into(),
                 content: budget_finalization_prompt(
                     stop_reason,
-                    rounds_used,
-                    request_count,
-                    token_count,
+                    loop_engine.rounds_used(),
+                    loop_checkpoint.request_count,
+                    loop_checkpoint.token_count,
                     &run_summary,
                     &evidence_ids,
                 ),
@@ -1394,6 +1401,7 @@ impl ConversationRuntime {
             }
         }
         let output = final_output.ok_or_else(|| anyhow::anyhow!("模型未返回有效响应"))?;
+        let loop_checkpoint = loop_engine.checkpoint();
 
         let final_content = if context.run_id.is_some() {
             let report = if output.content.trim().is_empty() {
@@ -1404,18 +1412,21 @@ impl ConversationRuntime {
             let run_reference = context.run_id.as_deref().unwrap_or("无");
             format!(
                 "{report}\n\n---\n\n## 结构化证据索引\n\n\
-                 - 工具调用：{request_count}\n- 有效观察：{successful_observations}\n\
+                 - 工具调用：{}\n- 有效观察：{}\n\
                  - Evidence 数量：{}\n- Run：`{run_reference}`\n\n\
                  各项发现应引用其 Evidence；完整证据可在该 Run 的 Evidence 页面复核。\
                  原始响应未直接拼接进报告。",
+                loop_checkpoint.request_count,
+                loop_checkpoint.effective_observations,
                 evidence_ids.len()
             )
         } else if !output.content.trim().is_empty() {
             output.content.clone()
         } else {
             format!(
-                "本轮完成了 {request_count} 次受控工具调用并形成 {successful_observations} 条有效观察。\
-                 原始响应已保存为 Evidence，报告不内联原始输出。"
+                "本轮完成了 {} 次受控工具调用并形成 {} 条有效观察。\
+                 原始响应已保存为 Evidence，报告不内联原始输出。",
+                loop_checkpoint.request_count, loop_checkpoint.effective_observations
             )
         };
 

@@ -9,11 +9,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use chrono::Utc;
-use kairos_platform_pent_api::{
-    AgentMessage, AgentTurnRequest, ConversationContext, ConversationIntent,
-    ConversationMessageType,
-};
+use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessageType};
 
+use super::agent_loop::{AgentLoopEngine, AgentLoopLimits, AgentLoopStop};
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
@@ -203,7 +201,7 @@ impl AgentManager {
             match agent {
                 Some(a) if a.status == AgentStatus::Completed => return a.result,
                 Some(a) if a.status == AgentStatus::Failed => {
-                    return a.error.map(|e| format!("子代理执行失败: {e}"))
+                    return a.error.map(|e| format!("子代理执行失败: {e}"));
                 }
                 None => return Some("子代理不存在".into()),
                 _ => {}
@@ -311,8 +309,7 @@ async fn execute_sub_agent_inline_tool(
 ) -> super::tool_executor::ConversationToolResult {
     let content = match tool_name {
         "knowledge_search" => {
-            let parsed = serde_json::from_str::<serde_json::Value>(arguments)
-                .unwrap_or_default();
+            let parsed = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
             let query = parsed
                 .get("query")
                 .and_then(serde_json::Value::as_str)
@@ -327,12 +324,12 @@ async fn execute_sub_agent_inline_tool(
                     .map(|guides| serde_json::json!({"query":query,"guides":guides}))
             }
         }
-        "evidence_list" | "evidence_search" | "evidence_view" => repository
-            .execute_evidence_tool(run_id, tool_name, arguments)
-            .await,
-        "skill_list" | "skill_load" => repository
-            .execute_skill_tool(tool_name, arguments)
-            .await,
+        "evidence_list" | "evidence_search" | "evidence_view" => {
+            repository
+                .execute_evidence_tool(run_id, tool_name, arguments)
+                .await
+        }
+        "skill_list" | "skill_load" => repository.execute_skill_tool(tool_name, arguments).await,
         "record_finding" => super::run_bridge::record_finding(pool, run_id, arguments)
             .await
             .map_err(anyhow::Error::msg),
@@ -406,7 +403,14 @@ async fn execute_sub_agent(
         .await?
         .unwrap_or_else(|| format!("sub-run-{}", agent_id));
 
-    let budget = SubAgentBudget::default();
+    let budget = AgentLoopLimits {
+        max_rounds: SUB_AGENT_MAX_TOOL_ROUNDS,
+        max_duration_seconds: u64::MAX,
+        max_requests: SUB_AGENT_MAX_REQUESTS,
+        max_tokens: u64::MAX,
+        stall_limit: Some(SUB_AGENT_STALL_LIMIT),
+    };
+    let mut loop_engine = AgentLoopEngine::new(budget);
     let mut context = context;
     context.run_id = Some(run_id.clone());
 
@@ -429,30 +433,26 @@ async fn execute_sub_agent(
              - 子代理预算有限（{} 轮），请高效执行\n\n\
              **工具选择**：优先用专项工具（nuclei/sqlmap/dalfox/dir_fuzz/ffuf/js_analyze/browser MCP），\
              curl/http_request 仅用于特殊测试。先探测后攻击，工具失败就换工具不要重试。",
-            budget.max_rounds
+            loop_engine.limits().max_rounds
         ),
         format: "text".into(),
     });
 
     let mut final_output: Option<String> = None;
-    let mut request_count = 0usize;
-    let mut tool_call_count = 0usize;
-    let mut consecutive_failures = 0usize;
-    let mut effective_observations = 0usize;
-
-    for round in 0..budget.max_rounds {
-        if request_count >= budget.max_requests {
-            final_output = Some(format!(
-                "子代理请求数耗尽（{}），未完成子任务",
-                budget.max_requests
-            ));
-            break;
-        }
-        if consecutive_failures >= SUB_AGENT_STALL_LIMIT {
-            final_output = Some(format!(
-                "子代理连续 {} 次工具失败，判定为阻塞",
-                consecutive_failures
-            ));
+    for round in loop_engine.next_round()..loop_engine.limits().max_rounds {
+        if let Err(reason) = loop_engine.begin_round(round) {
+            let state = loop_engine.checkpoint();
+            final_output = Some(match reason {
+                AgentLoopStop::Requests => format!(
+                    "子代理请求数耗尽（{}），未完成子任务",
+                    loop_engine.limits().max_requests
+                ),
+                AgentLoopStop::Stalled => format!(
+                    "子代理连续 {} 次工具失败，判定为阻塞",
+                    state.consecutive_failures
+                ),
+                other => format!("子代理因 {} 预算停止，未完成子任务", other.as_str()),
+            });
             break;
         }
 
@@ -463,6 +463,7 @@ async fn execute_sub_agent(
                 return Err(anyhow::anyhow!("子代理模型调用失败: {e}"));
             }
         };
+        loop_engine.record_model_usage(output.usage.input_tokens, output.usage.output_tokens);
 
         if !output.tool_calls.is_empty() {
             let gate = super::hitl::HitlGate::new(pool.clone());
@@ -500,10 +501,8 @@ async fn execute_sub_agent(
                         hitl_rejections.insert(tool_call.id.clone(), reason);
                     }
                     Err(error) => {
-                        hitl_rejections.insert(
-                            tool_call.id.clone(),
-                            format!("AI 围栏处理失败：{error}"),
-                        );
+                        hitl_rejections
+                            .insert(tool_call.id.clone(), format!("AI 围栏处理失败：{error}"));
                     }
                 }
             }
@@ -545,10 +544,9 @@ async fn execute_sub_agent(
             )> = Vec::new();
 
             for (i, tc) in output.tool_calls.iter().enumerate() {
-                if request_count >= budget.max_requests {
+                if loop_engine.start_request().is_err() {
                     break;
                 }
-                request_count += 1;
 
                 if let Some(reason) = hitl_rejections.get(&tc.id) {
                     fast_results.push((
@@ -616,8 +614,14 @@ async fn execute_sub_agent(
                     let repo = repository.clone();
                     let handle = tokio::spawn(async move {
                         let start = std::time::Instant::now();
-                        let result =
-                            super::tool_executor::execute_tool(&name, &args, &scope, &sid, Some(rid.as_str())).await;
+                        let result = super::tool_executor::execute_tool(
+                            &name,
+                            &args,
+                            &scope,
+                            &sid,
+                            Some(rid.as_str()),
+                        )
+                        .await;
                         let _ = repo
                             .record_tool_result(
                                 &rid,
@@ -629,12 +633,7 @@ async fn execute_sub_agent(
                                 start.elapsed().as_millis() as u64,
                             )
                             .await;
-                        (
-                            call_id,
-                            name,
-                            result,
-                            start.elapsed().as_millis() as u64,
-                        )
+                        (call_id, name, result, start.elapsed().as_millis() as u64)
                     });
                     slow_spawns.push((
                         i,
@@ -660,15 +659,8 @@ async fn execute_sub_agent(
 
             // Process all results
             for (_idx, result, call_id, tool_name) in &fast_results {
-                tool_call_count += 1;
-                if result.success
-                    && has_effective_observation(tool_name, &result.content)
-                {
-                    effective_observations += 1;
-                    consecutive_failures = 0;
-                } else {
-                    consecutive_failures += 1;
-                }
+                let effective = has_effective_observation(tool_name, &result.content);
+                loop_engine.record_tool_result(result.success, effective);
 
                 let compact = if result.content.chars().count() > 4000 {
                     format!(
@@ -695,10 +687,11 @@ async fn execute_sub_agent(
         // ── No tool calls — parse lifecycle action ──
         let content = output.content.trim();
         let directive = parse_sub_agent_directive(content);
+        let loop_checkpoint = loop_engine.checkpoint();
 
         match directive {
             SubAgentDirective::Final(text) => {
-                if tool_call_count < SUB_AGENT_MIN_TOOL_CALLS {
+                if loop_checkpoint.tool_call_count < SUB_AGENT_MIN_TOOL_CALLS {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("sub_gate_reject:{}", agent_id),
                         role: "user".into(),
@@ -711,7 +704,7 @@ async fn execute_sub_agent(
                     });
                     continue;
                 }
-                if effective_observations == 0 {
+                if loop_checkpoint.effective_observations == 0 {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("sub_gate_reject:{}", agent_id),
                         role: "user".into(),
@@ -739,7 +732,7 @@ async fn execute_sub_agent(
                 continue;
             }
             SubAgentDirective::NoPath(reason) => {
-                if tool_call_count == 0 {
+                if loop_checkpoint.tool_call_count == 0 {
                     context.recent_messages.push(AgentMessage {
                         message_id: format!("sub_no_path_reject:{}", agent_id),
                         role: "user".into(),
@@ -756,8 +749,8 @@ async fn execute_sub_agent(
                 break;
             }
             SubAgentDirective::Candidate(text) => {
-                if tool_call_count >= SUB_AGENT_MIN_TOOL_CALLS
-                    && effective_observations > 0
+                if loop_checkpoint.tool_call_count >= SUB_AGENT_MIN_TOOL_CALLS
+                    && loop_checkpoint.effective_observations > 0
                 {
                     final_output = Some(text);
                 } else {
@@ -774,10 +767,15 @@ async fn execute_sub_agent(
         }
     }
 
+    let loop_checkpoint = loop_engine.checkpoint();
     let result = final_output.unwrap_or_else(|| {
         format!(
             "子代理 {}: {} 轮 {} 次请求后未生成结论（工具调用 {} 次，有效观察 {} 次）",
-            description, budget.max_rounds, request_count, tool_call_count, effective_observations
+            description,
+            loop_engine.limits().max_rounds,
+            loop_checkpoint.request_count,
+            loop_checkpoint.tool_call_count,
+            loop_checkpoint.effective_observations
         )
     });
 
@@ -789,30 +787,9 @@ fn has_effective_observation(tool_name: &str, content: &str) -> bool {
         return false;
     }
     match tool_name {
-        "knowledge_search"
-        | "evidence_list"
-        | "evidence_search"
-        | "evidence_view"
-        | "skill_list"
-        | "skill_load"
-        | "record_finding"
-        | "agent_status"
-        | "agent_collect"
+        "knowledge_search" | "evidence_list" | "evidence_search" | "evidence_view"
+        | "skill_list" | "skill_load" | "record_finding" | "agent_status" | "agent_collect"
         | "agent_list" => false,
         _ => !content.trim().is_empty(),
-    }
-}
-
-struct SubAgentBudget {
-    max_rounds: usize,
-    max_requests: usize,
-}
-
-impl Default for SubAgentBudget {
-    fn default() -> Self {
-        Self {
-            max_rounds: SUB_AGENT_MAX_TOOL_ROUNDS,
-            max_requests: SUB_AGENT_MAX_REQUESTS,
-        }
     }
 }

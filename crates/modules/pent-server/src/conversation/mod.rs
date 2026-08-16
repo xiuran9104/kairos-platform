@@ -37,6 +37,7 @@ pub(crate) fn build_runtime(
 
 pub mod adapters;
 pub mod agent_http;
+pub(crate) mod agent_loop;
 pub(crate) mod agent_manager;
 pub(crate) mod agent_pipeline;
 pub(crate) mod agent_profiles;
