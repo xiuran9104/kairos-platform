@@ -1819,6 +1819,7 @@ dependencies = [
  "kairos-platform-pent-api",
  "kairos-platform-pent-core",
  "kairos-platform-pent-runtime",
+ "kairos-platform-pent-tooling",
  "md-5",
  "regex",
  "reqwest",
@@ -1831,6 +1832,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kairos-platform-pent-tooling"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "kairos-platform-pent-api",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

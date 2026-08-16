@@ -1,7 +1,5 @@
+use crate::contract::{ToolDescriptor, ToolExecutionResult, ToolInvocation, ToolRouteRequest};
 use async_trait::async_trait;
-use kairos_platform_pent_api::{
-    ToolDescriptor, ToolExecutionResult, ToolInvocation, ToolRouteRequest,
-};
 
 #[async_trait]
 pub trait ToolCatalog: Send + Sync {

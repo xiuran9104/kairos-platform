@@ -4,7 +4,10 @@
 
 pub mod internal;
 pub mod client;
-pub mod protocol;
+/// Compatibility facade for MCP clients using the historical path.
+pub mod protocol {
+    pub use kairos_platform_pent_tooling::mcp::*;
+}
 pub mod recipes;
 pub mod registry;
 pub mod transport;

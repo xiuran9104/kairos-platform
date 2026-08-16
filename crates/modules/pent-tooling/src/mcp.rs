@@ -1,4 +1,4 @@
-//! MCP (Model Context Protocol) types — JSON-RPC 2.0 over stdio.
+//! MCP (Model Context Protocol) and JSON-RPC 2.0 data types.
 //! Implements the 2024-11-05 protocol version for tool discovery and invocation.
 
 use serde::{Deserialize, Serialize};
@@ -174,5 +174,37 @@ impl McpServerConfig {
 impl Default for ClientCapabilities {
     fn default() -> Self {
         Self { roots: None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_remote_transport_from_server_config() {
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "browser",
+            "command": "",
+            "url": "https://mcp.example.test/sse",
+            "headers": {"authorization": "Bearer redacted"}
+        }))
+        .unwrap();
+
+        assert!(config.is_http());
+        assert_eq!(config.headers.len(), 1);
+    }
+
+    #[test]
+    fn tool_schema_uses_mcp_camel_case_wire_format() {
+        let tool = ToolDef {
+            name: "inspect".into(),
+            description: "Inspect a target".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        let value = serde_json::to_value(tool).unwrap();
+        assert_eq!(value["inputSchema"]["type"], "object");
+        assert!(value.get("input_schema").is_none());
     }
 }
