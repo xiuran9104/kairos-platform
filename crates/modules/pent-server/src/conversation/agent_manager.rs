@@ -11,12 +11,12 @@ use tokio::sync::Mutex;
 use chrono::Utc;
 use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessageType};
 
-use super::agent_loop::{
-    AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
-};
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
+};
+use kairos_platform_pent_runtime::agent_loop::{
+    AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
 };
 
 const SUB_AGENT_MAX_TOOL_ROUNDS: usize = 12;

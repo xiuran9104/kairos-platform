@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AgentDirective {
+pub enum AgentDirective {
     Final(String),
     Replan(String),
     NoPath(String),
@@ -16,7 +16,7 @@ pub(crate) enum AgentDirective {
 }
 
 /// Parse the text or JSON lifecycle protocol shared by every agent loop.
-pub(crate) fn parse_agent_directive(content: &str) -> AgentDirective {
+pub fn parse_agent_directive(content: &str) -> AgentDirective {
     let content = content.trim();
 
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content)
@@ -74,7 +74,7 @@ pub(crate) fn parse_agent_directive(content: &str) -> AgentDirective {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AgentLoopLimits {
+pub struct AgentLoopLimits {
     pub max_rounds: usize,
     pub max_duration_seconds: u64,
     pub max_requests: usize,
@@ -83,7 +83,7 @@ pub(crate) struct AgentLoopLimits {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct AgentLoopCheckpoint {
+pub struct AgentLoopCheckpoint {
     pub next_round: usize,
     pub request_count: usize,
     pub token_count: u64,
@@ -93,7 +93,7 @@ pub(crate) struct AgentLoopCheckpoint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentLoopStop {
+pub enum AgentLoopStop {
     Rounds,
     Time,
     Requests,
@@ -102,7 +102,7 @@ pub(crate) enum AgentLoopStop {
 }
 
 impl AgentLoopStop {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Rounds => "rounds",
             Self::Time => "time",
@@ -114,7 +114,7 @@ impl AgentLoopStop {
 }
 
 #[derive(Debug)]
-pub(crate) struct AgentLoopEngine {
+pub struct AgentLoopEngine {
     limits: AgentLoopLimits,
     state: AgentLoopCheckpoint,
     started_at: Instant,
@@ -122,14 +122,11 @@ pub(crate) struct AgentLoopEngine {
 }
 
 impl AgentLoopEngine {
-    pub(crate) fn new(limits: AgentLoopLimits) -> Self {
+    pub fn new(limits: AgentLoopLimits) -> Self {
         Self::from_checkpoint(limits, AgentLoopCheckpoint::default())
     }
 
-    pub(crate) fn from_checkpoint(
-        limits: AgentLoopLimits,
-        checkpoint: AgentLoopCheckpoint,
-    ) -> Self {
+    pub fn from_checkpoint(limits: AgentLoopLimits, checkpoint: AgentLoopCheckpoint) -> Self {
         Self {
             limits,
             state: checkpoint,
@@ -138,23 +135,23 @@ impl AgentLoopEngine {
         }
     }
 
-    pub(crate) const fn limits(&self) -> &AgentLoopLimits {
+    pub const fn limits(&self) -> &AgentLoopLimits {
         &self.limits
     }
 
-    pub(crate) const fn checkpoint(&self) -> AgentLoopCheckpoint {
+    pub const fn checkpoint(&self) -> AgentLoopCheckpoint {
         self.state
     }
 
-    pub(crate) const fn next_round(&self) -> usize {
+    pub const fn next_round(&self) -> usize {
         self.state.next_round
     }
 
-    pub(crate) const fn rounds_used(&self) -> usize {
+    pub const fn rounds_used(&self) -> usize {
         self.rounds_used
     }
 
-    pub(crate) fn begin_round(&mut self, round: usize) -> Result<(), AgentLoopStop> {
+    pub fn begin_round(&mut self, round: usize) -> Result<(), AgentLoopStop> {
         if round >= self.limits.max_rounds {
             return Err(AgentLoopStop::Rounds);
         }
@@ -179,7 +176,7 @@ impl AgentLoopEngine {
         Ok(())
     }
 
-    pub(crate) fn start_request(&mut self) -> Result<(), AgentLoopStop> {
+    pub fn start_request(&mut self) -> Result<(), AgentLoopStop> {
         if self.state.request_count >= self.limits.max_requests {
             return Err(AgentLoopStop::Requests);
         }
@@ -187,7 +184,7 @@ impl AgentLoopEngine {
         Ok(())
     }
 
-    pub(crate) fn record_model_usage(&mut self, input_tokens: u64, output_tokens: u64) {
+    pub fn record_model_usage(&mut self, input_tokens: u64, output_tokens: u64) {
         self.state.token_count = self
             .state
             .token_count
@@ -195,7 +192,7 @@ impl AgentLoopEngine {
             .saturating_add(output_tokens);
     }
 
-    pub(crate) fn record_tool_result(&mut self, success: bool, effective: bool) {
+    pub fn record_tool_result(&mut self, success: bool, effective: bool) {
         self.state.tool_call_count = self.state.tool_call_count.saturating_add(1);
         if success && effective {
             self.state.effective_observations = self.state.effective_observations.saturating_add(1);

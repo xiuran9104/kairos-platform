@@ -6,9 +6,6 @@ use kairos_platform_pent_api::{
     ConversationMessageType, ConversationTurnStatus,
 };
 
-use super::agent_loop::{
-    AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
-};
 use super::rmos::{
     AttackGraph, KnowledgeCache, PentestMemory,
     injector::{build_injected_context, prepare_injection},
@@ -17,6 +14,9 @@ use super::{
     ConversationContextSource, ConversationEventSink, ConversationInstructionSink,
     ConversationIntentDetector, ConversationKnowledgeSource, ConversationModelGateway,
     ConversationRepository, ModelTurnOutput,
+};
+use kairos_platform_pent_runtime::agent_loop::{
+    AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
 };
 
 /// Maximum tool-calling rounds before forcing a stop.

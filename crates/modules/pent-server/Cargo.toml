@@ -22,6 +22,7 @@ kairos-platform-framework-security.workspace = true
 kairos-platform-framework-web.workspace = true
 kairos-platform-pent-api.workspace = true
 kairos-platform-pent-core.workspace = true
+kairos-platform-pent-runtime.workspace = true
 kairos-platform-mitm-proxy.workspace = true
 kairos-platform-ai-api.workspace = true
 kairos-platform-ai-server.workspace = true
