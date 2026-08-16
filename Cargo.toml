@@ -20,6 +20,7 @@ members = [
     "crates/modules/pent-api",
     "crates/modules/pent-core",
     "crates/modules/pent-server",
+    "crates/modules/mitm-proxy",
     "crates/modules/scan-api",
     "crates/modules/scan-server",
     "services/gateway",
@@ -71,6 +72,7 @@ kairos-platform-system-server = { path = "crates/modules/system-server" }
 kairos-platform-pent-api = { path = "crates/modules/pent-api" }
 kairos-platform-pent-core = { path = "crates/modules/pent-core" }
 kairos-platform-pent-server = { path = "crates/modules/pent-server" }
+kairos-platform-mitm-proxy = { path = "crates/modules/mitm-proxy" }
 kairos-platform-scan-api = { path = "crates/modules/scan-api" }
 kairos-platform-scan-server = { path = "crates/modules/scan-server" }
 serde = { version = "1.0", features = ["derive"] }

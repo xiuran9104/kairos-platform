@@ -48,6 +48,11 @@ async fn main() -> anyhow::Result<()> {
         ),
     );
 
+    // Start the in-process MITM traffic-capture proxy when enabled.
+    let _mitm_proxy = kairos_platform_pent_server::infrastructure::mitm_sink::spawn_mitm_proxy(
+        database.clone(),
+    );
+
     // Start the worker for async task processing
     kairos_platform_pent_server::start_worker(
         database.clone(),

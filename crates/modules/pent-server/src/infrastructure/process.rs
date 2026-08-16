@@ -211,6 +211,16 @@ async fn execute_prepared_tool(
            .env("HTTPS_PROXY", &proxy_addr)
            .env("no_proxy", "127.0.0.1,localhost,.local")
            .env("NO_PROXY", "127.0.0.1,localhost,.local");
+        // Inject the platform CA so tools trust the proxy's impersonated certs.
+        let ca_path = kairos_platform_mitm_proxy::ca::ca_cert_path(
+            &kairos_platform_mitm_proxy::ca::default_ca_dir(),
+        );
+        if ca_path.exists() {
+            cmd.env("SSL_CERT_FILE", &ca_path)
+               .env("CURL_CA_BUNDLE", &ca_path)
+               .env("REQUESTS_CA_BUNDLE", &ca_path)
+               .env("NODE_EXTRA_CA_CERTS", &ca_path);
+        }
     }
     let mut child = cmd
         .stdin(Stdio::null())

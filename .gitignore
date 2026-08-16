@@ -1,6 +1,9 @@
 /target
 /backups/
 
+# MITM CA key material (runtime-generated, must never be committed)
+/storage/mitm/
+
 # Vben / Node
 node_modules
 dist

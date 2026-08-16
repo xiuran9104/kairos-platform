@@ -2,6 +2,7 @@ pub mod embedding;
 pub mod execution;
 pub mod knowledge;
 pub mod memory;
+pub mod mitm_sink;
 pub mod object_store;
 pub mod process;
 pub mod recipe;
