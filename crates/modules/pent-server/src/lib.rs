@@ -37,14 +37,13 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub use config::PentConfig;
-pub use mcp_servers::PgMcpServerConfigSource;
+pub use mcp_servers::{PgMcpServerConfigSource, spawn_mcp_reconciler};
 
 #[derive(Clone)]
 pub struct PentState {
     pub pool: PgPool,
     conversation_tasks: conversation::turn_tasks::TurnTaskRegistry,
     pub nats: Option<crate::transport::mq::NatsHandle>,
-    pub mcp_registry: Option<std::sync::Arc<kairos_platform_pent_tooling::mcp::McpRegistry>>,
 }
 
 impl PentState {
@@ -53,17 +52,11 @@ impl PentState {
             pool,
             conversation_tasks: Default::default(),
             nats: None,
-            mcp_registry: None,
         }
     }
 
     pub fn with_nats(mut self, nats: crate::transport::mq::NatsHandle) -> Self {
         self.nats = Some(nats);
-        self
-    }
-
-    pub fn with_mcp(mut self, mcp: std::sync::Arc<kairos_platform_pent_tooling::mcp::McpRegistry>) -> Self {
-        self.mcp_registry = Some(mcp);
         self
     }
 }
@@ -1104,10 +1097,20 @@ async fn register_worker(pool: &PgPool, worker_id: &str) -> Result<(), String> {
         .unwrap_or(1)
         .clamp(1, 100);
     sqlx::query(
-        "INSERT INTO pent_workers(worker_id,capacity,status,last_heartbeat,registered_at)
-         VALUES($1,$2,'active',now(),now())
+        "INSERT INTO pent_workers(
+             worker_id,capacity,status,last_heartbeat,registered_at,
+             sandbox_backend,sandbox_ready,sandbox_detail
+         )
+         VALUES($1,$2,'active',now(),now(),'bubblewrap',true,
+             jsonb_build_object(
+                 'mount_namespace',true,'pid_namespace',true,'user_namespace',true,
+                 'capabilities_dropped',true,'seccomp',true,'network_isolated',false,
+                 'container_backend',false
+             ))
          ON CONFLICT(worker_id) DO UPDATE SET
-             capacity=EXCLUDED.capacity,status='active',last_heartbeat=now()",
+             capacity=EXCLUDED.capacity,status='active',last_heartbeat=now(),
+             sandbox_backend=EXCLUDED.sandbox_backend,sandbox_ready=true,
+             sandbox_detail=EXCLUDED.sandbox_detail",
     )
     .bind(worker_id)
     .bind(capacity)
@@ -1232,8 +1235,11 @@ async fn list_nodes(
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT jsonb_build_object(
              'worker_id', worker_id,
-             'status', status,
+             'status', CASE WHEN last_heartbeat < now()-interval '30 seconds' THEN 'offline' ELSE status END,
              'capacity', capacity,
+             'sandbox_backend', sandbox_backend,
+             'sandbox_ready', sandbox_ready,
+             'sandbox_detail', sandbox_detail,
              'last_heartbeat', last_heartbeat,
              'registered_at', registered_at
          ) FROM pent_workers ORDER BY registered_at DESC",

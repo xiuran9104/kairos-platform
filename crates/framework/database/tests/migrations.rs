@@ -42,6 +42,7 @@ async fn applies_all_migrations_to_empty_postgres() {
         "pent_tool_calls",
         "pent_workers",
         "pent_mcp_servers",
+        "pent_mcp_server_instances",
         "pent_knowledge_retrieval_logs",
         "pent_skill_stats_meta",
         "pent_agent_roles",
@@ -61,6 +62,25 @@ async fn applies_all_migrations_to_empty_postgres() {
             .await
             .expect("inspect expected table");
         assert!(exists, "expected table {table}");
+    }
+    for (table, column) in [
+        ("pent_mcp_servers", "config_revision"),
+        ("pent_workers", "sandbox_backend"),
+        ("pent_workers", "sandbox_ready"),
+        ("pent_workers", "sandbox_detail"),
+    ] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name=$1 AND column_name=$2
+            )",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect expected column");
+        assert!(exists, "expected column {table}.{column}");
     }
     let toon_schema_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(

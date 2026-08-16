@@ -1171,6 +1171,22 @@ CREATE TABLE public.pent_knowledge_retrieval_logs (
 
 
 --
+-- Name: pent_mcp_server_instances; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pent_mcp_server_instances (
+    server_id character varying(50) NOT NULL,
+    worker_id character varying(100) NOT NULL,
+    status character varying(20) DEFAULT 'pending'::character varying NOT NULL,
+    applied_revision bigint DEFAULT 0 NOT NULL,
+    tool_count integer DEFAULT 0 NOT NULL,
+    error text,
+    last_heartbeat timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pent_mcp_server_instances_status_check CHECK (((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('connecting'::character varying)::text, ('connected'::character varying)::text, ('error'::character varying)::text, ('stopped'::character varying)::text])))
+);
+
+
+--
 -- Name: pent_mcp_servers; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1189,6 +1205,7 @@ CREATE TABLE public.pent_mcp_servers (
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
     headers jsonb DEFAULT '{}'::jsonb NOT NULL,
+    config_revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT pent_mcp_servers_transport_check CHECK (((transport)::text = ANY (ARRAY[('stdio'::character varying)::text, ('http'::character varying)::text, ('sse'::character varying)::text])))
 );
 
@@ -1709,7 +1726,10 @@ CREATE TABLE public.pent_workers (
     capacity integer DEFAULT 1,
     status character varying(20) DEFAULT 'active'::character varying,
     last_heartbeat timestamp with time zone DEFAULT now(),
-    registered_at timestamp with time zone DEFAULT now()
+    registered_at timestamp with time zone DEFAULT now(),
+    sandbox_backend character varying(30) DEFAULT 'bubblewrap'::character varying NOT NULL,
+    sandbox_ready boolean DEFAULT false NOT NULL,
+    sandbox_detail jsonb DEFAULT '{}'::jsonb NOT NULL
 );
 
 
@@ -4165,10 +4185,18 @@ COPY public.pent_knowledge_retrieval_logs (id, tenant_id, query, risk_type, conv
 
 
 --
+-- Data for Name: pent_mcp_server_instances; Type: TABLE DATA; Schema: public; Owner: -
+--
+
+COPY public.pent_mcp_server_instances (server_id, worker_id, status, applied_revision, tool_count, error, last_heartbeat) FROM stdin;
+\.
+
+
+--
 -- Data for Name: pent_mcp_servers; Type: TABLE DATA; Schema: public; Owner: -
 --
 
-COPY public.pent_mcp_servers (id, tenant_id, name, transport, command, args, env, url, enabled, timeout_secs, description, created_at, updated_at, headers) FROM stdin;
+COPY public.pent_mcp_servers (id, tenant_id, name, transport, command, args, env, url, enabled, timeout_secs, description, created_at, updated_at, headers, config_revision) FROM stdin;
 \.
 
 
@@ -4606,9 +4634,7 @@ COPY public.pent_tool_quality_metrics (tool_id, version, capability, target_type
 -- Data for Name: pent_workers; Type: TABLE DATA; Schema: public; Owner: -
 --
 
-COPY public.pent_workers (worker_id, capacity, status, last_heartbeat, registered_at) FROM stdin;
-worker-pent-agent-worker-01	1	active	2026-08-16 09:13:59.780547+00	2026-08-05 07:39:53.190075+00
-worker-gateway	1	active	2026-08-16 09:14:03.211517+00	2026-07-28 18:16:12.056932+00
+COPY public.pent_workers (worker_id, capacity, status, last_heartbeat, registered_at, sandbox_backend, sandbox_ready, sandbox_detail) FROM stdin;
 \.
 
 
@@ -8392,6 +8418,14 @@ ALTER TABLE ONLY public.pent_knowledge_retrieval_logs
 
 
 --
+-- Name: pent_mcp_server_instances pent_mcp_server_instances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pent_mcp_server_instances
+    ADD CONSTRAINT pent_mcp_server_instances_pkey PRIMARY KEY (server_id, worker_id);
+
+
+--
 -- Name: pent_mcp_servers pent_mcp_servers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9294,6 +9328,13 @@ CREATE INDEX idx_pent_conversation_turns_session ON public.pent_conversation_tur
 
 
 --
+-- Name: idx_pent_mcp_server_instances_heartbeat; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pent_mcp_server_instances_heartbeat ON public.pent_mcp_server_instances USING btree (last_heartbeat);
+
+
+--
 -- Name: idx_pent_metacognitive_run; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -9927,6 +9968,14 @@ ALTER TABLE ONLY public.pent_knowledge_documents
 
 
 --
+-- Name: pent_mcp_server_instances pent_mcp_server_instances_server_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pent_mcp_server_instances
+    ADD CONSTRAINT pent_mcp_server_instances_server_id_fkey FOREIGN KEY (server_id) REFERENCES public.pent_mcp_servers(id) ON DELETE CASCADE;
+
+
+--
 -- Name: scan_business_resources scan_business_resources_cabinet_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9979,4 +10028,3 @@ ALTER TABLE ONLY public.scan_tasks
 --
 
 \unrestrict gbAcs6z5dFitzQBw1WPZdc5gmldUYxu91LctKsqHtqzZif6PKC8tevhD7mWTg5w
-

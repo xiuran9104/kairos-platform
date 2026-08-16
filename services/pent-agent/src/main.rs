@@ -22,12 +22,17 @@ async fn main() -> anyhow::Result<()> {
     ensure_initialized(&database).await?;
     let config = PentConfig::from_env();
     let mcp_registry = kairos_platform_pent_tooling::mcp::registry::shared().await;
-    if let Err(error) = kairos_platform_pent_server::PgMcpServerConfigSource::new(database.clone())
-        .load_into(&mcp_registry)
-        .await
-    {
-        tracing::warn!(%error, "failed to load configured MCP servers");
-    }
+    let worker_id = format!(
+        "worker-{}-{}-{}",
+        SERVICE_NAME,
+        config.worker_id,
+        uuid::Uuid::new_v4()
+    );
+    kairos_platform_pent_server::spawn_mcp_reconciler(
+        database.clone(),
+        mcp_registry,
+        worker_id.clone(),
+    );
     match kairos_platform_pent_server::infrastructure::recipe::load_from_db(&database).await {
         Ok(count) => tracing::info!(count, "tool recipes loaded from pent_tool_definitions"),
         Err(error) => {
@@ -47,12 +52,7 @@ async fn main() -> anyhow::Result<()> {
     // Start the worker for async task processing
     kairos_platform_pent_server::start_worker(
         database.clone(),
-        format!(
-            "worker-{}-{}-{}",
-            SERVICE_NAME,
-            config.worker_id,
-            uuid::Uuid::new_v4()
-        ),
+        worker_id,
         config.lease_ttl_seconds,
     )
     .await;

@@ -28,6 +28,7 @@ pg_dump "$database_url" \
   --exclude-table-data='pent_knowledge_documents' \
   --exclude-table-data='pent_metacognitive_snapshots' \
   --exclude-table-data='pent_model_calls' \
+  --exclude-table-data='pent_mcp_server_instances' \
   --exclude-table-data='pent_plan_deltas' \
   --exclude-table-data='pent_plan_versions' \
   --exclude-table-data='pent_pre_reflections' \
@@ -39,6 +40,7 @@ pg_dump "$database_url" \
   --exclude-table-data='pent_tasks' \
   --exclude-table-data='pent_tool_feedback' \
   --exclude-table-data='pent_tool_route_decisions' \
+  --exclude-table-data='pent_workers' \
   --exclude-table-data='scan_tasks' \
   --exclude-table-data='scan_port_details' \
   --exclude-table-data='infra_api_access_log' \

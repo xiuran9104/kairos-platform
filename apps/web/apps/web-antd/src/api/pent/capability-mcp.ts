@@ -96,11 +96,20 @@ export interface PentMcpServer {
   url?: string;
   headers?: Record<string, string>;
   enabled: boolean;
+  config_revision?: number;
   timeout_secs?: number;
   description?: string;
-  status?: 'connected' | 'connecting' | 'disabled' | 'disconnected' | 'error' | string;
+  status?: 'connected' | 'connecting' | 'disabled' | 'error' | 'pending' | 'stopping' | string;
   tool_count?: number;
   error?: string;
+  instances?: Array<{
+    applied_revision: number;
+    error?: string;
+    last_heartbeat: string;
+    status: 'connected' | 'connecting' | 'error' | 'stale' | 'stopped' | string;
+    tool_count: number;
+    worker_id: string;
+  }>;
   created_at?: string;
   updated_at?: string;
 }

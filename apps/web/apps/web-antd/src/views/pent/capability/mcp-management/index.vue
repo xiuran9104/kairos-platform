@@ -177,21 +177,23 @@ const serverStatusColor: Record<string, string> = {
   connected: 'green',
   connecting: 'blue',
   error: 'red',
-  disconnected: 'default',
+  pending: 'processing',
+  stopping: 'orange',
   disabled: 'orange',
 };
 const serverStatusLabel: Record<string, string> = {
   connected: '已连接',
   connecting: '连接中...',
   error: '连接失败',
-  disconnected: '未连接',
+  pending: '等待 Agent 应用',
+  stopping: '停止中...',
   disabled: '已禁用',
 };
 
 async function doStart(s: PentMcpServer) {
   try {
     await startPentMcpServer(s.id);
-    message.success(`已启动 ${s.name}`);
+    message.success(`已提交 ${s.name} 的启动请求`);
     fetchServers();
   } catch {
     message.error('启动失败');
@@ -201,7 +203,7 @@ async function doStart(s: PentMcpServer) {
 async function doStop(s: PentMcpServer) {
   try {
     await stopPentMcpServer(s.id);
-    message.success(`已停止 ${s.name}`);
+    message.success(`已提交 ${s.name} 的停止请求`);
     fetchServers();
   } catch {
     message.error('停止失败');
@@ -384,8 +386,8 @@ onDeactivated(() => {
                   <a-tag v-if="(s.tool_count ?? 0) > 0" size="small" color="blue" :title="'工具数量'">
                     🔧 {{ s.tool_count }}
                   </a-tag>
-                  <a-tag :color="serverStatusColor[s.status || 'disconnected']" size="small">
-                    {{ serverStatusLabel[s.status || 'disconnected'] || s.status }}
+                  <a-tag :color="serverStatusColor[s.status || 'pending']" size="small">
+                    {{ serverStatusLabel[s.status || 'pending'] || s.status }}
                   </a-tag>
                 </div>
                 <a-space :size="4">
@@ -398,11 +400,11 @@ onDeactivated(() => {
                     ⏸ 停止
                   </a-button>
                   <a-button
-                    v-else-if="s.status === 'connecting'"
+                    v-else-if="s.status === 'connecting' || s.status === 'pending' || s.status === 'stopping'"
                     size="small"
                     disabled
                   >
-                    ⏳ 连接中...
+                    ⏳ 状态同步中...
                   </a-button>
                   <a-button
                     v-else
@@ -435,19 +437,19 @@ onDeactivated(() => {
 
               <!-- 错误块 -->
               <div
-                v-if="(s.status === 'error' || s.status === 'disconnected') && s.error"
+                v-if="s.status === 'error' && s.error"
                 :style="{
                   margin: '12px 0',
                   padding: '8px 12px',
                   borderRadius: '4px',
                   fontSize: '13px',
                   wordBreak: 'break-all',
-                  background: s.status === 'error' ? '#fff1f0' : '#fffbe6',
-                  borderLeft: `3px solid ${s.status === 'error' ? '#f5222d' : '#faad14'}`,
-                  color: s.status === 'error' ? '#cf1322' : '#8a6d00',
+                  background: '#fff1f0',
+                  borderLeft: '3px solid #f5222d',
+                  color: '#cf1322',
                 }"
               >
-                <strong>{{ s.status === 'error' ? '❌' : '⚠️' }} 连接错误：</strong>{{ s.error }}
+                <strong>❌ Agent 连接错误：</strong>{{ s.error }}
               </div>
 
               <!-- 详情网格 -->
@@ -475,6 +477,24 @@ onDeactivated(() => {
                 <a-col v-if="s.timeout_secs" :span="12" style="margin-bottom: 8px">
                   <div style="font-size: 12px; color: var(--ant-color-text-tertiary)">超时时间</div>
                   <div>{{ s.timeout_secs }} 秒</div>
+                </a-col>
+                <a-col :span="24" style="margin-bottom: 8px">
+                  <div style="font-size: 12px; color: var(--ant-color-text-tertiary)">
+                    Agent 实例（配置版本 {{ s.config_revision || 1 }}）
+                  </div>
+                  <a-space wrap>
+                    <a-tag
+                      v-for="instance in s.instances || []"
+                      :key="instance.worker_id"
+                      :color="serverStatusColor[instance.status] || (instance.status === 'stale' ? 'default' : 'blue')"
+                      :title="instance.error || instance.last_heartbeat"
+                    >
+                      {{ instance.worker_id }} · {{ instance.status }}
+                    </a-tag>
+                    <span v-if="!(s.instances || []).length" style="color: var(--ant-color-text-tertiary)">
+                      尚无在线 pent-agent 认领
+                    </span>
+                  </a-space>
                 </a-col>
                 <a-col v-if="s.transport === 'stdio' && s.command" :span="24" style="margin-bottom: 8px">
                   <div style="font-size: 12px; color: var(--ant-color-text-tertiary)">命令</div>

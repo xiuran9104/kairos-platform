@@ -22,7 +22,7 @@ import {
 } from '#/api/pent';
 
 // ── utils ─────────────────────────────────────────────────────────────────
-/** 监控页展示：内部 mcp::tool → 模型侧 mcp__tool（与原版一致） */
+/** 将内部工具标识转换为模型侧展示名。 */
 function formatToolName(name?: string) {
   return name && name.includes('::') ? name.replace('::', '__') : name || '';
 }

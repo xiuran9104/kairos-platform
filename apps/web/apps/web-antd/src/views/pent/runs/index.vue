@@ -229,6 +229,15 @@ async function showDetail(run: any) {
 function pretty(value: any) {
   return JSON.stringify(value ?? {}, null, 2);
 }
+function executionAudit(call: any) {
+  const value = call?.execution_audit;
+  if (typeof value !== 'string') return value || {};
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
 function eventTitle(event: any) {
   const labels: Record<string, string> = {
     'conversation.tool_calls': '模型选择工具',
@@ -479,6 +488,18 @@ const columns = [
                       <a-tag :color="call.exit_code === 0 ? 'success' : 'error'">
                         {{ call.exit_code === 0 ? '成功' : `退出码 ${call.exit_code ?? '-'}` }}
                       </a-tag>
+                    </div>
+                    <a-space v-if="executionAudit(call).backend" wrap style="margin: 6px 0">
+                      <a-tag color="blue">{{ executionAudit(call).backend }}</a-tag>
+                      <a-tag :color="executionAudit(call).mount_namespace ? 'green' : 'default'">Mount NS</a-tag>
+                      <a-tag :color="executionAudit(call).pid_namespace ? 'green' : 'default'">PID NS</a-tag>
+                      <a-tag :color="executionAudit(call).user_namespace ? 'green' : 'default'">User NS</a-tag>
+                      <a-tag :color="executionAudit(call).capabilities_dropped ? 'green' : 'red'">Capabilities Drop</a-tag>
+                      <a-tag :color="executionAudit(call).seccomp ? 'green' : 'red'">Seccomp-BPF</a-tag>
+                      <a-tag color="orange">网络：{{ executionAudit(call).network_policy || '共享宿主网络' }}</a-tag>
+                    </a-space>
+                    <div v-if="executionAudit(call).workspace_dir" class="trace-preview">
+                      workspace: {{ executionAudit(call).workspace_dir }} · artifacts: {{ executionAudit(call).artifact_dir }}
                     </div>
                     <details>
                       <summary>参数与执行信息</summary>

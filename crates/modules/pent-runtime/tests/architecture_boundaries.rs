@@ -109,7 +109,7 @@ fn production_process_roles_do_not_overlap() {
     for required in [
         "start_worker",
         "init_global_executor",
-        "PgMcpServerConfigSource",
+        "spawn_mcp_reconciler",
         "mcp::registry::shared",
         "verify_bubblewrap",
     ] {
