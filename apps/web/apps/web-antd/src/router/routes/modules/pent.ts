@@ -69,7 +69,7 @@ const routes: RouteRecordRaw[] = [
         path: '/pent/traffic',
         component: () => import('#/views/pent/traffic/index.vue'),
         name: 'PentTraffic',
-        meta: { title: 'LLM 流量', icon: 'lucide:network' },
+        meta: { title: '流量记录', icon: 'lucide:network' },
       },
       {
         path: '/pent/rmos',

@@ -137,7 +137,7 @@ onMounted(async () => {
 
 <template>
   <div style="padding: 24px; min-height: 100%; background-color: var(--ant-color-bg-layout)">
-    <PageHeader title="LLM 流量" subtitle="HTTP 请求 / 响应交换记录（自动脱敏）">
+    <PageHeader title="流量记录" subtitle="HTTP 请求 / 响应交换记录（自动脱敏）">
       <template #extra>
         <a-button @click="fetch" :loading="loading">刷新</a-button>
       </template>

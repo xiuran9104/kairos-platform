@@ -459,16 +459,10 @@ function go(path: string) {
       </div>
     </a-card>
 
-    <!-- 工具执行次数 -->
-    <a-card title="工具执行次数" size="small" style="margin-top: 16px">
-      <a-empty v-if="!topTools.length" description="暂无工具调用" />
-      <EchartsUI v-else ref="barRef" style="width: 100%; height: 260px" />
-    </a-card>
-
     <!-- 最近事件 + 能力总览 -->
     <a-row :gutter="[16, 16]" style="margin-top: 16px">
       <a-col :xs="24" :lg="14">
-        <a-card title="最近事件" size="small">
+        <a-card title="最近事件" size="small" style="height: 100%">
           <a-empty v-if="!recentEvents.length" description="暂无事件" />
           <a-timeline v-else>
             <a-timeline-item v-for="(e, i) in recentEvents" :key="i" :color="e.color">
@@ -481,7 +475,7 @@ function go(path: string) {
         </a-card>
       </a-col>
       <a-col :xs="24" :lg="10">
-        <a-card title="能力总览" size="small">
+        <a-card title="能力总览" size="small" style="height: 100%">
           <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px">
             <div
               v-for="c in capabilityItems"
@@ -502,5 +496,11 @@ function go(path: string) {
         </a-card>
       </a-col>
     </a-row>
+
+    <!-- 工具执行次数 -->
+    <a-card title="工具执行次数" size="small" style="margin-top: 16px">
+      <a-empty v-if="!topTools.length" description="暂无工具调用" />
+      <EchartsUI v-else ref="barRef" style="width: 100%; height: 260px" />
+    </a-card>
   </div>
 </template>
