@@ -218,6 +218,28 @@ async fn update_session_role(
     Ok(Json(ApiResponse::new(json!({"role_id": role_id}))))
 }
 
+/// Extract the target list from a project `asset_scope` value (JSON array or
+/// `{ "targets": [...] }` object), normalised to trimmed non-empty strings.
+fn extract_scope_targets(scope: Option<&Value>) -> Vec<String> {
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let array = match scope {
+        Value::Array(targets) => targets.clone(),
+        Value::Object(object) => object
+            .get("targets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    array
+        .into_iter()
+        .filter_map(|target| target.as_str().map(str::trim).map(str::to_owned))
+        .filter(|target| !target.is_empty())
+        .collect()
+}
+
 async fn create_session(
     State(state): State<PentState>,
     user: CurrentUser,
@@ -232,12 +254,60 @@ async fn create_session(
         return Err(AppError::bad_request("目标范围不能包含空值"));
     }
 
+    // 项目是目标的权威来源：绑定项目时继承项目目标，项目未配置则回写对话目标。
+    let project_scope = match request.project_id.as_deref() {
+        Some(project_id) => {
+            let scope = sqlx::query_scalar::<_, Value>(
+                "SELECT asset_scope FROM pent_projects
+                 WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0",
+            )
+            .bind(project_id)
+            .bind(tenant_id)
+            .bind(security::tenant_wide(&user))
+            .bind(&user.user_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
+            match scope {
+                Some(scope) => Some(scope),
+                None => return Err(AppError::bad_request("项目不存在或无权访问")),
+            }
+        }
+        None => None,
+    };
+    let project_targets = extract_scope_targets(project_scope.as_ref());
+    let mut targets = request.targets.clone();
+    if targets.is_empty() {
+        targets = project_targets.clone();
+    }
+    if targets.is_empty() {
+        return Err(AppError::bad_request(
+            "请至少提供一个授权目标，或在项目设置中配置目标范围",
+        ));
+    }
+    if let Some(project_id) = request.project_id.as_deref()
+        && project_targets.is_empty()
+    {
+        sqlx::query(
+            "UPDATE pent_projects SET asset_scope=$2, updated_at=now()
+             WHERE id=$1 AND tenant_id=$3 AND deleted=0",
+        )
+        .bind(project_id)
+        .bind(serde_json::Value::Array(
+            targets.iter().cloned().map(Value::String).collect(),
+        ))
+        .bind(tenant_id)
+        .execute(&state.pool)
+        .await
+        .map_err(internal)?;
+    }
+
     let session_id = Uuid::new_v4().to_string();
     let confirmed_at = chrono::Utc::now();
     let proposal = json!({
-        "targets": request.targets,
+        "targets": targets,
         "constraints": request.constraints,
-        "source": "user_input",
+        "source": if project_scope.is_some() { "project_scope" } else { "user_input" },
         "confirmed": true,
         "confirmed_at": confirmed_at,
         "confirmed_by": user.user_id
@@ -267,24 +337,6 @@ async fn create_session(
     let message_id = Uuid::new_v4().to_string();
     let assistant_message_id = Uuid::new_v4().to_string();
     let mut tx = state.pool.begin().await.map_err(internal)?;
-    if let Some(project_id) = request.project_id.as_deref() {
-        let project_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pent_projects
-                 WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0
-             )",
-        )
-        .bind(project_id)
-        .bind(tenant_id)
-        .bind(security::tenant_wide(&user))
-        .bind(&user.user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(internal)?;
-        if !project_exists {
-            return Err(AppError::bad_request("项目不存在或无权访问"));
-        }
-    }
 
     sqlx::query(
         "INSERT INTO pent_agent_sessions(
@@ -445,6 +497,40 @@ async fn confirm_scope(
         return Err(AppError::bad_request(
             "Session 不存在或当前状态不能确认范围",
         ));
+    }
+
+    // 若会话绑定了项目且项目尚未配置目标范围，则回写对话确认的目标。
+    if let Some(project_id) = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT project_id FROM pent_agent_sessions WHERE id=$1 AND tenant_id=$2",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(internal)?
+    {
+        let scope = sqlx::query_scalar::<_, Value>(
+            "SELECT asset_scope FROM pent_projects WHERE id=$1 AND tenant_id=$2 AND deleted=0",
+        )
+        .bind(&project_id)
+        .bind(tenant_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal)?;
+        if extract_scope_targets(scope.as_ref()).is_empty() {
+            sqlx::query(
+                "UPDATE pent_projects SET asset_scope=$2, updated_at=now()
+                 WHERE id=$1 AND tenant_id=$3 AND deleted=0",
+            )
+            .bind(&project_id)
+            .bind(serde_json::Value::Array(
+                request.targets.iter().cloned().map(Value::String).collect(),
+            ))
+            .bind(tenant_id)
+            .execute(&state.pool)
+            .await
+            .map_err(internal)?;
+        }
     }
 
     Ok(Json(ApiResponse::new(json!({

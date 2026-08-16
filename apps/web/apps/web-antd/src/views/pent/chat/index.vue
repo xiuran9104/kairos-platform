@@ -84,6 +84,25 @@ function openCreate() {
   showCreate.value = true;
 }
 
+function projectTargetsOf(project: any): string[] {
+  const scope = project?.asset_scope;
+  if (Array.isArray(scope)) {
+    return scope.filter((t: any) => typeof t === 'string');
+  }
+  if (scope && typeof scope === 'object' && Array.isArray(scope.targets)) {
+    return scope.targets.filter((t: any) => typeof t === 'string');
+  }
+  return [];
+}
+
+function onProjectChange() {
+  const project = projects.value.find((p) => p.id === createForm.value.project_id);
+  const targets = projectTargetsOf(project);
+  if (targets.length > 0) {
+    createForm.value.targetsText = targets.join('\n');
+  }
+}
+
 async function doCreate() {
   const targets = createForm.value.targetsText
     .split(/[\n,]/)
@@ -692,15 +711,16 @@ onMounted(async () => {
           <a-select
             v-model:value="createForm.project_id"
             allow-clear
-            placeholder="可选"
+            placeholder="可选（选择后自动继承项目目标）"
             :options="projects.map((p) => ({ label: p.name || p.id, value: p.id }))"
+            @change="onProjectChange"
           />
         </a-form-item>
         <a-form-item label="授权目标" required>
           <a-textarea
             v-model:value="createForm.targetsText"
             :rows="3"
-            placeholder="每行一个 URL 或 IP，例如 http://localhost:13000"
+            placeholder="每行一个 URL 或 IP，例如 http://localhost:13000；选择项目后自动继承项目目标"
           />
         </a-form-item>
       </a-form>
