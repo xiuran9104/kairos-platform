@@ -47,6 +47,38 @@ pub struct RunToolHistory {
     pub tool_calls: Vec<HistoricalToolCall>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolExecutionContext {
+    pub scope_snapshot: serde_json::Value,
+    pub session_id: String,
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeToolResult {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// JSON-encoded observation returned to the model and evidence pipeline.
+    pub content: String,
+    pub success: bool,
+}
+
+#[async_trait]
+pub trait ConversationToolExecutor: Send + Sync {
+    async fn execute(
+        &self,
+        call: &RuntimeToolCall,
+        context: &ToolExecutionContext,
+    ) -> RuntimeToolResult;
+}
+
 #[async_trait]
 pub trait ConversationRepository: Send + Sync {
     async fn begin_turn(
@@ -203,4 +235,33 @@ pub trait ConversationInstructionSink: Send + Sync {
 #[async_trait]
 pub trait ConversationEventSink: Send + Sync {
     async fn emit(&self, event_type: &str, payload: serde_json::Value) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubToolExecutor;
+
+    #[async_trait]
+    impl ConversationToolExecutor for StubToolExecutor {
+        async fn execute(
+            &self,
+            call: &RuntimeToolCall,
+            _context: &ToolExecutionContext,
+        ) -> RuntimeToolResult {
+            RuntimeToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: "{}".into(),
+                success: true,
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_tool_executor_is_object_safe() {
+        let executor = StubToolExecutor;
+        let _: &dyn ConversationToolExecutor = &executor;
+    }
 }

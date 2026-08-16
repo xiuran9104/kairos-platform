@@ -3,6 +3,11 @@
 //! during conversation-driven penetration testing.
 use std::time::Instant;
 
+pub use kairos_platform_pent_runtime::ports::RuntimeToolResult as ConversationToolResult;
+use kairos_platform_pent_runtime::ports::{
+    ConversationToolExecutor, RuntimeToolCall, ToolExecutionContext,
+};
+
 const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 50_000;
 const NETWORK_TOOLS: &[&str] = &[
     "dir_fuzz",
@@ -138,13 +143,28 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             || direct_network_tools_enabled())
 }
 
-/// Result of executing a single tool call from the LLM.
-#[derive(Debug, Clone)]
-pub struct ConversationToolResult {
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub content: String, // JSON string of the result
-    pub success: bool,
+/// Server adapter that binds the runtime ToolExecutor port to the existing
+/// conversation tool router (builtin, recipe, MCP and HTTP handlers).
+pub struct ServerConversationToolExecutor;
+
+#[async_trait::async_trait]
+impl ConversationToolExecutor for ServerConversationToolExecutor {
+    async fn execute(
+        &self,
+        call: &RuntimeToolCall,
+        context: &ToolExecutionContext,
+    ) -> ConversationToolResult {
+        let mut result = execute_tool(
+            &call.name,
+            &call.arguments,
+            &context.scope_snapshot,
+            &context.session_id,
+            context.run_id.as_deref(),
+        )
+        .await;
+        result.tool_call_id.clone_from(&call.id);
+        result
+    }
 }
 
 /// Execute a tool call from the LLM. Returns the result that can be

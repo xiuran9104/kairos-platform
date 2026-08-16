@@ -30,6 +30,7 @@ pub(crate) fn build_runtime(
         Arc::new(AiModelGateway::new(pool.clone())),
         Arc::new(MemoryAdapter::new(pool.clone())),
         Arc::new(InstructionSink::new(pool.clone())),
+        Arc::new(tool_executor::ServerConversationToolExecutor),
         Arc::new(LoggingConversationEventSink),
         pool.clone(),
     );

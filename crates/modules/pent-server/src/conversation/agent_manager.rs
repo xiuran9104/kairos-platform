@@ -14,6 +14,7 @@ use kairos_platform_pent_api::{AgentMessage, AgentTurnRequest, ConversationMessa
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
+    ConversationToolExecutor, RuntimeToolCall, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopEngine, AgentLoopLimits, AgentLoopStop, parse_agent_directive,
@@ -91,6 +92,7 @@ impl AgentManager {
         gateway: Arc<dyn ConversationModelGateway>,
         context_source: Arc<dyn ConversationContextSource>,
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
+        tool_executor: Arc<dyn ConversationToolExecutor>,
         events: Arc<dyn ConversationEventSink>,
         intent_detector: Arc<dyn ConversationIntentDetector>,
         pool: kairos_platform_framework_database::PgPool,
@@ -150,6 +152,7 @@ impl AgentManager {
                 gateway,
                 context_source,
                 knowledge_source,
+                tool_executor,
                 events,
                 intent_detector,
                 pool,
@@ -295,6 +298,7 @@ async fn execute_sub_agent(
     gateway: Arc<dyn ConversationModelGateway>,
     context_source: Arc<dyn ConversationContextSource>,
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
+    tool_executor: Arc<dyn ConversationToolExecutor>,
     events: Arc<dyn ConversationEventSink>,
     intent_detector: Arc<dyn ConversationIntentDetector>,
     pool: kairos_platform_framework_database::PgPool,
@@ -548,16 +552,23 @@ async fn execute_sub_agent(
                     let sid = session_id.to_string();
                     let rid = run_id.clone();
                     let repo = repository.clone();
+                    let executor = tool_executor.clone();
                     let handle = tokio::spawn(async move {
                         let start = std::time::Instant::now();
-                        let result = super::tool_executor::execute_tool(
-                            &name,
-                            &args,
-                            &scope,
-                            &sid,
-                            Some(rid.as_str()),
-                        )
-                        .await;
+                        let result = executor
+                            .execute(
+                                &RuntimeToolCall {
+                                    id: call_id.clone(),
+                                    name: name.clone(),
+                                    arguments: args.clone(),
+                                },
+                                &ToolExecutionContext {
+                                    scope_snapshot: scope,
+                                    session_id: sid,
+                                    run_id: Some(rid.clone()),
+                                },
+                            )
+                            .await;
                         let _ = repo
                             .record_tool_result(
                                 &rid,

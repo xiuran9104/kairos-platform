@@ -13,7 +13,8 @@ use super::rmos::{
 use super::{
     ConversationContextSource, ConversationEventSink, ConversationInstructionSink,
     ConversationIntentDetector, ConversationKnowledgeSource, ConversationModelGateway,
-    ConversationRepository, ModelTurnOutput,
+    ConversationRepository, ConversationToolExecutor, ModelTurnOutput, RuntimeToolCall,
+    ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopCheckpoint, AgentLoopEngine, AgentLoopLimits, parse_agent_directive,
@@ -157,6 +158,7 @@ pub struct ConversationRuntime {
     model_gateway: Arc<dyn ConversationModelGateway>,
     knowledge_source: Arc<dyn ConversationKnowledgeSource>,
     instruction_sink: Arc<dyn ConversationInstructionSink>,
+    tool_executor: Arc<dyn ConversationToolExecutor>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
     pool: kairos_platform_framework_database::PgPool,
@@ -170,6 +172,7 @@ impl ConversationRuntime {
         model_gateway: Arc<dyn ConversationModelGateway>,
         knowledge_source: Arc<dyn ConversationKnowledgeSource>,
         instruction_sink: Arc<dyn ConversationInstructionSink>,
+        tool_executor: Arc<dyn ConversationToolExecutor>,
         events: Arc<dyn ConversationEventSink>,
         pool: kairos_platform_framework_database::PgPool,
     ) -> Self {
@@ -180,6 +183,7 @@ impl ConversationRuntime {
             model_gateway,
             knowledge_source,
             instruction_sink,
+            tool_executor,
             events,
             nats: None,
             pool,
@@ -911,16 +915,23 @@ impl ConversationRuntime {
                         let scope = context.scope_snapshot.clone();
                         let sid = session_id.to_string();
                         let rid = context.run_id.clone();
+                        let executor = self.tool_executor.clone();
                         let handle = tokio::spawn(async move {
                             let start = std::time::Instant::now();
-                            let result = super::tool_executor::execute_tool(
-                                &name,
-                                &args,
-                                &scope,
-                                &sid,
-                                rid.as_deref(),
-                            )
-                            .await;
+                            let result = executor
+                                .execute(
+                                    &RuntimeToolCall {
+                                        id: call_id.clone(),
+                                        name: name.clone(),
+                                        arguments: args.clone(),
+                                    },
+                                    &ToolExecutionContext {
+                                        scope_snapshot: scope,
+                                        session_id: sid,
+                                        run_id: rid,
+                                    },
+                                )
+                                .await;
                             (
                                 call_id,
                                 name,
@@ -1551,14 +1562,20 @@ impl ConversationRuntime {
                 }
             }
             _ => {
-                super::tool_executor::execute_tool(
-                    &tc.name,
-                    &tc.arguments,
-                    &context.scope_snapshot,
-                    session_id,
-                    context.run_id.as_deref(),
-                )
-                .await
+                self.tool_executor
+                    .execute(
+                        &RuntimeToolCall {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                        },
+                        &ToolExecutionContext {
+                            scope_snapshot: context.scope_snapshot.clone(),
+                            session_id: session_id.to_string(),
+                            run_id: context.run_id.clone(),
+                        },
+                    )
+                    .await
             }
         }
     }
@@ -1872,6 +1889,7 @@ impl ConversationRuntime {
                 self.model_gateway.clone(),
                 self.context_source.clone(),
                 self.knowledge_source.clone(),
+                self.tool_executor.clone(),
                 self.events.clone(),
                 self.intent_detector.clone(),
                 self.pool.clone(),
@@ -2043,14 +2061,21 @@ impl ConversationRuntime {
             .repository
             .load_traffic_request(run_id, traffic_id)
             .await?;
-        let result = super::tool_executor::execute_tool(
-            "http_request",
-            &replay_args.to_string(),
-            scope_snapshot,
-            session_id,
-            Some(run_id),
-        )
-        .await;
+        let result = self
+            .tool_executor
+            .execute(
+                &RuntimeToolCall {
+                    id: tool_call_id.to_string(),
+                    name: "http_request".into(),
+                    arguments: replay_args.to_string(),
+                },
+                &ToolExecutionContext {
+                    scope_snapshot: scope_snapshot.clone(),
+                    session_id: session_id.to_string(),
+                    run_id: Some(run_id.to_string()),
+                },
+            )
+            .await;
         let traffic_ids = self
             .repository
             .record_http_traffic(
