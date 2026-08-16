@@ -1,7 +1,69 @@
 use kairos_platform_framework_database::PgPool;
+use kairos_platform_pent_runtime::ports::ToolExecutionClass;
 use serde_json::{Value, json};
 
 use super::tool_executor::has_conversation_handler;
+
+#[derive(Debug, Clone)]
+pub struct ConversationToolDefinition {
+    pub schema: Value,
+    pub execution_class: ToolExecutionClass,
+}
+
+impl ConversationToolDefinition {
+    pub fn name(&self) -> Option<&str> {
+        self.schema
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+    }
+}
+
+fn tool_definition(
+    schema: Value,
+    execution_class: ToolExecutionClass,
+) -> ConversationToolDefinition {
+    ConversationToolDefinition {
+        schema,
+        execution_class,
+    }
+}
+
+fn inline_definition(schema: Value) -> ConversationToolDefinition {
+    tool_definition(schema, ToolExecutionClass::Inline)
+}
+
+fn descriptor_execution_class(
+    risk_level: &str,
+    approval_policy: &str,
+    executor: &Value,
+) -> ToolExecutionClass {
+    if let Some(class) = explicit_execution_class(executor) {
+        return class;
+    }
+    if approval_policy.eq_ignore_ascii_case("always")
+        || matches!(
+            risk_level.to_ascii_lowercase().as_str(),
+            "high" | "critical"
+        )
+    {
+        ToolExecutionClass::Destructive
+    } else {
+        ToolExecutionClass::ReadOnly
+    }
+}
+
+fn explicit_execution_class(executor: &Value) -> Option<ToolExecutionClass> {
+    match executor.get("execution_class").and_then(Value::as_str) {
+        Some("inline") => Some(ToolExecutionClass::Inline),
+        Some("read_only") => Some(ToolExecutionClass::ReadOnly),
+        Some("destructive") => Some(ToolExecutionClass::Destructive),
+        Some(other) => {
+            tracing::warn!(%other, "invalid tool execution_class; using safe default");
+            Some(ToolExecutionClass::Destructive)
+        }
+        None => None,
+    }
+}
 
 /// FTS search on tool `embedding_document` using PostgreSQL full-text search.
 /// Falls back to an empty result set on any error — callers must degrade
@@ -92,9 +154,11 @@ async fn retrieve_tool_ids(pool: &PgPool, intent: &str, top_k: usize) -> Vec<(St
 
 /// Load tool schemas from the maintained registry instead of duplicating them
 /// in the conversation runtime.
-pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query_as::<_, (String, String, Value)>(
-        "SELECT tool_id, description, input_schema
+pub async fn load_conversation_tool_definitions(
+    pool: &PgPool,
+) -> anyhow::Result<Vec<ConversationToolDefinition>> {
+    let rows = sqlx::query_as::<_, (String, String, Value, String, String, Value)>(
+        "SELECT tool_id, description, input_schema, risk_level, approval_policy, executor
          FROM pent_tool_definitions
          WHERE lifecycle_status = 'active'
          ORDER BY
@@ -112,17 +176,24 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
 
     let mut definitions = rows
         .into_iter()
-        .filter(|(name, _, _)| has_conversation_handler(name))
-        .map(|(name, description, parameters)| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters
-                }
-            })
-        })
+        .filter(|(name, _, _, _, _, _)| has_conversation_handler(name))
+        .map(
+            |(name, description, parameters, risk_level, approval_policy, executor)| {
+                let execution_class =
+                    descriptor_execution_class(&risk_level, &approval_policy, &executor);
+                tool_definition(
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": description,
+                            "parameters": parameters
+                        }
+                    }),
+                    execution_class,
+                )
+            },
+        )
         .collect::<Vec<_>>();
 
     // DesRed-style MCP-first extension point.  Server qualification keeps two
@@ -135,95 +206,98 @@ pub async fn load_conversation_tool_definitions(pool: &PgPool) -> anyhow::Result
         .filter(|(server_id, _)| server_id == crate::tooling::mcp::internal::INTERNAL_SERVER_ID)
         .map(|(_, tool)| tool.name.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let registered_classes = definitions
+        .iter()
+        .filter_map(|definition| {
+            definition
+                .name()
+                .map(|name| (name.to_owned(), definition.execution_class))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     // Once a host tool has a local MCP recipe, do not expose its legacy direct
     // function definition. This makes the migration opt-in per recipe while
     // retaining compatibility for tools that have not moved yet.
     definitions.retain(|definition| {
         definition
-            .pointer("/function/name")
-            .and_then(Value::as_str)
+            .name()
             .is_none_or(|name| !internal_recipe_names.contains(name))
     });
     for (server_id, tool) in mcp_tools {
-        definitions.push(json!({
-            "type": "function",
-            "function": {
-                "name": format!("mcp_{server_id}__{}", tool.name),
-                "description": tool.description,
-                "parameters": tool.input_schema,
-            }
-        }));
+        let execution_class = if server_id == crate::tooling::mcp::internal::INTERNAL_SERVER_ID {
+            registered_classes
+                .get(&tool.name)
+                .copied()
+                .unwrap_or(ToolExecutionClass::Destructive)
+        } else {
+            ToolExecutionClass::Destructive
+        };
+        definitions.push(tool_definition(
+            json!({
+                "type": "function",
+                "function": {
+                    "name": format!("mcp_{server_id}__{}", tool.name),
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                }
+            }),
+            execution_class,
+        ));
     }
 
     // This guarded validator is implemented by the conversation runtime but is
     // not yet part of older database snapshots.
-    if !definitions.iter().any(|definition| {
-        definition.pointer("/function/name").and_then(Value::as_str) == Some("file_upload_validate")
-    }) {
-        definitions.push(file_upload_validator_definition());
+    if !definitions
+        .iter()
+        .any(|definition| definition.name() == Some("file_upload_validate"))
+    {
+        definitions.push(inline_definition(file_upload_validator_definition()));
     }
-    if !definitions.iter().any(|definition| {
-        definition.pointer("/function/name").and_then(Value::as_str) == Some("knowledge_search")
-    }) {
-        definitions.push(knowledge_search_definition());
+    if !definitions
+        .iter()
+        .any(|definition| definition.name() == Some("knowledge_search"))
+    {
+        definitions.push(inline_definition(knowledge_search_definition()));
     }
-    if !definitions.iter().any(|definition| {
-        definition.pointer("/function/name").and_then(Value::as_str) == Some("vision_analyze")
-    }) {
-        definitions.push(vision_analyze_definition());
+    if !definitions
+        .iter()
+        .any(|definition| definition.name() == Some("vision_analyze"))
+    {
+        definitions.push(inline_definition(vision_analyze_definition()));
     }
     for definition in evidence_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
-        if !definitions
-            .iter()
-            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
-        {
-            definitions.push(definition);
+        if !definitions.iter().any(|existing| existing.name() == name) {
+            definitions.push(inline_definition(definition));
         }
     }
     for definition in traffic_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
-        if !definitions
-            .iter()
-            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
-        {
-            definitions.push(definition);
+        if !definitions.iter().any(|existing| existing.name() == name) {
+            definitions.push(inline_definition(definition));
         }
     }
     for definition in finding_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
-        if !definitions
-            .iter()
-            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
-        {
-            definitions.push(definition);
+        if !definitions.iter().any(|existing| existing.name() == name) {
+            definitions.push(inline_definition(definition));
         }
     }
     for definition in skill_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
-        if !definitions
-            .iter()
-            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
-        {
-            definitions.push(definition);
+        if !definitions.iter().any(|existing| existing.name() == name) {
+            definitions.push(inline_definition(definition));
         }
     }
     for definition in agent_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
-        if !definitions
-            .iter()
-            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
-        {
-            definitions.push(definition);
+        if !definitions.iter().any(|existing| existing.name() == name) {
+            definitions.push(inline_definition(definition));
         }
     }
     for definition in super::plan_board::definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
-        if !definitions
-            .iter()
-            .any(|existing| existing.pointer("/function/name").and_then(Value::as_str) == name)
-        {
-            definitions.push(definition);
+        if !definitions.iter().any(|existing| existing.name() == name) {
+            definitions.push(inline_definition(definition));
         }
     }
 
@@ -236,7 +310,7 @@ pub async fn load_tools_for_intent(
     pool: &PgPool,
     intent: &str,
     config: &Value,
-) -> anyhow::Result<Vec<Value>> {
+) -> anyhow::Result<Vec<ConversationToolDefinition>> {
     let all = load_conversation_tool_definitions(pool).await?;
     if config.get("tool_search_enabled").and_then(Value::as_bool) == Some(false) {
         return Ok(all);
@@ -294,10 +368,7 @@ pub async fn load_tools_for_intent(
     let selected = all
         .into_iter()
         .filter(|definition| {
-            let name = definition
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let name = definition.name().unwrap_or("");
             let lower = name.to_ascii_lowercase();
             ALWAYS.contains(&lower.as_str())
                 || lower.starts_with("mcp_")
@@ -636,10 +707,35 @@ fn file_upload_validator_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_tool_definitions, evidence_tool_definitions, file_upload_validator_definition,
-        finding_tool_definitions, knowledge_search_definition,
+        agent_tool_definitions, descriptor_execution_class, evidence_tool_definitions,
+        file_upload_validator_definition, finding_tool_definitions, knowledge_search_definition,
     };
     use crate::conversation::tool_executor::has_conversation_handler;
+    use kairos_platform_pent_runtime::ports::ToolExecutionClass;
+
+    #[test]
+    fn descriptor_execution_metadata_overrides_risk_fallback() {
+        assert_eq!(
+            descriptor_execution_class(
+                "critical",
+                "always",
+                &serde_json::json!({"execution_class": "read_only"}),
+            ),
+            ToolExecutionClass::ReadOnly
+        );
+        assert_eq!(
+            descriptor_execution_class("high", "conditional", &serde_json::json!({})),
+            ToolExecutionClass::Destructive
+        );
+        assert_eq!(
+            descriptor_execution_class(
+                "low",
+                "conditional",
+                &serde_json::json!({"execution_class": "invalid"}),
+            ),
+            ToolExecutionClass::Destructive
+        );
+    }
 
     #[test]
     fn guarded_upload_schema_uses_session_authorization() {
@@ -1056,6 +1152,7 @@ fn descriptor_from_row(row: DescriptorRow) -> anyhow::Result<ToolDescriptor> {
                 .get("handler")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            execution_class: explicit_execution_class(&executor),
         },
         resource_profile: ToolResourceProfile {
             cpu_cores: resource_profile

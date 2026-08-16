@@ -102,6 +102,7 @@ mod tests {
                 endpoint: None,
                 server_id: None,
                 handler: None,
+                execution_class: None,
             },
             resource_profile: ToolResourceProfile {
                 cpu_cores: 1.0,

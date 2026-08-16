@@ -6,15 +6,10 @@
 
 use crate::ports::{ModelToolCall, ToolApprovalGate, ToolApprovalOutcome, ToolApprovalRequest};
 
+pub use crate::ports::ToolExecutionClass;
+
 pub const DEFAULT_MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_SHELL_COMMAND_BYTES: usize = 64 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolExecutionClass {
-    Inline,
-    ReadOnly,
-    Destructive,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolDispatchPolicy {
@@ -112,7 +107,7 @@ impl<'a> ToolDispatcher<'a> {
 fn prepare_call(call: &mut ModelToolCall, policy: &ToolDispatchPolicy) -> ToolDispatchDecision {
     let mut decision = ToolDispatchDecision {
         tool_call_id: call.id.clone(),
-        class: classify_tool(&call.name),
+        class: call.execution_class,
         repair: None,
         blocked: policy_rejection(&call.name, policy),
     };
@@ -183,16 +178,6 @@ fn validate_tool_call(call: &mut ModelToolCall) -> ToolCallValidation {
     ToolCallValidation::Valid
 }
 
-pub fn classify_tool(tool_name: &str) -> ToolExecutionClass {
-    if is_inline_tool(tool_name) {
-        ToolExecutionClass::Inline
-    } else if is_destructive_tool(tool_name) {
-        ToolExecutionClass::Destructive
-    } else {
-        ToolExecutionClass::ReadOnly
-    }
-}
-
 fn is_agent_management_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -200,85 +185,24 @@ fn is_agent_management_tool(tool_name: &str) -> bool {
     )
 }
 
-fn is_inline_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "knowledge_search"
-            | "evidence_list"
-            | "evidence_search"
-            | "evidence_view"
-            | "record_finding"
-            | "traffic_list"
-            | "traffic_view"
-            | "traffic_sitemap"
-            | "traffic_diff"
-            | "traffic_replay"
-            | "skill_list"
-            | "skill_load"
-            | "agent_spawn"
-            | "agent_status"
-            | "agent_collect"
-            | "agent_list"
-            | "plan_create"
-            | "plan_get"
-            | "plan_update"
-            | "read"
-            | "write"
-            | "glob"
-            | "grep"
-            | "bash"
-            | "web_search"
-    )
-}
-
-fn is_destructive_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "nuclei"
-            | "web_vuln_scan"
-            | "sqli_validate"
-            | "xss_validate"
-            | "csrf_validate"
-            | "command_injection_validate"
-            | "file_inclusion_validate"
-            | "file_upload_validate"
-            | "afrog"
-            | "wapiti"
-            | "skipfish"
-            | "sqlmap"
-            | "sqlmap_scan"
-            | "xsser"
-            | "dalfox"
-            | "web_xss_scan"
-            | "commix"
-            | "ffuf"
-            | "wfuzz"
-            | "gobuster"
-            | "feroxbuster"
-            | "dirb"
-            | "dirsearch"
-            | "dir_fuzz"
-            | "ssh_exec"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn call(name: &str, arguments: &str) -> ModelToolCall {
+    fn call(name: &str, arguments: &str, execution_class: ToolExecutionClass) -> ModelToolCall {
         ModelToolCall {
             id: format!("call-{name}"),
             name: name.into(),
             arguments: arguments.into(),
+            execution_class,
         }
     }
 
     #[test]
     fn repairs_arguments_and_classifies_calls() {
-        let mut inline = call("knowledge_search", "[]");
+        let mut inline = call("custom_reference", "[]", ToolExecutionClass::Inline);
         let inline_decision = prepare_call(&mut inline, &ToolDispatchPolicy::default());
-        let mut destructive = call("nuclei", "{}");
+        let mut destructive = call("custom_scanner", "{}", ToolExecutionClass::Destructive);
         let destructive_decision = prepare_call(&mut destructive, &ToolDispatchPolicy::default());
 
         assert_eq!(inline.arguments, "{}");
@@ -293,20 +217,19 @@ mod tests {
             agent_management_only: true,
             plan_required: false,
         };
-        let mut scan = call("nmap", "{}");
-        let mut spawn = call("agent_spawn", "{}");
+        let mut scan = call("nmap", "{}", ToolExecutionClass::ReadOnly);
+        let mut spawn = call("agent_spawn", "{}", ToolExecutionClass::Inline);
 
         assert!(prepare_call(&mut scan, &policy).blocked.is_some());
         assert!(prepare_call(&mut spawn, &policy).blocked.is_none());
     }
 
     #[test]
-    fn ordinary_tools_default_to_read_only() {
-        assert_eq!(classify_tool("nmap"), ToolExecutionClass::ReadOnly);
-        assert_eq!(
-            classify_tool("mcp_take_screenshot"),
-            ToolExecutionClass::ReadOnly
-        );
+    fn dispatch_uses_catalog_execution_metadata() {
+        let mut call = call("same_name", "{}", ToolExecutionClass::Destructive);
+        let decision = prepare_call(&mut call, &ToolDispatchPolicy::default());
+
+        assert_eq!(decision.class, ToolExecutionClass::Destructive);
     }
 
     #[test]
@@ -315,7 +238,7 @@ mod tests {
             "command": "x".repeat(DEFAULT_MAX_SHELL_COMMAND_BYTES + 1)
         })
         .to_string();
-        let mut shell = call("exec", &arguments);
+        let mut shell = call("exec", &arguments, ToolExecutionClass::Destructive);
         let decision = prepare_call(&mut shell, &ToolDispatchPolicy::default());
 
         assert!(decision.blocked.is_some());

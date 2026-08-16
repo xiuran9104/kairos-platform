@@ -60,7 +60,7 @@ impl ToolExecutionCoordinator {
             let class = plan
                 .decision(&call.id)
                 .map(|decision| decision.class)
-                .unwrap_or(ToolExecutionClass::ReadOnly);
+                .unwrap_or(ToolExecutionClass::Destructive);
             let runtime_call = runtime_call(call);
             if class == ToolExecutionClass::Inline && inline.supports(&call.name) {
                 let started = Instant::now();
@@ -255,6 +255,7 @@ mod tests {
             id: format!("call-{index}"),
             name: name.into(),
             arguments: format!(r#"{{"index":{index}}}"#),
+            execution_class: ToolExecutionClass::Destructive,
         }
     }
 

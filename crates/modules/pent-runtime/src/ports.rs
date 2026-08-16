@@ -5,6 +5,8 @@ use kairos_platform_pent_api::{
     AgentTurnRequest, AgentTurnResult, ConversationContext, ConversationIntent, ModelUsage,
 };
 
+pub use kairos_platform_pent_api::ToolExecutionClass;
+
 #[derive(Debug, Clone)]
 pub struct ModelTurnOutput {
     pub content: String,
@@ -21,6 +23,7 @@ pub struct ModelToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    pub execution_class: ToolExecutionClass,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

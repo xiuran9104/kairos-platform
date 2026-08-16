@@ -1,5 +1,7 @@
 //! LLM-03: ModelGateway using AiModelFactory (ai-server).
-use crate::conversation::ports::{ConversationModelGateway, ModelToolCall, ModelTurnOutput};
+use crate::conversation::ports::{
+    ConversationModelGateway, ModelToolCall, ModelTurnOutput, ToolExecutionClass,
+};
 use async_trait::async_trait;
 use kairos_platform_ai_api::{ChatMessage, ChatRequest};
 use kairos_platform_ai_server::AiModelFactory;
@@ -9,7 +11,7 @@ use kairos_platform_pent_core::conversation::DEFAULT_CONTEXT_TOKEN_BUDGET;
 use kairos_platform_pent_runtime::context_compaction;
 use serde_json::Value;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 pub struct AiModelGateway {
@@ -174,7 +176,7 @@ impl ConversationModelGateway for AiModelGateway {
             ).await?
         };
         // Filter out tools that have exceeded their consecutive failure limit.
-        let tools: Vec<Value> = {
+        let tools: Vec<super::tool_catalog::ConversationToolDefinition> = {
             // Apply the bound agent role's tool whitelist first (empty = all).
             let role_whitelist: Option<std::collections::HashSet<String>> = context
                 .policy_snapshot
@@ -191,10 +193,7 @@ impl ConversationModelGateway for AiModelGateway {
             let tools = tools
                 .into_iter()
                 .filter(|tool| match &role_whitelist {
-                    Some(whitelist) => tool
-                        .pointer("/function/name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| whitelist.contains(name)),
+                    Some(whitelist) => tool.name().is_some_and(|name| whitelist.contains(name)),
                     None => true,
                 })
                 .collect::<Vec<_>>();
@@ -206,23 +205,20 @@ impl ConversationModelGateway for AiModelGateway {
             let multi_agent_enabled =
                 super::agent_pipeline::multi_agent_enabled(&context.policy_snapshot);
             tools
-                    .into_iter()
-                    .filter(|t| {
-                        let name = t
-                            .pointer("/function/name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let agent_tool = matches!(
-                            name,
-                            "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
-                        );
-                        !exhausted.contains(name)
-                            && (multi_agent_enabled || !agent_tool)
-                            && !(sub_agent
-                                && (agent_tool
-                                    || matches!(name, "plan_create" | "plan_get" | "plan_update")))
-                    })
-                    .collect()
+                .into_iter()
+                .filter(|t| {
+                    let name = t.name().unwrap_or("");
+                    let agent_tool = matches!(
+                        name,
+                        "agent_spawn" | "agent_status" | "agent_collect" | "agent_list"
+                    );
+                    !exhausted.contains(name)
+                        && (multi_agent_enabled || !agent_tool)
+                        && !(sub_agent
+                            && (agent_tool
+                                || matches!(name, "plan_create" | "plan_get" | "plan_update")))
+                })
+                .collect()
         };
         let mut api_messages: Vec<Value> =
             messages.iter().map(|m| format_message_for_api(m)).collect();
@@ -247,7 +243,7 @@ impl ConversationModelGateway for AiModelGateway {
         trim_api_messages_preserving_tool_groups(&mut api_messages, context_token_budget);
         let tool_names = tools
             .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .filter_map(|tool| tool.name())
             .collect::<Vec<_>>();
         let system_prompt = api_messages
             .first()
@@ -291,14 +287,28 @@ impl ConversationModelGateway for AiModelGateway {
         } else {
             tracing::debug!(available_tools = ?tool_names, "conversation tools disclosed to model");
         }
+        let execution_classes = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.name()
+                    .map(|name| (name.to_owned(), tool.execution_class))
+            })
+            .collect::<HashMap<_, _>>();
+        let tool_schemas = tools.into_iter().map(|tool| tool.schema).collect();
         let response = self
             .factory
-            .chat_tools(model_id, api_messages, tools, temperature, Some(max_tokens))
+            .chat_tools(
+                model_id,
+                api_messages,
+                tool_schemas,
+                temperature,
+                Some(max_tokens),
+            )
             .await
             .map_err(|error| anyhow::anyhow!("模型调用失败: {error:?}"))?;
 
         // Parse the response — it may contain either text or tool calls
-        let (content, tool_calls) = parse_chat_tools_response(&response);
+        let (content, tool_calls) = parse_chat_tools_response(&response, &execution_classes);
 
         if content.trim().is_empty() && tool_calls.is_empty() {
             tracing::warn!(
@@ -587,7 +597,10 @@ fn estimate_api_message_tokens(message: &Value) -> u64 {
     message.to_string().chars().count().div_ceil(3) as u64
 }
 
-fn parse_chat_tools_response(response: &Value) -> (String, Vec<ModelToolCall>) {
+fn parse_chat_tools_response(
+    response: &Value,
+    execution_classes: &HashMap<String, ToolExecutionClass>,
+) -> (String, Vec<ModelToolCall>) {
     let choice = response.pointer("/choices/0/message").or_else(|| {
         response
             .get("choices")
@@ -618,18 +631,24 @@ fn parse_chat_tools_response(response: &Value) -> (String, Vec<ModelToolCall>) {
             arr.iter()
                 .filter_map(|tc| {
                     let func = tc.get("function")?;
+                    let name = func.get("name").and_then(Value::as_str)?.to_string();
+                    let execution_class = execution_classes
+                        .get(&name)
+                        .copied()
+                        .unwrap_or(ToolExecutionClass::Destructive);
                     Some(ModelToolCall {
                         id: tc
                             .get("id")
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string(),
-                        name: func.get("name").and_then(Value::as_str)?.to_string(),
+                        name,
                         arguments: func
                             .get("arguments")
                             .and_then(Value::as_str)
                             .unwrap_or("{}")
                             .to_string(),
+                        execution_class,
                     })
                 })
                 .collect()
@@ -642,11 +661,31 @@ fn parse_chat_tools_response(response: &Value) -> (String, Vec<ModelToolCall>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_message_for_api, sanitize_tool_message_groups,
+        format_message_for_api, parse_chat_tools_response, sanitize_tool_message_groups,
         trim_api_messages_preserving_tool_groups,
     };
     use kairos_platform_ai_api::ChatMessage;
+    use kairos_platform_pent_runtime::ports::ToolExecutionClass;
     use serde_json::{Value, json};
+
+    #[test]
+    fn parsed_tool_calls_use_catalog_metadata_and_safe_unknown_default() {
+        let response = json!({
+            "choices": [{"message": {"tool_calls": [
+                {"id": "known", "function": {"name": "read_tool", "arguments": "{}"}},
+                {"id": "unknown", "function": {"name": "new_mcp_tool", "arguments": "{}"}}
+            ]}}]
+        });
+        let classes = std::collections::HashMap::from([(
+            "read_tool".to_string(),
+            ToolExecutionClass::ReadOnly,
+        )]);
+
+        let (_, calls) = parse_chat_tools_response(&response, &classes);
+
+        assert_eq!(calls[0].execution_class, ToolExecutionClass::ReadOnly);
+        assert_eq!(calls[1].execution_class, ToolExecutionClass::Destructive);
+    }
 
     fn call(id: &str) -> Value {
         json!({

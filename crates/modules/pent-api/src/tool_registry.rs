@@ -35,6 +35,18 @@ pub struct ToolExecutorSpec {
     pub endpoint: Option<String>,
     pub server_id: Option<String>,
     pub handler: Option<String>,
+    /// Runtime scheduling hint: inline, read_only, or destructive.
+    /// Missing metadata must be handled conservatively by the runtime.
+    #[serde(default)]
+    pub execution_class: Option<ToolExecutionClass>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionClass {
+    Inline,
+    ReadOnly,
+    Destructive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
