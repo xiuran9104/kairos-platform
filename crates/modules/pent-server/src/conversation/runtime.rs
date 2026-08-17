@@ -631,7 +631,14 @@ impl ConversationRuntime {
                     .await?;
                 let succeeded = processed.succeeded;
                 web_session.observe(&item.arguments, &result.content);
-                scan_progress.record_tool_arguments(&item.arguments, succeeded);
+                scan_progress.record_tool_arguments(
+                    &item.tool_name,
+                    &item.arguments,
+                    succeeded,
+                );
+                if item.tool_name == "record_finding" {
+                    scan_progress.record_finding_arguments(&item.arguments, succeeded);
+                }
                 if succeeded {
                     executed_call_signatures.insert(tool_call_signature(
                         &item.tool_name,
@@ -697,13 +704,19 @@ impl ConversationRuntime {
                                 .record(run_id, &finding.to_string())
                                 .await
                             {
-                                Ok(recorded) => tracing::info!(
-                                    run_id,
-                                    tool = %tool_name,
-                                    finding = %finding["title"],
-                                    duplicate = recorded["duplicate"].as_bool().unwrap_or(false),
-                                    "projected deterministic finding from evidence"
-                                ),
+                                Ok(recorded) => {
+                                    scan_progress.record_finding_arguments(
+                                        &finding.to_string(),
+                                        true,
+                                    );
+                                    tracing::info!(
+                                        run_id,
+                                        tool = %tool_name,
+                                        finding = %finding["title"],
+                                        duplicate = recorded["duplicate"].as_bool().unwrap_or(false),
+                                        "projected deterministic finding from evidence"
+                                    );
+                                }
                                 Err(error) => tracing::warn!(
                                     run_id,
                                     tool = %tool_name,
@@ -1329,6 +1342,12 @@ impl ConversationRuntime {
         if let Some(run_id) = context.run_id.as_deref() {
             let history = self.repository.load_run_tool_history(run_id).await?;
             evidence_ids = history.evidence_ids;
+            for target in history.finding_targets {
+                scan_progress.record_finding_arguments(
+                    &serde_json::json!({"target": target}).to_string(),
+                    true,
+                );
+            }
             for historical in history.tool_calls {
                 web_session.observe(&historical.arguments.to_string(), "{}");
                 if historical.tool_name == "skill_load" && historical.success {
@@ -1341,6 +1360,7 @@ impl ConversationRuntime {
                     ));
                 }
                 scan_progress.record_tool_arguments(
+                    &historical.tool_name,
                     &historical.arguments.to_string(),
                     historical.success,
                 );

@@ -2570,6 +2570,12 @@ recipes:
     target: true
     flag: -u
     format: flag
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
+    format: flag
 - tool_id: csrf_validate
   version: 1.0.0
   manifest_version: 1
@@ -2615,6 +2621,12 @@ recipes:
     target: true
     flag: -u
     format: flag
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
+    format: flag
 - tool_id: file_inclusion_validate
   version: 1.0.0
   manifest_version: 1
@@ -2659,6 +2671,12 @@ recipes:
     required: true
     target: true
     flag: -u
+    format: flag
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
     format: flag
 - tool_id: file_upload_validate
   version: 1.0.0
@@ -2751,6 +2769,12 @@ recipes:
     target: true
     flag: -u
     format: flag
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
+    format: flag
 - tool_id: xss_validate
   version: 1.0.0
   manifest_version: 1
@@ -2795,6 +2819,12 @@ recipes:
     required: true
     target: true
     flag: -u
+    format: flag
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
     format: flag
 - tool_id: afrog
   version: 1.0.0

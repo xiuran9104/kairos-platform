@@ -304,13 +304,31 @@ pub(super) async fn execute_file_upload_validate(arguments: &str) -> Conversatio
         Ok(part) => part,
         Err(error) => return tool_error("file_upload_validate", format!("MIME 无效: {error}")),
     };
-    let form = reqwest::multipart::Form::new().part(field_name.to_string(), part);
+    let mut form = reqwest::multipart::Form::new()
+        .text("Upload", "Upload")
+        .text("MAX_FILE_SIZE", "100000")
+        .part(field_name.to_string(), part);
+    if let Some(fields) = args.get("form").and_then(Value::as_object) {
+        for (name, value) in fields {
+            if let Some(value) = value.as_str() {
+                form = form.text(name.clone(), value.to_string());
+            }
+        }
+    }
+    let cookies = args
+        .get("cookies")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let client = match http_client(20) {
         Ok(client) => client,
         Err(error) => return tool_error("file_upload_validate", error.to_string()),
     };
     let started = std::time::Instant::now();
-    let response = match client.post(url).multipart(form).send().await {
+    let mut request = client.post(url).multipart(form);
+    if !cookies.is_empty() {
+        request = request.header(reqwest::header::COOKIE, cookies);
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => return tool_error("file_upload_validate", format!("上传请求失败: {error}")),
     };
@@ -322,7 +340,11 @@ pub(super) async fn execute_file_upload_validate(arguments: &str) -> Conversatio
         if !same_origin(url, verify_url) {
             return tool_error("file_upload_validate", "verify_url 必须与上传端点同源");
         }
-        verification = match client.get(verify_url).send().await {
+        let mut request = client.get(verify_url);
+        if !cookies.is_empty() {
+            request = request.header(reqwest::header::COOKIE, cookies);
+        }
+        verification = match request.send().await {
             Ok(response) => {
                 let verify_status = response.status().as_u16();
                 let verify_content_type = response

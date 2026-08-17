@@ -644,7 +644,9 @@ fn file_upload_validator_definition() -> Value {
                     "field_name": {"type": "string", "description": "文件字段名，默认 imgFile"},
                     "filename": {"type": "string", "description": "标记文件名，仅允许 txt/png/svg"},
                     "content_type": {"type": "string", "description": "标记文件 MIME 类型"},
-                    "verify_url": {"type": "string", "description": "可选的上传文件访问 URL"}
+                    "verify_url": {"type": "string", "description": "可选的上传文件访问 URL"},
+                    "form": {"type": "object", "description": "上传表单附加字段；user_token 会从当前 Run 自动注入", "additionalProperties": {"type": "string"}},
+                    "cookies": {"type": "string", "description": "认证 Cookie；通常由当前 Run 自动注入"}
                 }
             }
         }

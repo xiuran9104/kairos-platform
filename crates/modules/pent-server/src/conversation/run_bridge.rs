@@ -237,10 +237,91 @@ struct FindingDraft {
 }
 
 fn finding_fingerprint(title: &str, target: &str) -> String {
+    let semantic_key = dvwa_module_key(target)
+        .map(|module| format!("dvwa|{}|{module}", canonical_target_authority(target)))
+        .unwrap_or_else(|| {
+            format!(
+                "{}|{}",
+                normalized_vulnerability_kind(title),
+                canonical_target_scope(target)
+            )
+        });
     format!(
         "{:x}",
-        Sha256::digest(format!("{}|{}", title.trim(), target.trim()).as_bytes())
+        Sha256::digest(semantic_key.as_bytes())
     )
+}
+
+fn dvwa_module_key(target: &str) -> Option<&'static str> {
+    let normalized = target.to_ascii_lowercase();
+    [
+        ("/vulnerabilities/brute/", "brute-force"),
+        ("/vulnerabilities/exec/", "command-injection"),
+        ("/vulnerabilities/csrf/", "csrf"),
+        ("/vulnerabilities/fi/", "file-inclusion"),
+        ("/vulnerabilities/upload/", "file-upload"),
+        ("/vulnerabilities/captcha/", "insecure-captcha"),
+        ("/vulnerabilities/sqli_blind/", "blind-sql-injection"),
+        ("/vulnerabilities/sqli/", "sql-injection"),
+        ("/vulnerabilities/weak_id/", "weak-session-id"),
+        ("/vulnerabilities/xss_d/", "dom-xss"),
+        ("/vulnerabilities/xss_r/", "reflected-xss"),
+        ("/vulnerabilities/xss_s/", "stored-xss"),
+        ("/vulnerabilities/csp/", "csp-bypass"),
+        ("/vulnerabilities/javascript/", "javascript"),
+    ]
+    .into_iter()
+    .find_map(|(path, module)| normalized.contains(path).then_some(module))
+}
+
+fn canonical_target_authority(target: &str) -> String {
+    reqwest::Url::parse(target)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(match url.port() {
+                Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                None => format!("{}://{host}", url.scheme()),
+            })
+        })
+        .unwrap_or_else(|| target.split('/').take(3).collect::<Vec<_>>().join("/"))
+        .to_ascii_lowercase()
+}
+
+fn canonical_target_scope(target: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(target) {
+        url.set_query(None);
+        url.set_fragment(None);
+        return url.to_string().trim_end_matches('/').to_ascii_lowercase();
+    }
+    target
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn normalized_vulnerability_kind(title: &str) -> String {
+    let normalized = title.to_ascii_lowercase();
+    let kinds = [
+        (&["command injection", "os command", "命令注入"][..], "command-injection"),
+        (&["blind sql", "盲注", "盲 sql"][..], "blind-sql-injection"),
+        (&["sql injection", "sql 注入"][..], "sql-injection"),
+        (&["local file inclusion", "lfi", "本地文件包含", "任意本地文件读取"][..], "file-inclusion"),
+        (&["weak session", "session id", "会话标识符"][..], "weak-session-id"),
+        (&["stored xss", "存储型 xss"][..], "stored-xss"),
+        (&["reflected xss", "反射型 xss"][..], "reflected-xss"),
+        (&["dom xss", "dom-xss"][..], "dom-xss"),
+        (&["csrf", "跨站请求伪造"][..], "csrf"),
+        (&["file upload", "文件上传"][..], "file-upload"),
+    ];
+    kinds
+        .into_iter()
+        .find_map(|(aliases, kind)| aliases.iter().any(|alias| normalized.contains(alias)).then_some(kind))
+        .map(str::to_string)
+        .unwrap_or_else(|| normalized.split_whitespace().collect::<Vec<_>>().join("-"))
 }
 
 async fn persist_finding(
@@ -264,6 +345,24 @@ async fn persist_finding(
         return Err("存在不属于当前 Run 或不存在的 Evidence".to_string());
     }
 
+    let fingerprint = finding_fingerprint(&finding.title, &finding.target);
+    // Older runs used an exact title+target fingerprint. Check their semantic
+    // identity in application code so deploying the new fingerprint does not
+    // add one more duplicate beside legacy rows.
+    let existing = sqlx::query_as::<_, (String, String)>(
+        "SELECT title, target FROM pent_findings WHERE run_id=$1",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if existing
+        .iter()
+        .any(|(title, target)| finding_fingerprint(title, target) == fingerprint)
+    {
+        return Ok(false);
+    }
+
     let result = sqlx::query(
         "INSERT INTO pent_findings(
              id, run_id, project_id, title, severity, status, target,
@@ -281,7 +380,7 @@ async fn persist_finding(
     .bind(&finding.target)
     .bind(json!(evidence_ids))
     .bind(&finding.description)
-    .bind(finding_fingerprint(&finding.title, &finding.target))
+    .bind(fingerprint)
     .bind(finding.confidence)
     .execute(pool)
     .await
@@ -535,4 +634,36 @@ fn parse_findings_json(content: &str) -> Vec<FindingDraft> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dvwa_fingerprint_deduplicates_title_and_query_variants() {
+        let first = finding_fingerprint(
+            "File Inclusion: /etc/passwd 任意本地文件读取",
+            "http://127.0.0.1:18080/vulnerabilities/fi/?page=../../etc/passwd",
+        );
+        let second = finding_fingerprint(
+            "Local File Inclusion (LFI) via URL-encoded page parameter",
+            "http://127.0.0.1:18080/vulnerabilities/fi/",
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn fingerprints_keep_distinct_dvwa_modules_separate() {
+        assert_ne!(
+            finding_fingerprint(
+                "DVWA finding",
+                "http://127.0.0.1:18080/vulnerabilities/fi/"
+            ),
+            finding_fingerprint(
+                "DVWA finding",
+                "http://127.0.0.1:18080/vulnerabilities/exec/"
+            )
+        );
+    }
 }

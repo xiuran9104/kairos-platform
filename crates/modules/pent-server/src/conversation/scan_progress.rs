@@ -27,6 +27,92 @@ const DVWA_MODULES: [(&str, &str); 14] = [
     ("javascript", "/vulnerabilities/javascript/"),
 ];
 
+/// A module is covered only after a successful, targeted validation attempt.
+/// Merely opening the DVWA page is reconnaissance and must not satisfy the
+/// completion gate.
+fn is_targeted_dvwa_validation(module: &str, tool_name: &str, arguments: &str) -> bool {
+    if !matches!(
+        tool_name,
+        "http_request"
+            | "http-framework-test"
+            | "traffic_replay"
+            | "command_injection_validate"
+            | "csrf_validate"
+            | "file_inclusion_validate"
+            | "file_upload_validate"
+            | "sqlmap"
+            | "sqlmap_scan"
+            | "sqli_validate"
+            | "dalfox"
+            | "web_xss_scan"
+            | "xss_validate"
+            | "xsser"
+    ) {
+        return false;
+    }
+    let compact = arguments
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let is_post = compact.contains(r#""method":"post""#);
+    let has = |needles: &[&str]| needles.iter().any(|needle| compact.contains(needle));
+    let xss_scanner = matches!(tool_name, "dalfox" | "web_xss_scan" | "xss_validate" | "xsser");
+    let xss_payload = has(&[
+        "%3cscript", "<script", "%3csvg", "<svg", "onerror", "onload", "javascript%3a",
+        "javascript:",
+    ]);
+
+    match module {
+        "brute-force" => has(&["username", "password"]) && has(&["login", "submit"]),
+        "command-injection" => {
+            tool_name == "command_injection_validate"
+                || (has(&[r#""ip""#, "ip="])
+                    && has(&["%3b", ";", "%26%26", "&&", "%7c", "|", "%0a"]))
+        }
+        "csrf" => {
+            tool_name == "csrf_validate"
+                || (has(&["password_new", "password_conf"]) && has(&["change", "submit"]))
+        }
+        "file-inclusion" => {
+            tool_name == "file_inclusion_validate"
+                || (has(&["page="]) && has(&["../", "..%2f", "%2e%2e", "file%3a", "php%3a"]))
+        }
+        "file-upload" => {
+            tool_name == "file_upload_validate"
+                || (is_post && has(&["file", "upload", "multipart", "content"]))
+        }
+        "insecure-captcha" => {
+            is_post
+                && has(&[
+                    "password_new",
+                    "password_conf",
+                    "g-recaptcha-response",
+                    r#""step""#,
+                    "step=",
+                ])
+        }
+        "sql-injection" | "blind-sql-injection" => {
+            matches!(tool_name, "sqlmap" | "sqlmap_scan" | "sqli_validate")
+                || (has(&["id="])
+                    && has(&[
+                        "%27", "'", "union", "%20or%20", "+or+", "%20and%20", "+and+",
+                        "sleep", "benchmark",
+                    ]))
+        }
+        "weak-session-id" => is_post || has(&["generate", "new+session", "new%20session"]),
+        "dom-xss" => xss_scanner || (has(&["default="]) && xss_payload),
+        "reflected-xss" => xss_scanner || (has(&["name="]) && xss_payload),
+        "stored-xss" => {
+            xss_scanner || (is_post && has(&["message", "txtname", "mtxmessage"]) && xss_payload)
+        }
+        "csp-bypass" => has(&["include=", "script="]) && has(&["http", "data%3a", "alert"]),
+        "javascript" => {
+            (is_post || has(&["submit"])) && has(&["token", "phrase", "success"])
+        }
+        _ => false,
+    }
+}
+
 /// Evidence maturity level required for verified claims in a FINAL.
 /// Defaults to E2 (verbatim projection); set `PENTA_MIN_EVIDENCE_MATURITY=E3`
 /// to require cross-tool corroboration.
@@ -142,7 +228,10 @@ pub(super) struct ScanProgress {
     /// consecutive failures. Cleared when any different tool succeeds.
     exhausted_tools: HashSet<String>,
     dvwa_objective: bool,
+    dvwa_require_findings: bool,
     dvwa_covered: HashSet<String>,
+    dvwa_validation_attempts: HashMap<String, usize>,
+    dvwa_findings: HashSet<String>,
 }
 
 impl ScanProgress {
@@ -170,6 +259,12 @@ impl ScanProgress {
         let security_objective = has_target || has_test_command;
         let dvwa_objective = normalized.contains("dvwa")
             || normalized.contains("damn vulnerable web application");
+        let dvwa_require_findings = dvwa_objective
+            && (normalized.contains("security=low")
+                || normalized.contains("security = low")
+                || normalized.contains("security low")
+                || normalized.contains("低安全级别")
+                || normalized.contains("低安全模式"));
         Self {
             security_objective,
             seen_results: HashSet::new(),
@@ -185,7 +280,10 @@ impl ScanProgress {
             consecutive_tool_failures: HashMap::new(),
             exhausted_tools: HashSet::new(),
             dvwa_objective,
+            dvwa_require_findings,
             dvwa_covered: HashSet::new(),
+            dvwa_validation_attempts: HashMap::new(),
+            dvwa_findings: HashSet::new(),
         }
     }
 
@@ -194,9 +292,13 @@ impl ScanProgress {
             format!(
                 "## DVWA 完整覆盖门槛\n本 Run 必须逐项访问并验证以下模块后才能 FINAL：{}。\n\
                  登录成功后复用 PHPSESSID/security Cookie；提交任何表单前先 GET 同一路径以获取最新 user_token，\
-                 每个模块至少执行一次有针对性的请求，\
+                 仅 GET 打开模块页面不算覆盖；每个模块必须执行带测试参数/载荷的针对性请求，\
                  弱 Session ID 必须生成至少两次并比较 Cookie。确认漏洞后立即调用 record_finding，\
-                 不要依赖最终摘要补录。",
+                 不要依赖最终摘要补录。\n\
+                 验证清单：brute 提交受控用户名/密码；exec 提交命令分隔符与无害标记；\
+                 csrf/captcha 验证受保护动作；fi 使用遍历标记；upload 上传并回读无害标记文件；\
+                 sqli/sqli_blind 使用 sqlmap 或差分载荷；三类 XSS 分别验证反射、持久化和 DOM sink；\
+                 csp 验证允许源脚本路径；javascript 复现客户端 token。",
                 DVWA_MODULES
                     .iter()
                     .map(|(name, _)| *name)
@@ -206,14 +308,41 @@ impl ScanProgress {
         })
     }
 
-    pub(super) fn record_tool_arguments(&mut self, arguments: &str, success: bool) {
+    pub(super) fn record_tool_arguments(
+        &mut self,
+        tool_name: &str,
+        arguments: &str,
+        success: bool,
+    ) {
+        if !self.dvwa_objective || !success {
+            return;
+        }
+        let normalized = arguments.to_ascii_lowercase();
+        for (name, path) in DVWA_MODULES {
+            if normalized.contains(path)
+                && is_targeted_dvwa_validation(name, tool_name, &normalized)
+            {
+                let attempts = self
+                    .dvwa_validation_attempts
+                    .entry(name.to_string())
+                    .or_default();
+                *attempts += 1;
+                if name == "weak-session-id" && *attempts < 2 {
+                    continue;
+                }
+                self.dvwa_covered.insert(name.to_string());
+            }
+        }
+    }
+
+    pub(super) fn record_finding_arguments(&mut self, arguments: &str, success: bool) {
         if !self.dvwa_objective || !success {
             return;
         }
         let normalized = arguments.to_ascii_lowercase();
         for (name, path) in DVWA_MODULES {
             if normalized.contains(path) {
-                self.dvwa_covered.insert(name.to_string());
+                self.dvwa_findings.insert(name.to_string());
             }
         }
     }
@@ -424,6 +553,21 @@ impl ScanProgress {
                     missing.len(),
                     missing.join("、")
                 ));
+            }
+            if self.dvwa_require_findings {
+                let missing_findings = DVWA_MODULES
+                    .iter()
+                    .filter(|(name, _)| !self.dvwa_findings.contains(*name))
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>();
+                if !missing_findings.is_empty() {
+                    return Some(format!(
+                        "DVWA security=low 预期漏洞结果不完整，仍有 {} 个模块没有形成已验证 Finding：{}。\
+                         请检查认证 Cookie、载荷与响应证据并继续验证；不得用页面可达性代替漏洞结论。",
+                        missing_findings.len(),
+                        missing_findings.join("、")
+                    ));
+                }
             }
         }
         // Evidence diversity gate: require observations from at least two
@@ -676,7 +820,7 @@ fn section_has_content(content: &str, heading: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ScanProgress;
+    use super::{DVWA_MODULES, ScanProgress};
 
     #[test]
     fn ordinary_chat_does_not_require_tools_or_evidence() {
@@ -700,7 +844,8 @@ mod tests {
         let mut progress = ScanProgress::new("对 DVWA http://dvwa 做完整渗透测试");
         progress.record_tool_result("http_request", true, true, r#"{"status":200}"#);
         progress.record_tool_arguments(
-            r#"{"url":"http://dvwa/vulnerabilities/sqli/?id=1"}"#,
+            "http_request",
+            r#"{"url":"http://dvwa/vulnerabilities/sqli/?id=1%27%20or%20%271%27=%271"}"#,
             true,
         );
         let rejection = progress
@@ -708,6 +853,56 @@ mod tests {
             .expect("incomplete DVWA coverage must be rejected");
         assert!(rejection.contains("DVWA 覆盖不完整"));
         assert!(rejection.contains("file-upload"));
+    }
+
+    #[test]
+    fn opening_dvwa_module_pages_does_not_count_as_validation() {
+        let mut progress = ScanProgress::new("完整测试 DVWA http://dvwa");
+        for (_, path) in DVWA_MODULES {
+            progress.record_tool_arguments(
+                "http_request",
+                &format!(r#"{{"url":"http://dvwa{path}","method":"GET"}}"#),
+                true,
+            );
+        }
+        assert!(progress.dvwa_covered.is_empty());
+    }
+
+    #[test]
+    fn weak_session_requires_two_successful_generations() {
+        let mut progress = ScanProgress::new("完整测试 DVWA http://dvwa");
+        let arguments =
+            r#"{"url":"http://dvwa/vulnerabilities/weak_id/","method":"POST"}"#;
+        progress.record_tool_arguments("http_request", arguments, true);
+        assert!(!progress.dvwa_covered.contains("weak-session-id"));
+        progress.record_tool_arguments("http_request", arguments, true);
+        assert!(progress.dvwa_covered.contains("weak-session-id"));
+    }
+
+    #[test]
+    fn low_security_dvwa_requires_a_finding_for_every_module() {
+        let mut progress = ScanProgress::new("完整测试 DVWA http://dvwa security=low");
+        progress.record_tool_result("http_request", true, true, r#"{"status":200}"#);
+        progress.dvwa_covered = DVWA_MODULES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let rejection = progress
+            .final_rejection("FINAL: 完成", &["ev-1".into()])
+            .expect("low security DVWA must produce expected findings");
+        assert!(rejection.contains("没有形成已验证 Finding"));
+
+        for (_, path) in DVWA_MODULES {
+            progress.record_finding_arguments(
+                &format!(r#"{{"target":"http://dvwa{path}"}}"#),
+                true,
+            );
+        }
+        assert!(
+            progress
+                .final_rejection("FINAL: 完成", &["ev-1".into()])
+                .is_none()
+        );
     }
 
     #[test]

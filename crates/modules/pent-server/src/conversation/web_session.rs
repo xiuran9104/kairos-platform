@@ -44,31 +44,53 @@ impl WebSessionState {
         let mut changed = false;
         match call.name.as_str() {
             "http-framework-test" | "gobuster" | "sqlmap" | "sqlmap_scan" | "dalfox"
-            | "web_xss_scan" => {
-                changed |= insert_string_if_missing(object, "cookies", &cookie);
+            | "web_xss_scan" | "file_upload_validate" => {
+                changed |= merge_cookie_field(object, "cookies", &cookie);
             }
-            "nuclei" | "web_vuln_scan" | "ffuf" => {
-                changed |= insert_string_if_missing(object, "header", &format!("Cookie: {cookie}"));
+            "nuclei"
+            | "web_vuln_scan"
+            | "ffuf"
+            | "command_injection_validate"
+            | "csrf_validate"
+            | "file_inclusion_validate"
+            | "sqli_validate"
+            | "xss_validate" => {
+                changed |= merge_header_cookie_field(object, "header", &cookie);
             }
             "http_request" => {
                 let headers = object
                     .entry("headers")
                     .or_insert_with(|| Value::Object(Default::default()));
-                if let Some(headers) = headers.as_object_mut()
-                    && !headers.keys().any(|name| name.eq_ignore_ascii_case("cookie"))
-                {
-                    headers.insert("Cookie".into(), Value::String(cookie.clone()));
-                    changed = true;
+                if let Some(headers) = headers.as_object_mut() {
+                    if let Some(name) = headers
+                        .keys()
+                        .find(|name| name.eq_ignore_ascii_case("cookie"))
+                        .cloned()
+                    {
+                        let explicit = headers.get(&name).and_then(Value::as_str).unwrap_or_default();
+                        let merged = merge_cookie_headers(&cookie, explicit);
+                        if merged != explicit {
+                            headers.insert(name, Value::String(merged));
+                            changed = true;
+                        }
+                    } else if !cookie.is_empty() {
+                        headers.insert("Cookie".into(), Value::String(cookie.clone()));
+                        changed = true;
+                    }
                 }
             }
             _ => {}
         }
 
-        if matches!(call.name.as_str(), "http-framework-test" | "http_request")
-            && object
+        let form_post = call.name == "file_upload_validate"
+            || object
                 .get("method")
                 .and_then(Value::as_str)
-                .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+                .is_some_and(|method| method.eq_ignore_ascii_case("POST"));
+        if matches!(
+            call.name.as_str(),
+            "http-framework-test" | "http_request" | "file_upload_validate"
+        ) && form_post
             && let Some(path) = request_path(&Value::Object(object.clone()))
             && let Some((name, value)) = self.csrf_by_path.get(&path)
         {
@@ -77,6 +99,15 @@ impl WebSessionState {
                     form.insert(name.clone(), Value::String(value.clone()));
                     changed = true;
                 }
+            } else if call.name == "file_upload_validate" {
+                object.insert(
+                    "form".into(),
+                    Value::Object(serde_json::Map::from_iter([(
+                        name.clone(),
+                        Value::String(value.clone()),
+                    )])),
+                );
+                changed = true;
             } else {
                 let body_key = if call.name == "http-framework-test" {
                     "data"
@@ -155,16 +186,78 @@ impl WebSessionState {
     }
 }
 
-fn insert_string_if_missing(
+fn merge_cookie_field(
     object: &mut serde_json::Map<String, Value>,
     name: &str,
-    value: &str,
+    session_cookie: &str,
 ) -> bool {
-    if value.is_empty() || object.get(name).and_then(Value::as_str).is_some_and(|v| !v.is_empty()) {
+    if session_cookie.is_empty() {
         return false;
     }
-    object.insert(name.into(), Value::String(value.into()));
+    let explicit = object.get(name).and_then(Value::as_str).unwrap_or_default();
+    let merged = merge_cookie_headers(session_cookie, explicit);
+    if merged == explicit {
+        return false;
+    }
+    object.insert(name.into(), Value::String(merged));
     true
+}
+
+fn merge_header_cookie_field(
+    object: &mut serde_json::Map<String, Value>,
+    name: &str,
+    session_cookie: &str,
+) -> bool {
+    if session_cookie.is_empty() {
+        return false;
+    }
+    let existing = object.get(name).and_then(Value::as_str).unwrap_or_default();
+    let mut lines = existing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Some(index) = lines.iter().position(|line| {
+        line.split_once(':')
+            .is_some_and(|(header, _)| header.trim().eq_ignore_ascii_case("cookie"))
+    }) {
+        let explicit = lines[index]
+            .split_once(':')
+            .map(|(_, value)| value.trim())
+            .unwrap_or_default();
+        lines[index] = format!("Cookie: {}", merge_cookie_headers(session_cookie, explicit));
+    } else {
+        lines.push(format!("Cookie: {session_cookie}"));
+    }
+    let merged = lines.join("\n");
+    if merged == existing {
+        return false;
+    }
+    object.insert(name.into(), Value::String(merged));
+    true
+}
+
+/// Merge cookies by name. Run-authenticated state supplies the baseline while
+/// an explicit tool argument may override a single cookie without discarding
+/// PHPSESSID/security and the rest of the authenticated session.
+fn merge_cookie_headers(session_cookie: &str, explicit_cookie: &str) -> String {
+    let mut cookies = BTreeMap::new();
+    for header in [session_cookie, explicit_cookie] {
+        for pair in header.split(';') {
+            let Some((name, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if !name.trim().is_empty() {
+                cookies.insert(name.trim().to_string(), value.trim().to_string());
+            }
+        }
+    }
+    cookies
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn raw_http_observations(value: &Value) -> Vec<&str> {
@@ -245,6 +338,41 @@ mod tests {
     }
 
     #[test]
+    fn merges_explicit_scanner_cookie_with_authenticated_session() {
+        let mut state = WebSessionState::default();
+        state.observe(
+            r#"{"url":"http://dvwa/login.php"}"#,
+            &serde_json::json!({"stdout":"HTTP/1.1 302 Found\r\nSet-Cookie: PHPSESSID=abc; path=/\r\nSet-Cookie: security=low\r\n\r\n"}).to_string(),
+        );
+        let mut sqlmap = call(
+            "sqlmap_scan",
+            r#"{"url":"http://dvwa/vulnerabilities/sqli/?id=1","cookies":"dvwaSession=2"}"#,
+        );
+        assert!(state.inject(&mut sqlmap));
+        assert!(sqlmap.arguments.contains("PHPSESSID=abc"));
+        assert!(sqlmap.arguments.contains("security=low"));
+        assert!(sqlmap.arguments.contains("dvwaSession=2"));
+    }
+
+    #[test]
+    fn merges_existing_cookie_header_for_nuclei() {
+        let mut state = WebSessionState::default();
+        state.observe(
+            r#"{"url":"http://dvwa/login.php"}"#,
+            &serde_json::json!({"stdout":"Set-Cookie: PHPSESSID=abc; path=/\r\nSet-Cookie: security=low"}).to_string(),
+        );
+        let mut nuclei = call(
+            "nuclei",
+            r#"{"target":"http://dvwa","header":"X-Test: yes\nCookie: dvwaSession=2"}"#,
+        );
+        assert!(state.inject(&mut nuclei));
+        assert!(nuclei.arguments.contains("PHPSESSID=abc"));
+        assert!(nuclei.arguments.contains("security=low"));
+        assert!(nuclei.arguments.contains("dvwaSession=2"));
+        assert!(nuclei.arguments.contains("X-Test: yes"));
+    }
+
+    #[test]
     fn injects_path_scoped_csrf_token_into_post_body() {
         let mut state = WebSessionState::default();
         state.observe(
@@ -273,5 +401,23 @@ mod tests {
         assert!(state.inject(&mut request));
         let arguments: Value = serde_json::from_str(&request.arguments).unwrap();
         assert_eq!(arguments["form"]["user_token"], "token456");
+    }
+
+    #[test]
+    fn injects_auth_and_csrf_into_file_upload_validator() {
+        let mut state = WebSessionState::default();
+        state.observe(
+            r#"{"url":"http://dvwa/vulnerabilities/upload/","headers":{"Cookie":"PHPSESSID=abc; security=low"}}"#,
+            &serde_json::json!({"stdout":"<input type='hidden' name='user_token' value='upload-token'>"}).to_string(),
+        );
+        let mut request = call(
+            "file_upload_validate",
+            r#"{"url":"http://dvwa/vulnerabilities/upload/","filename":"marker.txt"}"#,
+        );
+        assert!(state.inject(&mut request));
+        let arguments: Value = serde_json::from_str(&request.arguments).unwrap();
+        assert_eq!(arguments["form"]["user_token"], "upload-token");
+        assert!(arguments["cookies"].as_str().unwrap().contains("PHPSESSID=abc"));
+        assert!(arguments["cookies"].as_str().unwrap().contains("security=low"));
     }
 }

@@ -580,9 +580,16 @@ impl ConversationRepository for PgConversationRepository {
                 success: exit_code == Some(0),
             });
         }
+        let finding_targets = sqlx::query_scalar::<_, String>(
+            "SELECT target FROM pent_findings WHERE run_id=$1 ORDER BY created_at",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(RunToolHistory {
             evidence_ids,
             tool_calls,
+            finding_targets,
         })
     }
 

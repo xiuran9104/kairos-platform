@@ -50,6 +50,9 @@ pub struct HistoricalToolCall {
 pub struct RunToolHistory {
     pub evidence_ids: Vec<String>,
     pub tool_calls: Vec<HistoricalToolCall>,
+    /// Targets of findings already persisted for the Run. Completion gates
+    /// restore these so a resumed turn does not lose verified coverage.
+    pub finding_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
