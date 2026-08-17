@@ -164,9 +164,7 @@ impl NatsHandle {
         )
         .await
         {
-            Ok(message) => {
-                message.ok_or_else(|| "pent-agent 执行响应通道已关闭".to_string())?
-            }
+            Ok(message) => message.ok_or_else(|| "pent-agent 执行响应通道已关闭".to_string())?,
             Err(_) => {
                 let _ = client.publish(cancel_subject, Vec::new().into()).await;
                 cancellation.disarm();
@@ -290,14 +288,11 @@ pub async fn spawn_conversation_tool_responder(
             let response_client = client.clone();
             let response_pool = pool.clone();
             tokio::spawn(async move {
-                let response = execute_remote_tool_request(
-                    &response_client,
-                    &response_pool,
-                    &message.payload,
-                )
-                .await;
+                let response =
+                    execute_remote_tool_request(&response_client, &response_pool, &message.payload)
+                        .await;
                 let payload = serde_json::to_vec(&response).unwrap_or_else(|_| {
-                    br#"{"output":null,"error":"响应序列化失败"}"#.to_vec()
+                    br#"{"output":null,"error":"response serialization failed"}"#.to_vec()
                 });
                 if let Err(error) = response_client.publish(reply, payload.into()).await {
                     tracing::warn!(%error, "发送对话工具执行响应失败");
@@ -331,7 +326,10 @@ async fn execute_remote_tool_request(
     let Some(recipe) = crate::infrastructure::recipe::lookup(&request.tool_name) else {
         return RemoteToolExecutionResponse {
             output: None,
-            error: Some(format!("工具 {} 未在 pent-agent 配方中注册", request.tool_name)),
+            error: Some(format!(
+                "工具 {} 未在 pent-agent 配方中注册",
+                request.tool_name
+            )),
         };
     };
     if recipe.target_type == crate::infrastructure::recipe::TargetType::Network

@@ -334,7 +334,10 @@ pub fn parse_recipe_file(content: &str) -> Result<Vec<Recipe>, String> {
     let mut seen = HashMap::new();
     for recipe in &file.recipes {
         validate_recipe(recipe)?;
-        if seen.insert(recipe.tool_id.clone(), recipe.version.clone()).is_some() {
+        if seen
+            .insert(recipe.tool_id.clone(), recipe.version.clone())
+            .is_some()
+        {
             return Err(format!("重复配方: {}@{}", recipe.tool_id, recipe.version));
         }
     }
@@ -788,7 +791,8 @@ pub(crate) fn load_recipes_for_tests() {
     let map: std::collections::HashMap<String, ExecutableRecipe> = recipes
         .iter()
         .filter_map(|recipe| {
-            ExecutableRecipe::from_recipe(recipe).map(|executable| (recipe.tool_id.clone(), executable))
+            ExecutableRecipe::from_recipe(recipe)
+                .map(|executable| (recipe.tool_id.clone(), executable))
         })
         .collect();
     set_global_recipes(map);
@@ -903,7 +907,8 @@ recipes:
     fn renders_target_placeholder_with_scope_validation() {
         let recipe = ExecutableRecipe::from_recipe(&sample_recipe()).unwrap();
         let policy = NetworkPolicy::TargetOnly("example.test".into());
-        let prepared = render_recipe(&recipe, &["scan".into(), "example.test".into()], &policy).unwrap();
+        let prepared =
+            render_recipe(&recipe, &["scan".into(), "example.test".into()], &policy).unwrap();
         assert_eq!(prepared.program, "/usr/bin/nmap");
         assert_eq!(prepared.args.last().unwrap(), "example.test");
         assert!(render_recipe(&recipe, &["scan".into(), "other.test".into()], &policy).is_err());
@@ -1062,8 +1067,9 @@ recipes:
         let mut target = p("target", "positional");
         target.required = true;
         let recipe = param_recipe(vec![target]);
-        assert!(render_recipe_from_json(&recipe, &serde_json::json!({}), &NetworkPolicy::Full)
-            .is_err());
+        assert!(
+            render_recipe_from_json(&recipe, &serde_json::json!({}), &NetworkPolicy::Full).is_err()
+        );
     }
 
     #[test]
@@ -1074,7 +1080,13 @@ recipes:
         let schema = parameters_to_input_schema(&[target]);
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["target"]["type"], "string");
-        assert!(schema["required"].as_array().unwrap().iter().any(|v| v == "target"));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "target")
+        );
     }
 
     #[test]
@@ -1091,7 +1103,11 @@ recipes:
         .unwrap();
         assert_eq!(
             prepared.args,
-            vec!["-sT".to_string(), "-u".to_string(), "http://example.com/FUZZ".to_string()]
+            vec![
+                "-sT".to_string(),
+                "-u".to_string(),
+                "http://example.com/FUZZ".to_string()
+            ]
         );
     }
 
@@ -1120,24 +1136,74 @@ recipes:
         // Every tool name handled by the hardcoded prepare_tool whitelist must
         // have a recipe (executable, or builtin metadata for http_request).
         for tool in [
-            "tcp_scan", "nmap", "nmap_scan", "http_probe", "http_request",
-            "nuclei", "web_vuln_scan",
-            "sqli_validate", "xss_validate", "csrf_validate",
-            "command_injection_validate", "file_inclusion_validate", "file_upload_validate",
-            "afrog", "dns_lookup", "ssh_exec", "sql_query",
-            "subfinder", "amass", "dnsx", "masscan", "naabu",
-            "ffuf", "gobuster", "nikto", "whatweb", "wafw00f", "httpx",
-            "wpscan", "web_wordpress_scan",
-            "sqlmap", "sqlmap_scan", "xsser", "commix",
-            "testssl", "web_tls_scan", "sslscan", "sslyze", "qsslcaudit",
-            "dir_fuzz", "dirsearch", "dirb", "feroxbuster", "wfuzz",
-            "hakrawler", "katana", "gau", "httrack", "arjun",
-            "dnsrecon", "dnsenum", "fierce",
-            "dmitry", "theharvester",
-            "enum4linux", "smbmap", "smtp-user-enum", "swaks", "davtest",
-            "nbtscan", "netdiscover",
-            "web_vuln_scan", "web_wordpress_scan", "wapiti", "skipfish", "lbd",
-            "dalfox", "web_xss_scan",
+            "tcp_scan",
+            "nmap",
+            "nmap_scan",
+            "http_probe",
+            "http_request",
+            "nuclei",
+            "web_vuln_scan",
+            "sqli_validate",
+            "xss_validate",
+            "csrf_validate",
+            "command_injection_validate",
+            "file_inclusion_validate",
+            "file_upload_validate",
+            "afrog",
+            "dns_lookup",
+            "ssh_exec",
+            "sql_query",
+            "subfinder",
+            "amass",
+            "dnsx",
+            "masscan",
+            "naabu",
+            "ffuf",
+            "gobuster",
+            "nikto",
+            "whatweb",
+            "wafw00f",
+            "httpx",
+            "wpscan",
+            "web_wordpress_scan",
+            "sqlmap",
+            "sqlmap_scan",
+            "xsser",
+            "commix",
+            "testssl",
+            "web_tls_scan",
+            "sslscan",
+            "sslyze",
+            "qsslcaudit",
+            "dir_fuzz",
+            "dirsearch",
+            "dirb",
+            "feroxbuster",
+            "wfuzz",
+            "hakrawler",
+            "katana",
+            "gau",
+            "httrack",
+            "arjun",
+            "dnsrecon",
+            "dnsenum",
+            "fierce",
+            "dmitry",
+            "theharvester",
+            "enum4linux",
+            "smbmap",
+            "smtp-user-enum",
+            "swaks",
+            "davtest",
+            "nbtscan",
+            "netdiscover",
+            "web_vuln_scan",
+            "web_wordpress_scan",
+            "wapiti",
+            "skipfish",
+            "lbd",
+            "dalfox",
+            "web_xss_scan",
         ] {
             assert!(ids.contains(tool), "recipes.yaml 缺少工具 {tool}");
         }
