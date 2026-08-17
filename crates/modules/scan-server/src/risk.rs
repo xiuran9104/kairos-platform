@@ -6,7 +6,7 @@ use axum::{
 use kairos_platform_framework_common::ApiResponse;
 use kairos_platform_framework_web::AppError;
 use kairos_platform_scan_api::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
@@ -50,10 +50,14 @@ pub async fn update_one(
     Path(id): Path<String>,
     Json(req): Json<UpdateRiskRequest>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let status_str = req
-        .status
-        .as_ref()
-        .map(|st| format!("{:?}", st).to_lowercase());
+    let status_str = req.status.as_ref().map(|status| match status {
+        RiskStatus::Open => "open",
+        RiskStatus::Verified => "verified",
+        RiskStatus::Resolved => "resolved",
+        RiskStatus::Ignored => "ignored",
+        RiskStatus::FalsePositive => "false_positive",
+        RiskStatus::PendingReview => "pending_review",
+    });
     sqlx::query("UPDATE scan_risks SET status=COALESCE($2,status),assigned_to=COALESCE($3,assigned_to),solution=COALESCE($4,solution),updated_at=now() WHERE id=$1 AND deleted=0")
         .bind(&id).bind(&status_str).bind(&req.assigned_to).bind(&req.solution)
         .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;

@@ -27,14 +27,11 @@ impl<'a> EvidenceSink<'a> {
         let Some(run_id) = run_id else {
             return Ok(None);
         };
-        let should_persist = match persistence {
-            ToolResultPersistence::MainEvidence => {
-                !is_evidence_tool(&item.tool_name)
-                    && !is_traffic_tool(&item.tool_name)
-                    && !is_finding_tool(&item.tool_name)
-            }
-            ToolResultPersistence::ExternalBestEffort => !item.inline,
-        };
+        let should_persist = should_persist_tool_result(
+            &item.tool_name,
+            item.inline,
+            persistence,
+        );
         if !should_persist {
             return Ok(None);
         }
@@ -61,6 +58,24 @@ impl<'a> EvidenceSink<'a> {
     }
 }
 
+fn should_persist_tool_result(
+    tool_name: &str,
+    inline: bool,
+    persistence: ToolResultPersistence,
+) -> bool {
+    match persistence {
+        ToolResultPersistence::MainEvidence => {
+            !is_evidence_tool(tool_name)
+                && !is_traffic_tool(tool_name)
+                && !is_finding_tool(tool_name)
+        }
+        // Sub-agent inline reference tools normally do not create evidence,
+        // but skill_load is also the durable usage signal consumed by the
+        // Skills Monitor. Preserve it so delegated runs are observable.
+        ToolResultPersistence::ExternalBestEffort => !inline || tool_name == "skill_load",
+    }
+}
+
 pub struct TrafficSink<'a> {
     repository: &'a dyn ConversationRepository,
 }
@@ -76,7 +91,12 @@ impl<'a> TrafficSink<'a> {
         run_id: Option<&str>,
         enabled: bool,
     ) -> anyhow::Result<Vec<String>> {
-        if !enabled || !matches!(item.tool_name.as_str(), "http_request" | "http_probe") {
+        if !enabled
+            || !matches!(
+                item.tool_name.as_str(),
+                "http_request" | "http_probe" | "http-framework-test"
+            )
+        {
             return Ok(Vec::new());
         }
         let Some(run_id) = run_id else {
@@ -207,11 +227,25 @@ pub(crate) fn is_finding_tool(tool_name: &str) -> bool {
 
 #[cfg(test)]
 mod execution_result_tests {
-    use super::is_evidence_tool;
+    use super::{ToolResultPersistence, is_evidence_tool, should_persist_tool_result};
 
     #[test]
     fn execution_result_names_route_to_run_scoped_evidence_store() {
         assert!(is_evidence_tool("query_execution_result"));
         assert!(is_evidence_tool("query-execution-result"));
+    }
+
+    #[test]
+    fn delegated_skill_load_is_persisted_for_monitoring() {
+        assert!(should_persist_tool_result(
+            "skill_load",
+            true,
+            ToolResultPersistence::ExternalBestEffort
+        ));
+        assert!(!should_persist_tool_result(
+            "skill_list",
+            true,
+            ToolResultPersistence::ExternalBestEffort
+        ));
     }
 }

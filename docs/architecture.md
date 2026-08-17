@@ -52,7 +52,7 @@ Pent 依赖方向：`pent-server -> pent-runtime|pent-tooling|pent-core -> pent-
 - **Infra**：配置、文件、任务、日志、数据源。
 - **AI**：统一模型管理、聊天/SSE、工具调用、知识库、图片、Midjourney、音乐、语音、Embedding、写作。
 - **Pent**：授权渗透任务、Agent 会话、工具路由、安全护栏、运行时编排与结果追踪。
-- **Scan**：扫描器、扫描任务、资产发现及异构扫描结果归一化。
+- **Scan**：扫描器、扫描任务、独立 Agent 的并发端口/只读协议探测、服务指纹、数据库精确版本漏洞目录、证据驱动风险规则与复扫生命周期，以及异构扫描结果归一化。版本目录只在产品和版本证据同时精确命中时生成待复核风险。
 - **Asset Ops**：资产、机房、区域、端点、指纹与风险运营。
 - **Media**：素材上传及媒体基础能力。
 
@@ -98,7 +98,7 @@ pent_tool_definitions 表（初始化快照）
 
 - 模块：`crates/modules/mitm-proxy`（`ca.rs` / `tls.rs` / `proxy.rs` / `lib.rs`）。
 - CA 持久化于 `PENTA_MITM_CA_DIR`（默认 `storage/mitm/`，已 gitignore，私钥不入库）。
-- 落库：`pent-server/src/infrastructure/mitm_sink.rs` 实现 `TrafficSink`，写入 `pent_http_traffic`（body 受 `PENTA_MITM_BODY_LIMIT` 限制）。
+- 落库：`pent-server/src/infrastructure/mitm_sink.rs` 实现 `TrafficSink`，写入 `pent_http_traffic`；大 Body 按 `PENTA_MITM_INLINE_BODY_LIMIT` 分流到 MinIO，数据库保留摘要、预览与对象键。
 - 注入：`infrastructure/process.rs` 在 `PENTA_TRAFFIC_CAPTURE=true` 时注入代理地址与 `SSL_CERT_FILE`/`CURL_CA_BUNDLE`/`REQUESTS_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS`。
 - 启动：`pent-agent` 调 `mitm_sink::spawn_mitm_proxy`。
 
@@ -119,7 +119,7 @@ pent_tool_definitions 表（初始化快照）
 | --- | --- | --- |
 | gateway | 8080 | 统一路由、鉴权、限流、审计，组合各模块 |
 | pent-agent | 8081（仅健康检查） | Agent worker、工具/Sandbox、MCP、MITM 代理与 Evidence 产出 |
-| scan-agent | — | 扫描执行节点 |
+| scan-agent | — | 扫描执行节点；通过 Gateway 注册、心跳续租、领取任务并回传资产与端口结果 |
 | mitm-proxy | 8085（内嵌） | 流量抓取代理 |
 
 本地基础设施（PostgreSQL/Redis/NATS/MinIO）由 `script/docker/docker-compose.yml` 启动。

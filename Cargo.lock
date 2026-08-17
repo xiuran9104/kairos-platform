@@ -1920,12 +1920,17 @@ name = "kairos-scan-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
+ "kairos-platform-scan-api",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

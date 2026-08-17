@@ -1,6 +1,8 @@
 //! Conversation runtime ports and orchestration.
 
 mod runtime;
+mod finding_projection;
+mod web_session;
 
 pub use kairos_platform_pent_runtime::ports::*;
 pub use runtime::*;

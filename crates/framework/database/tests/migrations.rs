@@ -37,9 +37,12 @@ async fn applies_all_migrations_to_empty_postgres() {
         "infra_codegen_column",
         "pent_runtime_policies",
         "pent_runs",
+        "pent_cloud_credentials",
         "pent_http_traffic",
         "pent_skills",
         "pent_tool_calls",
+        "scan_vulnerability_rules",
+        "scan_risk_verifications",
         "pent_workers",
         "pent_mcp_servers",
         "pent_mcp_server_instances",
@@ -68,6 +71,25 @@ async fn applies_all_migrations_to_empty_postgres() {
         ("pent_workers", "sandbox_backend"),
         ("pent_workers", "sandbox_ready"),
         ("pent_workers", "sandbox_detail"),
+        ("pent_http_traffic", "request_sha256"),
+        ("pent_http_traffic", "request_body_object_key"),
+        ("pent_http_traffic", "response_body_object_key"),
+        ("scan_port_details", "service_version"),
+        ("scan_port_details", "service_banner"),
+        ("scan_risks", "rule_id"),
+        ("scan_risks", "evidence"),
+        ("scan_risks", "source"),
+        ("scan_risks", "first_seen"),
+        ("scan_risks", "last_seen"),
+        ("scan_vulnerability_rules", "cpe_uri"),
+        ("scan_vulnerability_rules", "version_start_including"),
+        ("scan_vulnerability_rules", "version_start_excluding"),
+        ("scan_vulnerability_rules", "version_end_including"),
+        ("scan_vulnerability_rules", "version_end_excluding"),
+        ("scan_risk_verifications", "rejected_by"),
+        ("scan_risk_verifications", "rejected_at"),
+        ("scan_risk_verifications", "executed_by"),
+        ("scan_risk_verifications", "executed_at"),
     ] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -82,6 +104,54 @@ async fn applies_all_migrations_to_empty_postgres() {
         .expect("inspect expected column");
         assert!(exists, "expected column {table}.{column}");
     }
+
+    let scan_risk_rule_index: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.scan_risks_active_rule_key') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect scan risk rule index");
+    assert!(scan_risk_rule_index);
+
+    let vulnerability_rule_index: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.scan_vulnerability_rules_active_match_key') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect vulnerability rule match index");
+    assert!(vulnerability_rule_index);
+
+    let seeded_vulnerability_rule: (String, String, String, String, bool) = sqlx::query_as(
+        "SELECT cve_id,product,exact_version,default_status,enabled
+         FROM scan_vulnerability_rules WHERE id='cve-2011-2523-vsftpd-2.3.4'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect seeded vulnerability rule");
+    assert_eq!(
+        seeded_vulnerability_rule,
+        (
+            "CVE-2011-2523".to_string(),
+            "vsftpd".to_string(),
+            "2.3.4".to_string(),
+            "pending_review".to_string(),
+            true,
+        )
+    );
+
+    let cloud_credential_constraints: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE conrelid='public.pent_cloud_credentials'::regclass
+           AND conname IN (
+               'pent_cloud_credentials_provider_check',
+               'pent_cloud_credentials_status_check',
+               'pent_cloud_credentials_allowed_tools_array_check',
+               'pent_cloud_credentials_encrypted_payload_check'
+           )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect cloud credential constraints");
+    assert_eq!(cloud_credential_constraints, 4);
     let toon_schema_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM pg_namespace WHERE nspname IN ('toon', 'toonflow')
@@ -111,6 +181,23 @@ async fn applies_all_migrations_to_empty_postgres() {
     assert_eq!(
         pent_capability_ops_menus, 19,
         "pent capability/ops menus must be bootstrapped"
+    );
+
+    let task_monitor_route: (String, String, bool, Option<i64>) = sqlx::query_as(
+        "SELECT path,component,visible,active_menu_id
+         FROM system_menu WHERE id=30418 AND deleted=0",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Pent task monitor route exists");
+    assert_eq!(
+        task_monitor_route,
+        (
+            "tasks/:id".to_string(),
+            "pent/task-monitor/index".to_string(),
+            false,
+            Some(30403),
+        )
     );
 
     let duplicate_route_names: i64 = sqlx::query_scalar(
@@ -349,6 +436,28 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("inspect scan task scanner binding");
     assert_eq!(scan_task_scanner_column, 1);
+
+    let scan_task_lease_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='scan_tasks'
+           AND column_name IN ('claim_token','lease_expires_at','attempt_count','error_message')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect scan task lease columns");
+    assert_eq!(scan_task_lease_columns, 4);
+
+    let scan_asset_ports_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='scan_assets'
+              AND column_name='ports' AND data_type='jsonb'
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect normalized scan asset ports");
+    assert!(scan_asset_ports_column);
 
     let scanner_menu_name: String =
         sqlx::query_scalar("SELECT name FROM system_menu WHERE id=30304 AND deleted=0")

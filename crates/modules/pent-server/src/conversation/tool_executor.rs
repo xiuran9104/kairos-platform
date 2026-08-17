@@ -162,6 +162,7 @@ impl ConversationToolExecutor for ServerConversationToolExecutor {
             &context.scope_snapshot,
             &context.session_id,
             context.run_id.as_deref(),
+            Some(&call.id),
         )
         .await;
         result.tool_call_id.clone_from(&call.id);
@@ -177,6 +178,7 @@ pub async fn execute_tool(
     scope_snapshot: &serde_json::Value,
     session_id: &str,
     run_id: Option<&str>,
+    execution_id: Option<&str>,
 ) -> ConversationToolResult {
     if NETWORK_TOOLS.contains(&name)
         && !conversation_native_tool(name)
@@ -204,10 +206,24 @@ pub async fn execute_tool(
     match name {
         // ── HTTP tools ──────────────────────────────────────────
         "http_request" if !direct_network_tools_enabled() => {
-            execute_isolated_http_request(arguments, scope_snapshot, session_id, run_id).await
+            execute_isolated_http_request(
+                arguments,
+                scope_snapshot,
+                session_id,
+                run_id,
+                execution_id,
+            )
+            .await
         }
         "http_probe" if !direct_network_tools_enabled() => {
-            execute_isolated_http_probe(arguments, scope_snapshot, session_id, run_id).await
+            execute_isolated_http_probe(
+                arguments,
+                scope_snapshot,
+                session_id,
+                run_id,
+                execution_id,
+            )
+            .await
         }
         "http_request" => execute_http_request(arguments).await,
         "http_probe" => execute_http_probe(arguments).await,
@@ -245,6 +261,7 @@ pub async fn execute_tool(
                         scope_snapshot,
                         session_id,
                         run_id,
+                        execution_id,
                     )
                     .await;
                 }
@@ -270,6 +287,7 @@ async fn execute_recipe_tool(
     scope_snapshot: &serde_json::Value,
     session_id: &str,
     run_id: Option<&str>,
+    execution_id: Option<&str>,
 ) -> ConversationToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
@@ -282,12 +300,15 @@ async fn execute_recipe_tool(
         );
     };
     let request = crate::transport::mq::RemoteToolExecutionRequest {
-        execution_id: uuid::Uuid::new_v4().to_string(),
+        execution_id: execution_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         tool_name: name.to_string(),
         arguments: args,
         scope_snapshot: scope_snapshot.clone(),
         session_id: session_id.to_string(),
         run_id: run_id.map(ToOwned::to_owned),
+        traffic_run_id: None,
         timeout_seconds: crate::infrastructure::recipe::lookup(name)
             .map(|recipe| recipe.resource_profile.timeout_seconds)
             .unwrap_or(300),
@@ -452,6 +473,7 @@ async fn execute_isolated_http_request(
     scope_snapshot: &serde_json::Value,
     session_id: &str,
     run_id: Option<&str>,
+    execution_id: Option<&str>,
 ) -> ConversationToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
@@ -473,12 +495,15 @@ async fn execute_isolated_http_request(
         return tool_error("http_request", "pent-agent 执行通道不可用");
     };
     let request = crate::transport::mq::RemoteToolExecutionRequest {
-        execution_id: uuid::Uuid::new_v4().to_string(),
+        execution_id: execution_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         tool_name: "http_request".into(),
         arguments: args,
         scope_snapshot: scope_snapshot.clone(),
         session_id: session_id.into(),
         run_id: run_id.map(str::to_owned),
+        traffic_run_id: None,
         timeout_seconds: 30,
     };
     let output = match bus.request_tool_execution(&request).await {
@@ -525,6 +550,7 @@ async fn execute_isolated_http_probe(
     scope_snapshot: &serde_json::Value,
     session_id: &str,
     run_id: Option<&str>,
+    execution_id: Option<&str>,
 ) -> ConversationToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
@@ -540,12 +566,15 @@ async fn execute_isolated_http_probe(
     let mut reachable = false;
     for url in http_probe_urls(target) {
         let request = crate::transport::mq::RemoteToolExecutionRequest {
-            execution_id: uuid::Uuid::new_v4().to_string(),
+            execution_id: execution_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             tool_name: "http_probe".into(),
             arguments: serde_json::json!({"target":url}),
             scope_snapshot: scope_snapshot.clone(),
             session_id: session_id.into(),
             run_id: run_id.map(str::to_owned),
+            traffic_run_id: None,
             timeout_seconds: 30,
         };
         match bus.request_tool_execution(&request).await {
@@ -1330,7 +1359,7 @@ pub async fn execute_tools_parallel(
             let sid = session_id.to_string();
             let rid = run_id.map(str::to_string);
             tokio::spawn(async move {
-                let result = execute_tool(&n, &a, &scope, &sid, rid.as_deref()).await;
+                let result = execute_tool(&n, &a, &scope, &sid, rid.as_deref(), None).await;
                 (idx, cid, result)
             })
         })

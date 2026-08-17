@@ -69,7 +69,9 @@ impl AiModelGateway {
 }
 
 fn conversation_output_token_limit(configured: u32) -> u32 {
-    if std::env::var("PENTA_ENV").as_deref() == Ok("development") {
+    let unlimited = std::env::var("PENTA_UNLIMITED_BUDGETS")
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    if unlimited || std::env::var("PENTA_ENV").as_deref() == Ok("development") {
         return std::env::var("PENTA_CONVERSATION_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
@@ -306,6 +308,11 @@ impl ConversationModelGateway for AiModelGateway {
 
         // Parse the response — it may contain either text or tool calls
         let (content, tool_calls) = parse_chat_tools_response(&response, &execution_classes);
+        let reasoning_content = response
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
 
         if content.trim().is_empty() && tool_calls.is_empty() {
             tracing::warn!(
@@ -339,7 +346,7 @@ impl ConversationModelGateway for AiModelGateway {
             .unwrap_or(0);
         Ok(ModelTurnOutput {
             content,
-            reasoning_summary: None,
+            reasoning_summary: reasoning_content,
             plan_update: None,
             citations: vec![],
             usage: ModelUsage {
@@ -364,11 +371,15 @@ fn format_message_for_api(m: &kairos_platform_ai_api::ChatMessage) -> Value {
     if let Ok(parsed) = serde_json::from_str::<Value>(&m.content) {
         // Tool calls message from assistant
         if let Some(tool_calls) = parsed.get("tool_calls") {
-            return serde_json::json!({
+            let mut message = serde_json::json!({
                 "role": "assistant",
                 "content": parsed.get("content").cloned().unwrap_or(Value::Null),
                 "tool_calls": tool_calls
             });
+            if let Some(reasoning) = parsed.get("reasoning_content") {
+                message["reasoning_content"] = reasoning.clone();
+            }
+            return message;
         }
         // Tool result message
         if let Some(tool_call_id) = parsed.get("tool_call_id").and_then(Value::as_str) {
@@ -708,6 +719,25 @@ mod tests {
         let formatted = format_message_for_api(&message);
         assert_eq!(formatted["content"], "根据新证据改为检查登录接口");
         assert_eq!(formatted["tool_calls"][0]["id"], "call-1");
+    }
+
+    #[test]
+    fn preserves_reasoning_content_for_thinking_model_tool_rounds() {
+        let message = ChatMessage {
+            role: "assistant".into(),
+            content: serde_json::json!({
+                "content": null,
+                "reasoning_content": "opaque reasoning state",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "http_probe", "arguments": "{}"}
+                }]
+            })
+            .to_string(),
+        };
+        let formatted = format_message_for_api(&message);
+        assert_eq!(formatted["reasoning_content"], "opaque reasoning state");
     }
 
     #[test]

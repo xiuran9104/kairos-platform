@@ -10,6 +10,23 @@ const STALL_STOP_THRESHOLD: usize = 8;
 /// satisfy the gate. The gate still prevents zero-tool "drive-by" reports.
 const MIN_EVIDENCE_CATEGORY_DIVERSITY: usize = 1;
 
+const DVWA_MODULES: [(&str, &str); 14] = [
+    ("brute-force", "/vulnerabilities/brute/"),
+    ("command-injection", "/vulnerabilities/exec/"),
+    ("csrf", "/vulnerabilities/csrf/"),
+    ("file-inclusion", "/vulnerabilities/fi/"),
+    ("file-upload", "/vulnerabilities/upload/"),
+    ("insecure-captcha", "/vulnerabilities/captcha/"),
+    ("sql-injection", "/vulnerabilities/sqli/"),
+    ("blind-sql-injection", "/vulnerabilities/sqli_blind/"),
+    ("weak-session-id", "/vulnerabilities/weak_id/"),
+    ("dom-xss", "/vulnerabilities/xss_d/"),
+    ("reflected-xss", "/vulnerabilities/xss_r/"),
+    ("stored-xss", "/vulnerabilities/xss_s/"),
+    ("csp-bypass", "/vulnerabilities/csp/"),
+    ("javascript", "/vulnerabilities/javascript/"),
+];
+
 /// Evidence maturity level required for verified claims in a FINAL.
 /// Defaults to E2 (verbatim projection); set `PENTA_MIN_EVIDENCE_MATURITY=E3`
 /// to require cross-tool corroboration.
@@ -124,6 +141,8 @@ pub(super) struct ScanProgress {
     /// Tools that have been temporarily removed from the catalog due to
     /// consecutive failures. Cleared when any different tool succeeds.
     exhausted_tools: HashSet<String>,
+    dvwa_objective: bool,
+    dvwa_covered: HashSet<String>,
 }
 
 impl ScanProgress {
@@ -149,6 +168,8 @@ impl ScanProgress {
         .iter()
         .any(|p| normalized.contains(p));
         let security_objective = has_target || has_test_command;
+        let dvwa_objective = normalized.contains("dvwa")
+            || normalized.contains("damn vulnerable web application");
         Self {
             security_objective,
             seen_results: HashSet::new(),
@@ -163,6 +184,37 @@ impl ScanProgress {
             traffic_replay_count: 0,
             consecutive_tool_failures: HashMap::new(),
             exhausted_tools: HashSet::new(),
+            dvwa_objective,
+            dvwa_covered: HashSet::new(),
+        }
+    }
+
+    pub(super) fn coverage_instruction(&self) -> Option<String> {
+        self.dvwa_objective.then(|| {
+            format!(
+                "## DVWA 完整覆盖门槛\n本 Run 必须逐项访问并验证以下模块后才能 FINAL：{}。\n\
+                 登录成功后复用 PHPSESSID/security Cookie；提交任何表单前先 GET 同一路径以获取最新 user_token，\
+                 每个模块至少执行一次有针对性的请求，\
+                 弱 Session ID 必须生成至少两次并比较 Cookie。确认漏洞后立即调用 record_finding，\
+                 不要依赖最终摘要补录。",
+                DVWA_MODULES
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
+        })
+    }
+
+    pub(super) fn record_tool_arguments(&mut self, arguments: &str, success: bool) {
+        if !self.dvwa_objective || !success {
+            return;
+        }
+        let normalized = arguments.to_ascii_lowercase();
+        for (name, path) in DVWA_MODULES {
+            if normalized.contains(path) {
+                self.dvwa_covered.insert(name.to_string());
+            }
         }
     }
 
@@ -358,6 +410,21 @@ impl ScanProgress {
                  请改变策略继续验证，或使用 NO_PATH 报告工具、授权或环境阻塞。"
                     .into(),
             );
+        }
+        if self.dvwa_objective {
+            let missing = DVWA_MODULES
+                .iter()
+                .filter(|(name, _)| !self.dvwa_covered.contains(*name))
+                .map(|(name, path)| format!("{name}({path})"))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Some(format!(
+                    "DVWA 覆盖不完整，仍有 {} 个模块没有成功执行针对性请求：{}。\
+                     请继续验证；扫描根路径或仅运行通用扫描器不能替代逐模块覆盖。",
+                    missing.len(),
+                    missing.join("、")
+                ));
+            }
         }
         // Evidence diversity gate: require observations from at least two
         // distinct tool categories before accepting a security FINAL. A
@@ -626,6 +693,21 @@ mod tests {
                 .unwrap()
                 .contains("尚未执行")
         );
+    }
+
+    #[test]
+    fn dvwa_final_requires_each_vulnerable_module() {
+        let mut progress = ScanProgress::new("对 DVWA http://dvwa 做完整渗透测试");
+        progress.record_tool_result("http_request", true, true, r#"{"status":200}"#);
+        progress.record_tool_arguments(
+            r#"{"url":"http://dvwa/vulnerabilities/sqli/?id=1"}"#,
+            true,
+        );
+        let rejection = progress
+            .final_rejection("FINAL: 阶段性完成", &["ev-1".into()])
+            .expect("incomplete DVWA coverage must be rejected");
+        assert!(rejection.contains("DVWA 覆盖不完整"));
+        assert!(rejection.contains("file-upload"));
     }
 
     #[test]

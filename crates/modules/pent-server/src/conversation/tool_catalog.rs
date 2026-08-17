@@ -21,7 +21,10 @@ async fn tool_fts_search(pool: &PgPool, query: &str, top_k: usize) -> Vec<(Strin
     if query.trim().is_empty() {
         return Vec::new();
     }
-    let result = sqlx::query_as::<_, (String, f64)>(
+    // PostgreSQL ts_rank returns REAL (float4), which maps to Rust f32.
+    // Decoding it as f64 makes every retrieval fail and silently expands the
+    // model catalog to all tools.
+    let result = sqlx::query_as::<_, (String, f32)>(
         "SELECT tool_id, ts_rank(
             to_tsvector('simple', coalesce(embedding_document, description)),
             plainto_tsquery('simple', $1)
@@ -41,7 +44,6 @@ async fn tool_fts_search(pool: &PgPool, query: &str, top_k: usize) -> Vec<(Strin
         Ok(rows) => rows
             .into_iter()
             .filter(|(_, rank)| *rank > 0.0)
-            .map(|(id, rank)| (id, rank as f32))
             .collect(),
         Err(error) => {
             tracing::warn!(%error, "FTS tool search failed; falling back to full catalog");

@@ -14,6 +14,7 @@ pg_dump "$database_url" \
   --no-owner \
   --no-privileges \
   --exclude-table-data='pent_agent_sessions' \
+  --exclude-table-data='pent_cloud_credentials' \
   --exclude-table-data='pent_agent_lessons' \
   --exclude-table-data='pent_artifacts' \
   --exclude-table-data='pent_context_snapshots' \
@@ -41,8 +42,12 @@ pg_dump "$database_url" \
   --exclude-table-data='pent_tool_feedback' \
   --exclude-table-data='pent_tool_route_decisions' \
   --exclude-table-data='pent_workers' \
+  --exclude-table-data='scan_assets' \
+  --exclude-table-data='scan_scanners' \
   --exclude-table-data='scan_tasks' \
   --exclude-table-data='scan_port_details' \
+  --exclude-table-data='scan_risks' \
+  --exclude-table-data='scan_risk_verifications' \
   --exclude-table-data='infra_api_access_log' \
   --exclude-table-data='infra_api_error_log' \
   --exclude-table-data='infra_job_log' \
@@ -105,6 +110,10 @@ in_copy {
 ' "$temporary" > "$sanitized"
 
 mv "$sanitized" "$temporary"
+
+# pg_dump currently appends a blank line after the final unrestrict marker.
+# Keep the tracked snapshot free of trailing blank-line churn.
+sed -i '${/^$/d;}' "$temporary"
 
 if rg -n -i \
   '((^|[^[:alnum:]])sk-[a-z0-9_-]{16,}|authorization:[[:space:]]*bearer[[:space:]]+[a-z0-9._-]{12,}|password=[^[:space:]]{8,})' \

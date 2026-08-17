@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use chrono::Utc;
 use kairos_platform_pent_api::{
@@ -20,8 +21,9 @@ use super::{
     ConversationEventSink, ConversationInstructionSink, ConversationIntentDetector,
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
     ConversationToolExecutor, FindingRecorder, InlineToolExecutor, ModelTurnOutput, PlanStore,
-    RoleResolver, RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall, RuntimeToolResult,
-    SkillStore, ToolApprovalGate, ToolExecutionContext,
+    ModelToolCall, RoleResolver, RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall,
+    RuntimeToolResult,
+    SkillStore, ToolApprovalGate, ToolExecutionClass, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopLimits, parse_agent_directive,
@@ -59,6 +61,8 @@ const AUTONOMOUS_LOOP_PROMPT: &str = r#"## 自主工具循环已启动
 - 策略失败需调整 → 输出 `REPLAN: <新策略>` 并在下一轮直接执行
 
 ## ⚠ 工具选择规则（严格遵守）
+在首次执行侦察、扫描或验证工具前，必须先调用 `skill_list` 查找与当前任务匹配的规程，
+再调用 `skill_load` 加载至少一个 Skill。不得跳过 Skill 直接开始操作。
 不要用 curl/http_request 手工做所有事！每个任务有专用工具：
 - 端口扫描 → nmap（不要 curl 逐个端口试）
 - 漏洞扫描 → nuclei / web_vuln_scan（不要 curl 手工测）
@@ -200,6 +204,10 @@ struct MainAgentRunHooks<'a> {
     evidence_ids: &'a mut Vec<String>,
     run_summary: &'a mut String,
     stall_terminal_prompted: &'a mut bool,
+    skill_loaded: &'a mut bool,
+    executed_call_signatures: &'a mut HashSet<String>,
+    web_session: &'a mut super::web_session::WebSessionState,
+    finding_projection: &'a mut super::finding_projection::FindingProjectionState,
 }
 
 #[async_trait::async_trait]
@@ -357,6 +365,10 @@ impl MainAgentRunHooks<'_> {
                 self.evidence_ids,
                 self.run_summary,
                 self.stall_terminal_prompted,
+                self.skill_loaded,
+                self.executed_call_signatures,
+                self.web_session,
+                self.finding_projection,
                 output,
                 directive,
             )
@@ -379,10 +391,53 @@ impl ConversationRuntime {
         evidence_ids: &mut Vec<String>,
         run_summary: &mut String,
         stall_terminal_prompted: &mut bool,
+        skill_loaded: &mut bool,
+        executed_call_signatures: &mut HashSet<String>,
+        web_session: &mut super::web_session::WebSessionState,
+        finding_projection: &mut super::finding_projection::FindingProjectionState,
         mut output: ModelTurnOutput,
         directive: Option<AgentDirective>,
     ) -> anyhow::Result<AgentRoundOutcome<ModelTurnOutput>> {
         if !output.tool_calls.is_empty() {
+            if let Some(rejection) = skill_gate_rejection(*skill_loaded, &output.tool_calls) {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_skill_gate:{round}"),
+                    role: "user".into(),
+                    content: rejection.into(),
+                    format: "text".into(),
+                });
+                return Ok(AgentRoundOutcome::Continue);
+            }
+            for call in &mut output.tool_calls {
+                if web_session.inject(call) {
+                    tracing::debug!(tool = %call.name, "injected run-local Web authentication state");
+                }
+            }
+            let duplicates = deduplicate_tool_calls(
+                &mut output.tool_calls,
+                executed_call_signatures,
+            );
+            if output.tool_calls.is_empty() {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_duplicate_gate:{round}"),
+                    role: "user".into(),
+                    content: "本轮工具调用与同轮或本 Run 已成功的只读调用完全重复，已跳过执行。\
+                              请复用已有 Evidence，改变目标路径、参数或验证方法。"
+                        .into(),
+                    format: "text".into(),
+                });
+                return Ok(AgentRoundOutcome::Continue);
+            }
+            if duplicates > 0 {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_duplicate_notice:{round}"),
+                    role: "user".into(),
+                    content: format!(
+                        "运行时已跳过 {duplicates} 个完全重复的工具调用；其余调用继续执行。"
+                    ),
+                    format: "text".into(),
+                });
+            }
             // Every tool path, including inline tools and agent_spawn, crosses
             // the same DesRed-compatible HITL fence before execution.
             let plan_required = orchestration
@@ -444,7 +499,7 @@ impl ConversationRuntime {
 
             // Persist the model's optional reasoning/plan together with
             // tool_calls so it remains part of the native tool transcript.
-            let assistant_tool_message = serde_json::json!({
+            let mut assistant_tool_message = serde_json::json!({
                 "content": if output.content.trim().is_empty() {
                     serde_json::Value::Null
                 } else {
@@ -452,6 +507,9 @@ impl ConversationRuntime {
                 },
                 "tool_calls": tool_calls_json
             });
+            if let Some(reasoning) = output.reasoning_summary.as_deref() {
+                assistant_tool_message["reasoning_content"] = reasoning.into();
+            }
             self.repository
                 .write_intermediate_message(
                     turn_id,
@@ -489,23 +547,6 @@ impl ConversationRuntime {
                                   XSS 检测、SQL 注入检测、目录爆破）批量发现漏洞，\
                                   用浏览器工具验证交互式漏洞，不要再逐一手工测试。"
                         .into(),
-                    format: "text".into(),
-                });
-            }
-
-            // ── Force summary when approaching turn limit ──────────
-            if round == 15 {
-                context.recent_messages.push(AgentMessage {
-                        message_id: "runtime_force_summary".into(), role: "user".into(),
-                        content: "已执行大量工具调用。请立即停止调用工具，用纯文本总结所有发现和漏洞。不要调用任何工具。".into(),
-                        format: "text".into(),
-                    });
-            }
-            if round > 15 {
-                context.recent_messages.push(AgentMessage {
-                    message_id: format!("runtime_stop_{round}"),
-                    role: "user".into(),
-                    content: "停止调用工具，输出最终报告。".into(),
                     format: "text".into(),
                 });
             }
@@ -589,6 +630,17 @@ impl ConversationRuntime {
                     )
                     .await?;
                 let succeeded = processed.succeeded;
+                web_session.observe(&item.arguments, &result.content);
+                scan_progress.record_tool_arguments(&item.arguments, succeeded);
+                if succeeded {
+                    executed_call_signatures.insert(tool_call_signature(
+                        &item.tool_name,
+                        &item.arguments,
+                    ));
+                }
+                if tool_name == "skill_load" && succeeded {
+                    *skill_loaded = true;
+                }
                 if plan_action
                     .as_ref()
                     .is_some_and(|(_, call_id)| call_id == &item.call_id)
@@ -630,6 +682,36 @@ impl ConversationRuntime {
                         .is_some_and(|(_, action_call_id)| action_call_id == call_id)
                     {
                         plan_action_evidence.push(eid.clone());
+                    }
+                    if succeeded
+                        && let Some(run_id) = context.run_id.as_deref()
+                    {
+                        for finding in finding_projection.observe(
+                            tool_name,
+                            &item.arguments,
+                            &result.content,
+                            eid,
+                        ) {
+                            match self
+                                .finding_recorder
+                                .record(run_id, &finding.to_string())
+                                .await
+                            {
+                                Ok(recorded) => tracing::info!(
+                                    run_id,
+                                    tool = %tool_name,
+                                    finding = %finding["title"],
+                                    duplicate = recorded["duplicate"].as_bool().unwrap_or(false),
+                                    "projected deterministic finding from evidence"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    run_id,
+                                    tool = %tool_name,
+                                    %error,
+                                    "failed to project deterministic finding"
+                                ),
+                            }
+                        }
                     }
                 }
                 append_run_summary(
@@ -1205,6 +1287,11 @@ impl ConversationRuntime {
         let mut evidence_ids = Vec::new();
         let mut run_summary = context.run_summary.clone();
         let mut stall_terminal_prompted = false;
+        let mut skill_loaded = false;
+        let mut executed_call_signatures = HashSet::new();
+        let mut web_session = super::web_session::WebSessionState::default();
+        let mut finding_projection =
+            super::finding_projection::FindingProjectionState::default();
 
         let user_input = context
             .recent_messages
@@ -1243,6 +1330,20 @@ impl ConversationRuntime {
             let history = self.repository.load_run_tool_history(run_id).await?;
             evidence_ids = history.evidence_ids;
             for historical in history.tool_calls {
+                web_session.observe(&historical.arguments.to_string(), "{}");
+                if historical.tool_name == "skill_load" && historical.success {
+                    skill_loaded = true;
+                }
+                if historical.success {
+                    executed_call_signatures.insert(tool_call_signature(
+                        &historical.tool_name,
+                        &historical.arguments.to_string(),
+                    ));
+                }
+                scan_progress.record_tool_arguments(
+                    &historical.arguments.to_string(),
+                    historical.success,
+                );
                 let effective_observation =
                     historical.success && !is_reference_tool(&historical.tool_name);
                 scan_progress.restore_tool_result(
@@ -1263,6 +1364,14 @@ impl ConversationRuntime {
             content: AUTONOMOUS_LOOP_PROMPT.to_string(),
             format: "text".into(),
         });
+        if let Some(instruction) = scan_progress.coverage_instruction() {
+            context.recent_messages.push(AgentMessage {
+                message_id: "runtime_coverage_gate".into(),
+                role: "user".into(),
+                content: instruction,
+                format: "text".into(),
+            });
+        }
 
         // ── RMOS: Memory + Knowledge + Attack Graph ──────────────────
         let mut pentest_memory = PentestMemory::new(&scan_goal);
@@ -1309,6 +1418,10 @@ impl ConversationRuntime {
             evidence_ids: &mut evidence_ids,
             run_summary: &mut run_summary,
             stall_terminal_prompted: &mut stall_terminal_prompted,
+            skill_loaded: &mut skill_loaded,
+            executed_call_signatures: &mut executed_call_signatures,
+            web_session: &mut web_session,
+            finding_projection: &mut finding_projection,
         };
         let run_result = match runner.run(&mut hooks).await {
             Ok(result) => result,
@@ -2209,7 +2322,63 @@ fn compact_runtime_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentDirective, compact_runtime_error, parse_agent_directive};
+    use super::{
+        AgentDirective, ModelToolCall, compact_runtime_error, deduplicate_tool_calls,
+        parse_agent_directive, skill_gate_rejection, tool_call_signature,
+    };
+    use std::collections::HashSet;
+    use kairos_platform_pent_api::ToolExecutionClass;
+
+    fn tool_call(name: &str) -> ModelToolCall {
+        ModelToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            arguments: "{}".into(),
+            execution_class: ToolExecutionClass::ReadOnly,
+        }
+    }
+
+    fn tool_call_with_arguments(name: &str, arguments: &str) -> ModelToolCall {
+        ModelToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            arguments: arguments.into(),
+            execution_class: ToolExecutionClass::ReadOnly,
+        }
+    }
+
+    #[test]
+    fn operational_tools_require_a_successfully_loaded_skill() {
+        assert!(skill_gate_rejection(false, &[tool_call("nmap_scan")]).is_some());
+        assert!(skill_gate_rejection(false, &[tool_call("skill_list")]).is_none());
+        assert!(skill_gate_rejection(false, &[tool_call("skill_load")]).is_none());
+        assert!(skill_gate_rejection(true, &[tool_call("nmap_scan")]).is_none());
+    }
+
+    #[test]
+    fn duplicate_calls_in_one_batch_are_removed() {
+        let call = tool_call_with_arguments("nuclei", r#"{"target":"http://dvwa"}"#);
+        let mut calls = vec![call.clone(), call];
+        assert_eq!(deduplicate_tool_calls(&mut calls, &HashSet::new()), 1);
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn prior_get_is_removed_but_mutating_post_can_repeat() {
+        let get = tool_call_with_arguments(
+            "http-framework-test",
+            r#"{"url":"http://dvwa/","method":"GET"}"#,
+        );
+        let post = tool_call_with_arguments(
+            "http-framework-test",
+            r#"{"url":"http://dvwa/weak_id/","method":"POST"}"#,
+        );
+        let executed = HashSet::from([tool_call_signature(&get.name, &get.arguments)]);
+        let mut calls = vec![get, post];
+        assert_eq!(deduplicate_tool_calls(&mut calls, &executed), 1);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].arguments.contains("POST"));
+    }
 
     #[test]
     fn runtime_error_is_compacted_before_returning_to_model() {
@@ -2299,6 +2468,92 @@ mod tests {
 
 fn is_skill_tool(tool_name: &str) -> bool {
     matches!(tool_name, "skill_list" | "skill_load")
+}
+
+fn deduplicate_tool_calls(
+    calls: &mut Vec<ModelToolCall>,
+    executed: &HashSet<String>,
+) -> usize {
+    let original_len = calls.len();
+    let mut batch = HashSet::new();
+    calls.retain(|call| {
+        let signature = tool_call_signature(&call.name, &call.arguments);
+        if !batch.insert(signature.clone()) {
+            return false;
+        }
+        !(deduplicate_across_rounds(call) && executed.contains(&signature))
+    });
+    original_len - calls.len()
+}
+
+fn deduplicate_across_rounds(call: &ModelToolCall) -> bool {
+    if call.name == "traffic_replay" || call.execution_class == ToolExecutionClass::Destructive {
+        return false;
+    }
+    if matches!(call.name.as_str(), "http_request" | "http-framework-test") {
+        let method = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|arguments| {
+                arguments
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_ascii_uppercase)
+            })
+            .unwrap_or_else(|| "GET".into());
+        return matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
+    }
+    true
+}
+
+fn tool_call_signature(tool_name: &str, arguments: &str) -> String {
+    let arguments = serde_json::from_str::<serde_json::Value>(arguments)
+        .map(canonical_json)
+        .unwrap_or_else(|_| serde_json::Value::String(arguments.trim().into()));
+    format!(
+        "{tool_name}:{:x}",
+        sha2::Sha256::digest(arguments.to_string().as_bytes())
+    )
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted = values
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::to_value(sorted).unwrap_or(serde_json::Value::Null)
+        }
+        value => value,
+    }
+}
+
+fn skill_gate_rejection(skill_loaded: bool, calls: &[ModelToolCall]) -> Option<&'static str> {
+    if skill_loaded {
+        return None;
+    }
+    let has_operational_call = calls.iter().any(|call| {
+        !matches!(
+            call.name.as_str(),
+            "skill_list"
+                | "skill_load"
+                | "knowledge_search"
+                | "plan_create"
+                | "plan_get"
+                | "plan_update"
+                | "agent_spawn"
+                | "agent_status"
+                | "agent_collect"
+                | "agent_list"
+        )
+    });
+    has_operational_call.then_some(
+        "执行门槛：本 Run 尚未成功加载 Skill。请先单独调用 skill_list 查找匹配规程，\
+         再单独调用 skill_load 加载至少一个 Skill；加载成功后才能执行侦察、扫描或验证工具。",
+    )
 }
 
 fn is_reference_tool(tool_name: &str) -> bool {

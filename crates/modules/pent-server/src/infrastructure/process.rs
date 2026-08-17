@@ -248,7 +248,8 @@ pub(crate) async fn execute_tool_json_direct(
     arguments: &serde_json::Value,
     limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
-    let prepared = prepare_tool_from_json(tool_name, arguments, &limits.network_access)?;
+    let mut prepared = prepare_tool_from_json(tool_name, arguments, &limits.network_access)?;
+    inject_run_id_header(&mut prepared, limits.run_id.as_deref());
     execute_prepared_tool(tool_name, &prepared, limits).await
 }
 
@@ -1086,7 +1087,7 @@ fn path_is_executable(path: &str) -> bool {
 
 /// Whether on-demand auto-install is allowed.
 /// Controlled by `PENTA_AUTO_INSTALL_TOOLS` (default: enabled).
-fn auto_install_enabled() -> bool {
+pub(crate) fn auto_install_enabled() -> bool {
     std::env::var("PENTA_AUTO_INSTALL_TOOLS")
         .map(|v| v != "false" && v != "0" && v != "no")
         .unwrap_or(true)
@@ -1139,6 +1140,27 @@ impl WorkerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_id_header_is_injected_for_curl_recipes_only() {
+        let mut curl = PreparedTool {
+            program: "/usr/bin/curl",
+            args: vec!["https://example.test".into()],
+        };
+        inject_run_id_header(&mut curl, Some("run-123"));
+        assert!(
+            curl.args
+                .windows(2)
+                .any(|pair| pair == ["--header", "x-kairos-run-id: run-123"])
+        );
+
+        let mut nmap = PreparedTool {
+            program: "/usr/bin/nmap",
+            args: vec!["example.test".into()],
+        };
+        inject_run_id_header(&mut nmap, Some("run-123"));
+        assert!(!nmap.args.iter().any(|arg| arg.contains("x-kairos-run-id")));
+    }
 
     #[tokio::test]
     async fn executes_allowlisted_tool_against_authorized_loopback() {

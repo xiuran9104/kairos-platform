@@ -17,6 +17,8 @@ AI 编码助手接手项目时应先阅读仓库根目录的 [AI 启动交接指
 
 ```bash
 cargo build --release -p kairos-platform-gateway
+cargo build --release -p kairos-platform-pent-agent
+cargo build --release -p kairos-scan-agent
 ```
 
 产物为 `target/release/kairos-platform-gateway`。生产服务至少需要：
@@ -41,6 +43,32 @@ cargo build --release -p kairos-platform-gateway
 6. 手动加载环境变量运行一次 `target/release/kairos-platform-gateway`，确认数据库验证成功和管理员可登录。
 7. 管理员创建后，从环境文件移除 `BOOTSTRAP_ADMIN_PASSWORD`。
 8. 使用 systemd、Docker 或 Kubernetes 托管网关进程。
+
+扫描节点由管理员先在“资产运营 → 扫描节点”创建；注册令牌只在创建响应中返回一次。把令牌交给目标网络内的 Scan Agent：
+
+```bash
+./target/release/kairos-scan-agent register \
+  --server https://kairos.example.com/api \
+  --token '<scanner-registration-token>' \
+  --name 'scanner-shanghai-01'
+```
+
+Scan Agent 会持续发送心跳、领取绑定到本节点的 pending 任务，并在执行期间续租。开启任务的服务识别、OS 识别或站点识别选项后，Agent 会在开放端口上执行有大小与超时限制的 Banner/HTTP 探测，并使用协议签名识别 SSH、FTP、SMTP、MySQL 和 Redis；PostgreSQL 探测仅发送不登录的 SSLRequest。HTTPS 结果会保存叶证书 SHA-256、有效期、主题、签发者、自签发状态和最多 8 个 SAN，不上传完整证书。HTTP 重定向不会自动跟随，以免越出任务授权目标。可用 `SCAN_AGENT_POLL_SECONDS` 调整空闲轮询间隔（默认 5 秒）。单个任务展开后最多允许 4096 个目标。
+
+Gateway 会根据 Agent 回传的明确证据生成低侵入风险，例如 Redis 未认证 PING、明文 FTP 和证书不在有效期内。风险以目标、端口和规则键去重；复扫会更新 `last_seen`，证据消失后自动转为 `resolved`。人工设置的 `ignored` 或 `false_positive` 不会被后续扫描覆盖。开放端口本身不计为风险。
+
+Gateway 也会加载 `scan_vulnerability_rules` 中启用的精确产品/版本规则。可通过 `/asset-ops/vulnerability-rules` 查询规则，并通过 `/asset-ops/vulnerability-rules/{id}` 创建、更新或软删除。版本命中只代表筛查线索，默认状态为 `pending_review`，必须结合软件来源、包哈希或主动验证确认；不要把单纯版本命中直接改成已验证漏洞。初始化规则 `CVE-2011-2523 / vsftpd 2.3.4` 特别要求核验是否来自受影响日期窗口内的被篡改发行包。
+
+规则也支持 inclusive/exclusive 版本边界和 CPE 2.3 产品标识。主动验证通过 `/pent/scan-risks/{risk_id}/verifications` 提交授权声明，再调用批准和执行接口；目标主机与端口必须等于风险记录，实际 Nuclei 进程只在 Pent Agent 上运行。无结构化命中时风险保持 `pending_review`。
+
+`masscan`、`ssh_exec`、`sql_query` 不由标准 Pent Agent 消费。需要单独部署高权限节点，并在其环境中设置：
+
+```bash
+export PENTA_WORKER_PROFILE=privileged
+cargo run -p kairos-platform-pent-agent
+```
+
+该节点应使用独立系统账号和网络边界。不要在普通 worker 上设置此变量；任意脚本执行与 Metasploit 仍保持未开放。
 
 systemd 示例：
 

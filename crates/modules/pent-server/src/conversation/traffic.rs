@@ -99,8 +99,63 @@ pub fn drafts_from_tool_result(
                     .collect()
             })
             .unwrap_or_default(),
+        "http-framework-test" => {
+            let Some(url) = arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+            else {
+                return Vec::new();
+            };
+            let raw = result
+                .get("stdout")
+                .or_else(|| result.get("raw_response"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if raw.is_empty() {
+                return Vec::new();
+            }
+            let (response_headers, response_body) = parse_raw_response(raw);
+            let mut request_headers = serde_json::Map::new();
+            if let Some(header) = arguments.get("headers").and_then(Value::as_str) {
+                if let Some((name, value)) = header.split_once(':') {
+                    request_headers.insert(name.trim().to_ascii_lowercase(), json!(value.trim()));
+                }
+            }
+            if let Some(cookies) = arguments.get("cookies").and_then(Value::as_str) {
+                request_headers.insert("cookie".into(), json!(cookies));
+            }
+            vec![TrafficDraft {
+                method: arguments
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("GET")
+                    .to_ascii_uppercase(),
+                url: url.to_string(),
+                request_headers: Value::Object(request_headers),
+                request_body: arguments
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .filter(|body| !body.is_empty())
+                    .map(str::to_owned),
+                response_status: response_status(raw),
+                response_headers,
+                response_body,
+                duration_ms: result
+                    .get("duration_ms")
+                    .or_else(|| result.get("elapsed_ms"))
+                    .and_then(Value::as_i64),
+            }]
+        }
         _ => Vec::new(),
     }
+}
+
+fn response_status(raw: &str) -> Option<i32> {
+    raw.lines()
+        .filter(|line| line.trim_start().starts_with("HTTP/"))
+        .filter_map(|line| line.split_whitespace().nth(1)?.parse::<i32>().ok())
+        .last()
 }
 
 /// Parse `curl -i` style output: one or more `HTTP/...` header blocks
@@ -252,6 +307,27 @@ mod tests {
         assert_eq!(drafts.len(), 2);
         assert_eq!(drafts[0].response_body.as_deref(), Some("root"));
         assert_eq!(drafts[1].response_status, None);
+    }
+
+    #[test]
+    fn drafts_structured_framework_request_with_cookie() {
+        let content = json!({
+            "stdout": "HTTP/1.1 302 Found\r\nLocation: /index.php\r\n\r\n"
+        })
+        .to_string();
+        let args = json!({
+            "url": "http://dvwa/login.php",
+            "method": "POST",
+            "data": "username=admin",
+            "headers": "Content-Type: application/x-www-form-urlencoded",
+            "cookies": "PHPSESSID=abc; security=low"
+        });
+        let drafts = drafts_from_tool_result("http-framework-test", &args, &content);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].response_status, Some(302));
+        assert_eq!(drafts[0].request_headers["cookie"], "PHPSESSID=abc; security=low");
+        assert_eq!(drafts[0].request_headers["content-type"], "application/x-www-form-urlencoded");
+        assert_eq!(drafts[0].request_body.as_deref(), Some("username=admin"));
     }
 
     #[test]

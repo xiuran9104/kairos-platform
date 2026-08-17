@@ -180,7 +180,18 @@ impl NatsHandle {
             .ok_or_else(|| "pent-agent 执行通道不可用（NATS 未连接）".to_string())?;
         let payload = serde_json::to_vec(request)
             .map_err(|error| format!("工具执行请求序列化失败: {error}"))?;
-        self.probe_tool_worker().await?;
+        let privileged = requires_privileged_worker(&request.tool_name);
+        let execute_subject = if privileged {
+            subjects::PRIVILEGED_TOOL_EXECUTE
+        } else {
+            subjects::CONVERSATION_TOOL_EXECUTE
+        };
+        let ping_subject = if privileged {
+            subjects::PRIVILEGED_TOOL_WORKER_PING
+        } else {
+            subjects::TOOL_WORKER_PING
+        };
+        self.probe_tool_worker(ping_subject).await?;
         let inbox = client.new_inbox();
         let mut replies = client
             .subscribe(inbox.clone())
@@ -192,7 +203,7 @@ impl NatsHandle {
             .map_err(|error| format!("工具执行心跳订阅失败: {error}"))?;
         client
             .publish_with_reply(
-                subjects::CONVERSATION_TOOL_EXECUTE.to_string(),
+                execute_subject.to_string(),
                 inbox,
                 payload.into(),
             )
@@ -236,7 +247,7 @@ impl NatsHandle {
             .map_err(|error| format!("工具执行响应解析失败: {error}"))
     }
 
-    async fn probe_tool_worker(&self) -> Result<(), String> {
+    async fn probe_tool_worker(&self, ping_subject: &str) -> Result<(), String> {
         let client = self
             .client
             .clone()
@@ -248,7 +259,7 @@ impl NatsHandle {
             .map_err(|error| format!("pent-agent 探测订阅失败: {error}"))?;
         client
             .publish_with_reply(
-                subjects::TOOL_WORKER_PING.to_string(),
+                ping_subject.to_string(),
                 inbox,
                 Vec::new().into(),
             )
@@ -263,6 +274,12 @@ impl NatsHandle {
         .ok_or_else(|| "pent-agent 探测响应通道已关闭".to_string())?;
         Ok(())
     }
+}
+
+/// Tools in this deliberately small allowlist are dispatched only to a worker
+/// explicitly started with `PENTA_WORKER_PROFILE=privileged`.
+pub fn requires_privileged_worker(tool_name: &str) -> bool {
+    matches!(tool_name, "masscan" | "ssh_exec" | "sql_query")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +327,10 @@ pub struct RemoteToolExecutionRequest {
     pub scope_snapshot: serde_json::Value,
     pub session_id: String,
     pub run_id: Option<String>,
+    /// Correlation identifier injected into proxy-aware HTTP clients without
+    /// implying that this execution belongs to a `pent_runs` row.
+    #[serde(default)]
+    pub traffic_run_id: Option<String>,
     pub timeout_seconds: u64,
 }
 
@@ -352,17 +373,36 @@ pub async fn spawn_conversation_tool_responder(
     let Some(client) = bus.client.clone() else {
         return Err("NATS 未连接，无法启动对话工具执行器".into());
     };
+    let privileged_profile = std::env::var("PENTA_WORKER_PROFILE")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("privileged"));
+    let (execute_subject, ping_subject, queue_group) = if privileged_profile {
+        (
+            subjects::PRIVILEGED_TOOL_EXECUTE,
+            subjects::PRIVILEGED_TOOL_WORKER_PING,
+            "penta-privileged-tool-workers",
+        )
+    } else {
+        (
+            subjects::CONVERSATION_TOOL_EXECUTE,
+            subjects::TOOL_WORKER_PING,
+            "penta-tool-workers",
+        )
+    };
+    tracing::info!(
+        worker_profile = if privileged_profile { "privileged" } else { "standard" },
+        "pent-agent 工具执行 worker profile 已启用"
+    );
     let mut requests = client
         .queue_subscribe(
-            subjects::CONVERSATION_TOOL_EXECUTE.to_string(),
-            "penta-tool-workers".to_string(),
+            execute_subject.to_string(),
+            queue_group.to_string(),
         )
         .await
         .map_err(|error| format!("订阅对话工具执行队列失败: {error}"))?;
     let mut probes = client
         .queue_subscribe(
-            subjects::TOOL_WORKER_PING.to_string(),
-            "penta-tool-workers".to_string(),
+            ping_subject.to_string(),
+            queue_group.to_string(),
         )
         .await
         .map_err(|error| format!("订阅对话工具探测队列失败: {error}"))?;
@@ -665,7 +705,7 @@ async fn execute_remote_tool_request(
             tokio::time::sleep(Duration::from_secs(EXECUTION_HEARTBEAT_INTERVAL_SECS)).await;
         }
     }));
-    let Some(recipe) = crate::infrastructure::recipe::lookup(&request.tool_name) else {
+    let Some((target_type, profile)) = remote_tool_policy(&request.tool_name) else {
         return RemoteToolExecutionResponse {
             output: None,
             error: Some(format!(
@@ -674,7 +714,15 @@ async fn execute_remote_tool_request(
             )),
         };
     };
-    if recipe.target_type == crate::infrastructure::recipe::TargetType::Network
+    let privileged_profile = std::env::var("PENTA_WORKER_PROFILE")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("privileged"));
+    if requires_privileged_worker(&request.tool_name) != privileged_profile {
+        return RemoteToolExecutionResponse {
+            output: None,
+            error: Some("工具与 pent-agent worker profile 不匹配，拒绝执行".into()),
+        };
+    }
+    if target_type == crate::infrastructure::recipe::TargetType::Network
         && request.scope_snapshot.get("confirmed_at").is_none()
         && request
             .scope_snapshot
@@ -687,15 +735,17 @@ async fn execute_remote_tool_request(
             error: Some("目标范围尚未人工确认，pent-agent 拒绝执行网络工具".into()),
         };
     }
-    let profile = recipe.resource_profile;
     let mut arguments = request.arguments;
     let expected_provider = arguments
         .get("provider")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
-    let credential_required = recipe.parameters.iter().any(|parameter| {
-        parameter.runtime_only && parameter.required && parameter.name == "_credential_ref"
-    });
+    let credential_required = crate::infrastructure::recipe::lookup(&request.tool_name)
+        .is_some_and(|recipe| {
+            recipe.parameters.iter().any(|parameter| {
+                parameter.runtime_only && parameter.required && parameter.name == "_credential_ref"
+            })
+        });
     let credential_ref = arguments
         .as_object_mut()
         .and_then(|object| object.remove("_credential_ref"))
@@ -746,7 +796,7 @@ async fn execute_remote_tool_request(
         memory_mb: profile.memory_mb.clamp(32, 32_768),
         timeout_seconds: profile.timeout_seconds.clamp(1, 3_600),
         network_access: NetworkPolicy::derive_from_scope(&request.scope_snapshot),
-        run_id: request.run_id,
+        run_id: request.traffic_run_id.or(request.run_id),
         secret_environment,
         ..Default::default()
     };
@@ -875,6 +925,26 @@ async fn execute_remote_tool_request(
             }
         }
     }
+}
+
+fn remote_tool_policy(
+    tool_name: &str,
+) -> Option<(
+    crate::infrastructure::recipe::TargetType,
+    crate::infrastructure::recipe::RecipeResourceProfile,
+)> {
+    if tool_name == "http_request" {
+        return Some((
+            crate::infrastructure::recipe::TargetType::Network,
+            crate::infrastructure::recipe::RecipeResourceProfile {
+                cpu_cores: 0.1,
+                memory_mb: 32,
+                timeout_seconds: 30,
+            },
+        ));
+    }
+    crate::infrastructure::recipe::lookup(tool_name)
+        .map(|recipe| (recipe.target_type, recipe.resource_profile))
 }
 
 async fn persist_remote_tool_call(
@@ -1161,6 +1231,8 @@ pub mod subjects {
     /// workers subscribe to this subject.
     pub const CONVERSATION_TOOL_EXECUTE: &str = "penta.tool.execute";
     pub const TOOL_WORKER_PING: &str = "penta.tool.worker.ping";
+    pub const PRIVILEGED_TOOL_EXECUTE: &str = "penta.tool.privileged.execute";
+    pub const PRIVILEGED_TOOL_WORKER_PING: &str = "penta.tool.privileged.worker.ping";
     pub const TERMINAL_CREATE: &str = "penta.terminal.create";
 
     pub fn tool_cancel(execution_id: &str) -> String {
@@ -1214,6 +1286,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn privileged_tools_use_a_dedicated_worker_profile() {
+        for tool in ["masscan", "ssh_exec", "sql_query"] {
+            assert!(requires_privileged_worker(tool));
+        }
+        assert!(!requires_privileged_worker("nuclei"));
+        assert!(!requires_privileged_worker("nmap"));
+    }
+
+    #[test]
+    fn builtin_http_request_has_remote_execution_policy() {
+        let (target_type, profile) = remote_tool_policy("http_request").expect("builtin policy");
+        assert_eq!(target_type, crate::infrastructure::recipe::TargetType::Network);
+        assert_eq!(profile.timeout_seconds, 30);
+    }
+
+    #[test]
     fn remote_request_round_trips() {
         let request = RemoteToolExecutionRequest {
             execution_id: "execution-1".into(),
@@ -1222,6 +1310,7 @@ mod tests {
             scope_snapshot: serde_json::json!({"targets": ["example.test"]}),
             session_id: "session-1".into(),
             run_id: Some("run-1".into()),
+            traffic_run_id: None,
             timeout_seconds: 300,
         };
         let encoded = serde_json::to_vec(&request).unwrap();
@@ -1346,6 +1435,7 @@ mod tests {
             scope_snapshot: serde_json::json!({"targets": ["example.test"]}),
             session_id: "session-1".into(),
             run_id: None,
+            traffic_run_id: None,
             timeout_seconds: 300,
         };
         let error = bus.request_tool_execution(&request).await.unwrap_err();

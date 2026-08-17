@@ -873,6 +873,12 @@ recipes:
     target: true
     flag: -u
     format: flag
+  - name: cookies
+    type: string
+    description: Cookie 字符串（认证状态由 Run 自动注入）
+    required: false
+    flag: --cookie
+    format: flag
 - tool_id: web_tls_scan
   version: 1.0.0
   manifest_version: 1
@@ -969,6 +975,12 @@ recipes:
     target: true
     flag: -u
     format: flag
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
+    format: flag
 - tool_id: web_wordpress_scan
   version: 1.0.0
   manifest_version: 1
@@ -1064,6 +1076,12 @@ recipes:
     target: true
     position: 1
     format: positional
+  - name: cookies
+    type: string
+    description: Cookie 字符串（认证状态由 Run 自动注入）
+    required: false
+    flag: --cookie
+    format: flag
 - tool_id: amass
   version: 1.0.0
   manifest_version: 1
@@ -1521,6 +1539,12 @@ recipes:
     target: true
     format: template
     template: -u {value}/FUZZ
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
+    format: flag
   executor:
     type: host
     program: /usr/local/bin/ffuf
@@ -1608,6 +1632,12 @@ recipes:
     required: true
     target: true
     flag: -u
+    format: flag
+  - name: cookies
+    type: string
+    description: Cookie 字符串（认证状态由 Run 自动注入）
+    required: false
+    flag: -c
     format: flag
 - tool_id: hakrawler
   version: 1.0.0
@@ -1733,7 +1763,7 @@ recipes:
   - fast
   source: builtin
   risk_level: medium
-  approval_policy: conditional
+  approval_policy: always
   supported_target_types:
   - ipv4
   - cidr
@@ -2127,6 +2157,12 @@ recipes:
     required: true
     target: true
     flag: -u
+    format: flag
+  - name: cookies
+    type: string
+    description: Cookie 字符串（认证状态由 Run 自动注入）
+    required: false
+    flag: --cookie
     format: flag
 - tool_id: sslscan
   version: 1.0.0
@@ -2834,6 +2870,12 @@ recipes:
     target: true
     position: 1
     format: positional
+  - name: cookies
+    type: string
+    description: Cookie 字符串（认证状态由 Run 自动注入）
+    required: false
+    flag: --cookie
+    format: flag
 - tool_id: nuclei
   version: 1.0.0
   manifest_version: 1
@@ -2874,6 +2916,12 @@ recipes:
     required: true
     target: true
     flag: -u
+    format: flag
+  - name: header
+    type: string
+    description: 自定义请求 Header（认证状态由 Run 自动注入）
+    required: false
+    flag: -H
     format: flag
 - tool_id: testssl
   version: 1.0.0
@@ -3039,7 +3087,7 @@ recipes:
   - psql
   source: builtin
   risk_level: medium
-  approval_policy: conditional
+  approval_policy: always
   supported_target_types:
   - hostname
   - ipv4

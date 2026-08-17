@@ -350,9 +350,15 @@ pub(crate) async fn list_published_skills(
          FROM pent_skills
          WHERE status='published'
            AND ($1::text IS NULL OR category=$1)
-           AND ($2::text IS NULL OR name ILIKE '%'||$2||'%' OR title ILIKE '%'||$2||'%'
-                OR description ILIKE '%'||$2||'%')
-         ORDER BY category, name
+           AND ($2::text IS NULL OR EXISTS (
+               SELECT 1
+               FROM unnest(regexp_split_to_array(trim($2), '\\s+')) AS term
+               WHERE length(term) >= 2
+                 AND concat_ws(' ', name, title, category, description)
+                     ILIKE '%' || term || '%'
+           ))
+         ORDER BY CASE WHEN id LIKE 'skill-seed-%' THEN 0 ELSE 1 END,
+                  category, name
          LIMIT $3",
     )
     .bind(category)

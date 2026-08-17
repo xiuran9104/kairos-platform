@@ -125,6 +125,18 @@ pub async fn authorize_request(request: Request, next: Next) -> Result<Response,
 }
 
 fn required_permission(method: &str, path: &str) -> &'static str {
+    if path.starts_with("/pent/scan-risk-verifications")
+        || path.starts_with("/pent/scan-risks/")
+    {
+        if path.ends_with("/approve") || path.ends_with("/reject") {
+            return permission_codes::APPROVAL_DECIDE;
+        }
+        return if method == "GET" {
+            permission_codes::RUN_READ
+        } else {
+            permission_codes::RUN_EXECUTE
+        };
+    }
     if path.starts_with("/pent/agent/settings") {
         return if method == "GET" { permission_codes::SETTINGS_READ } else { permission_codes::SETTINGS_MANAGE };
     }
@@ -294,6 +306,10 @@ mod tests {
         assert_eq!(
             required_permission("PUT", "/pent/tools/nmap/versions/1"),
             permission_codes::TOOL_MANAGE
+        );
+        assert_eq!(
+            required_permission("POST", "/pent/scan-risk-verifications/id/approve"),
+            permission_codes::APPROVAL_DECIDE
         );
     }
 }

@@ -14,6 +14,7 @@ mod mcp_servers;
 mod monitor;
 mod runtime_policy;
 mod roles;
+mod scan_verification;
 mod terminal;
 mod security;
 mod session;
@@ -99,6 +100,7 @@ pub fn routes(state: PentState) -> Router {
         .route("/pent/metrics", get(metrics))
         .route("/pent/tools/overview", get(tools_overview))
         .route("/pent/traffic", get(traffic_list))
+        .merge(scan_verification::routes())
         .route("/pent/rmos/memories", get(rmos_memories))
         .route("/pent/rmos/memories/{id}/feedback", post(rmos_feedback))
         .route("/pent/rmos/global-search", get(rmos_global_search))
@@ -1061,6 +1063,11 @@ async fn get_tool_call_result(
 
 async fn ensure_host_tools() {
     use crate::infrastructure::tool_lifecycle;
+
+    if !crate::infrastructure::process::auto_install_enabled() {
+        tracing::info!("host tool startup auto-install disabled");
+        return;
+    }
 
     let tools = tool_lifecycle::all_host_tools();
     let mut healthy = 0usize;

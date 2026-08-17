@@ -553,6 +553,7 @@ mod tests {
             &scope,
             "test-session",
             None,
+            None,
         )
         .await;
         assert!(js.success, "{}", js.content);
@@ -575,6 +576,7 @@ mod tests {
             &json!({"url": format!("{base_url}/")}).to_string(),
             &scope,
             "test-session",
+            None,
             None,
         )
         .await;
@@ -599,6 +601,7 @@ mod tests {
             .to_string(),
             &scope,
             "test-session",
+            None,
             None,
         )
         .await;

@@ -170,6 +170,61 @@ pub struct RegisterScannerAgentRequest {
 pub struct ScannerHeartbeatRequest {
     pub node_id: String,
     pub token: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub claim_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannerTaskClaimRequest {
+    pub node_id: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannerTaskClaim {
+    pub task: ScanTask,
+    pub claim_token: String,
+    pub lease_seconds: u64,
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannerPortResult {
+    pub port: u16,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannerTargetResult {
+    pub target: String,
+    #[serde(default)]
+    pub open_ports: Vec<u16>,
+    #[serde(default)]
+    pub ports: Vec<ScannerPortResult>,
+    #[serde(default)]
+    pub os_hint: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScannerTaskCompleteRequest {
+    pub node_id: String,
+    pub token: String,
+    pub task_id: String,
+    pub claim_token: String,
+    #[serde(default)]
+    pub results: Vec<ScannerTargetResult>,
+    pub error_message: Option<String>,
 }
 
 // ── Risk ──────────────────────────────────────────────────────────────────
@@ -193,6 +248,8 @@ pub enum RiskStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Risk {
     pub id: String,
+    #[serde(default)]
+    pub rule_id: Option<String>,
     pub asset_ip: String,
     pub port: u16,
     pub severity: String,
@@ -202,6 +259,80 @@ pub struct Risk {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub assigned_to: Option<String>,
+    #[serde(default)]
+    pub evidence: serde_json::Value,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub first_seen: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+// ── Vulnerability rule catalog ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VulnerabilityRule {
+    pub id: String,
+    pub cve_id: String,
+    pub product: String,
+    pub match_type: String,
+    pub exact_version: Option<String>,
+    pub cpe_uri: Option<String>,
+    pub version_start_including: Option<String>,
+    pub version_start_excluding: Option<String>,
+    pub version_end_including: Option<String>,
+    pub version_end_excluding: Option<String>,
+    pub severity: String,
+    pub title: String,
+    pub description: String,
+    pub solution: String,
+    pub reference_url: String,
+    pub default_status: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertVulnerabilityRuleRequest {
+    pub cve_id: String,
+    pub product: String,
+    #[serde(default = "default_exact_match_type")]
+    pub match_type: String,
+    #[serde(default)]
+    pub exact_version: Option<String>,
+    #[serde(default)]
+    pub cpe_uri: Option<String>,
+    #[serde(default)]
+    pub version_start_including: Option<String>,
+    #[serde(default)]
+    pub version_start_excluding: Option<String>,
+    #[serde(default)]
+    pub version_end_including: Option<String>,
+    #[serde(default)]
+    pub version_end_excluding: Option<String>,
+    pub severity: String,
+    pub title: String,
+    pub description: String,
+    pub solution: String,
+    pub reference_url: String,
+    #[serde(default = "default_pending_review_status")]
+    pub default_status: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_exact_match_type() -> String {
+    "exact".to_string()
+}
+
+fn default_pending_review_status() -> String {
+    "pending_review".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ── Quick scan result ─────────────────────────────────────────────────────

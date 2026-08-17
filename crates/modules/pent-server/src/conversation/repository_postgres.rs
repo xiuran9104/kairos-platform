@@ -154,13 +154,31 @@ impl ConversationRepository for PgConversationRepository {
         .await?
         .ok_or_else(|| anyhow::anyhow!("Pent 会话不存在"))?;
         if let Some(run_id) = session.7 {
-            sqlx::query("UPDATE pent_conversation_turns SET run_id=$2 WHERE id=$1")
-                .bind(turn_id)
-                .bind(&run_id)
+            let reusable: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pent_runs WHERE id=$1 AND status IN ('queued','running'))",
+            )
+            .bind(&run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if reusable {
+                sqlx::query("UPDATE pent_conversation_turns SET run_id=$2 WHERE id=$1")
+                    .bind(turn_id)
+                    .bind(&run_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "UPDATE pent_agent_sessions SET status='running',updated_at=now() WHERE id=$1",
+                )
+                .bind(session_id)
                 .execute(&mut *tx)
                 .await?;
-            tx.commit().await?;
-            return Ok(Some(run_id));
+                tx.commit().await?;
+                return Ok(Some(run_id));
+            }
+            sqlx::query("UPDATE pent_agent_sessions SET active_run_id=NULL WHERE id=$1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
         }
         let task_id = uuid::Uuid::new_v4().to_string();
         let run_id = uuid::Uuid::new_v4().to_string();
@@ -168,12 +186,13 @@ impl ConversationRepository for PgConversationRepository {
         sqlx::query(
             "INSERT INTO pent_tasks(
                  id,tenant_id,project_id,name,description,target_scope,status,created_by
-             ) VALUES($1,$2,$3,$4,$4,$5,'running',$6)",
+             ) VALUES($1,$2,$3,$4,$5,$6,'running',$7)",
         )
         .bind(&task_id)
         .bind(session.0)
         .bind(&session.1)
         .bind(&task_name)
+        .bind(&session.2)
         .bind(&session.3)
         .bind(&session.6)
         .execute(&mut *tx)
@@ -311,23 +330,37 @@ impl ConversationRepository for PgConversationRepository {
         .bind(retryable)
         .execute(&mut *tx)
         .await?;
-        // Reset session to ready, clear active_run_id, and close stale runs
-        sqlx::query(
-            "WITH s AS (
-                SELECT s2.id AS session_id, s2.active_run_id
-                FROM pent_conversation_turns t
-                JOIN pent_agent_sessions s2 ON s2.id = t.session_id
-                WHERE t.id = $1
-             ), closed AS (
-                UPDATE pent_runs SET status='completed', completed_at=now()
-                FROM s WHERE pent_runs.id = s.active_run_id AND pent_runs.status='running'
-             )
-             UPDATE pent_agent_sessions SET status='ready', active_run_id=NULL, updated_at=now()
-             FROM s WHERE pent_agent_sessions.id = s.session_id AND pent_agent_sessions.status='running'",
-        )
-        .bind(turn_id)
-        .execute(&mut *tx)
-        .await?;
+        if retryable {
+            sqlx::query(
+                "UPDATE pent_agent_sessions s SET status='ready',updated_at=now()
+                 FROM pent_conversation_turns t
+                 WHERE t.id=$1 AND s.id=t.session_id",
+            )
+            .bind(turn_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "WITH s AS (
+                    SELECT s2.id AS session_id, s2.active_run_id
+                    FROM pent_conversation_turns t
+                    JOIN pent_agent_sessions s2 ON s2.id=t.session_id
+                    WHERE t.id=$1
+                 ), failed AS (
+                    UPDATE pent_runs SET status='failed',completed_at=now(),
+                        failure_code=$2,failure_message=$3
+                    FROM s WHERE pent_runs.id=s.active_run_id
+                      AND pent_runs.status IN ('queued','running')
+                 )
+                 UPDATE pent_agent_sessions SET status='ready',active_run_id=NULL,updated_at=now()
+                 FROM s WHERE pent_agent_sessions.id=s.session_id",
+            )
+            .bind(turn_id)
+            .bind(code)
+            .bind(message)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1623,9 +1656,26 @@ fn task_display_name(objective: &str, scope: &serde_json::Value) -> String {
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if !first_target.is_empty() && objective != first_target {
+    let display = if !first_target.is_empty() && objective != first_target {
         format!("{objective} → {first_target}")
     } else {
         objective.to_string()
+    };
+    display.chars().take(200).collect()
+}
+
+#[cfg(test)]
+mod task_name_tests {
+    use super::task_display_name;
+
+    #[test]
+    fn long_multibyte_objective_fits_task_name_column() {
+        let objective = "完整渗透测试".repeat(80);
+        let name = task_display_name(
+            &objective,
+            &serde_json::json!({"targets": ["http://127.0.0.1:18080"]}),
+        );
+        assert_eq!(name.chars().count(), 200);
+        assert!(name.is_char_boundary(name.len()));
     }
 }

@@ -21,6 +21,8 @@
 
 `exec`、`execute-python-script`、`install-python-package`、Metasploit、MSFVenom、C2 和 WebShell 不作为普通 recipe 开放。这些能力必须进入专用执行器和高权限 worker，默认禁用，并要求显式授权范围、人工审批、超时/取消和完整证据记录。
 
+当前受控高权限子集为 `masscan`、`ssh_exec`、`sql_query`。三者的 recipe 均为 `approval_policy: always`，Gateway 只向高权限 NATS subject 投递，且 Pent Agent 仅在显式设置 `PENTA_WORKER_PROFILE=privileged` 时订阅该 subject；标准与高权限 worker 都会在执行入口复核 profile。
+
 ## 剩余 26 个同名缺口
 
 `angr`、`clair`、`cloudmapper`、`dnslog`、`exec`、`execute-python-script`、`falco`、`fscan`、`ghidra`、`icp-scan`、`install-python-package`、`libc-database`、`lightx`、`linpeas`、`metasploit`、`msfvenom`、`pacu`、`pwntools`、`quake-tool`、`query-execution-result`、`responder`、`sg-code-search`、`supply-chain-collect`、`virustotal_search`、`xiaolanben-search`、`zap`。
@@ -61,8 +63,8 @@ cargo test -q \
 
 结果为 307 passed、0 failed、0 ignored。该数字包含能力探测后的跳过：当前宿主没有可用的 Bubblewrap，且沙箱禁止创建本地监听器；未配置 `TEST_DATABASE_URL` 和 `MINIO_ENDPOINT`，所以 PostgreSQL、MinIO 和真实工具链路尚未在本机执行。部署验收必须在安装 Bubblewrap、允许本地网络并配置外部依赖的 Worker 主机上再次运行。
 
-## 尚未完成的发布步骤
+## 数据库发布状态
 
-- `sql/postgresql/0002_pent_cloud_credentials.sql` 与 `0003_mitm_body_objects.sql` 仍是临时升级文件。
-- 当前环境没有 Docker 和维护中的参考数据库，因此尚未把两项变更应用到参考库、重新导出 `sql/postgresql/0001_initial.sql` 或执行 `script/test-database-migrations.sh`。
-- 在完成上述数据库流程前，新增凭据表和 MITM 对象键字段不能视为已进入新部署的正式初始化快照。
+- 云凭据表、MITM Body 对象键字段已经应用到隔离的 PostgreSQL 18 参考库，并重新导出到 `sql/postgresql/0001_initial.sql`。
+- 临时 `0002_pent_cloud_credentials.sql` 与 `0003_mitm_body_objects.sql` 已在合并后删除。
+- `script/test-database-migrations.sh` 已验证当前快照可以初始化空数据库；bootstrap 断言覆盖云凭据约束和 MITM 新字段。

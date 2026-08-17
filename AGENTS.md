@@ -158,7 +158,25 @@ Build the backend:
 ```bash
 cargo build --release -p kairos-platform-gateway
 cargo build --release -p kairos-platform-pent-agent
+cargo build --release -p kairos-scan-agent
 ```
+
+Scan Agent 不直接连接数据库。管理员在“资产运营 → 扫描节点”创建节点并取得一次性展示的注册令牌后，在目标网络内启动：
+
+```bash
+./target/release/kairos-scan-agent register \
+  --server https://kairos.example.com/api \
+  --token '<scanner-registration-token>' \
+  --name 'scanner-node-01'
+```
+
+任务开启服务识别、OS 识别或站点识别时，Agent 会执行受超时和响应大小限制的 Banner/HTTP 探测与只读协议识别（包括 Redis PING 和 PostgreSQL SSLRequest，不执行登录）。HTTPS 仅回传受限的叶证书元数据与 SHA-256，不回传完整证书；HTTP 重定向默认不跟随，避免扫描越出任务授权目标。
+
+节点通过 Gateway 心跳续租、领取绑定任务并回传结果；Gateway 本身不执行扫描。
+
+Gateway 只依据结构化扫描证据生成自动风险，并以目标、端口和规则键去重。复扫不得把普通开放端口计作风险，也不得覆盖人工设置的 `ignored` / `false_positive` 状态；证据消失时保留历史记录并转为 `resolved`。
+
+数据库表 `scan_vulnerability_rules` 保存可维护的精确产品/版本筛查规则。只有产品与版本证据同时命中时才能生成目录风险，且版本命中默认进入 `pending_review`；版本号本身不得当作漏洞已确认的证据。规则管理 API 位于 `/asset-ops/vulnerability-rules` 和 `/asset-ops/vulnerability-rules/{id}`。
 
 Run once manually to verify the imported database and initial admin creation:
 

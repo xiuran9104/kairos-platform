@@ -55,6 +55,26 @@ pub async fn document() -> Json<Value> {
                 "get": { "tags": ["media"], "summary": "Get media asset", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Asset" } } },
                 "put": { "tags": ["media"], "summary": "Update media asset", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } },
                 "delete": { "tags": ["media"], "summary": "Delete media asset", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "OK" } } }
+            },
+            "/asset-ops/vulnerability-rules": {
+                "get": { "tags": ["scan"], "summary": "List vulnerability matching rules", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Rules" } } }
+            },
+            "/asset-ops/vulnerability-rules/{id}": {
+                "post": { "tags": ["scan"], "summary": "Create vulnerability matching rule", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Created" } } },
+                "put": { "tags": ["scan"], "summary": "Update vulnerability matching rule", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Updated" } } },
+                "delete": { "tags": ["scan"], "summary": "Delete vulnerability matching rule", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Deleted" } } }
+            },
+            "/pent/scan-risk-verifications": {
+                "get": { "tags": ["scan", "pent"], "summary": "List authorized active vulnerability verifications", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Verifications" } } }
+            },
+            "/pent/scan-risks/{risk_id}/verifications": {
+                "post": { "tags": ["scan", "pent"], "summary": "Request an active vulnerability verification", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Pending approval" } } }
+            },
+            "/pent/scan-risk-verifications/{id}/approve": {
+                "post": { "tags": ["scan", "pent"], "summary": "Confirm target-owner authorization", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Approved" } } }
+            },
+            "/pent/scan-risk-verifications/{id}/execute": {
+                "post": { "tags": ["scan", "pent"], "summary": "Execute an approved verification on pent-agent", "security": [{ "bearerAuth": [] }], "responses": { "200": { "description": "Verification result" } } }
             }
         }
     }))
