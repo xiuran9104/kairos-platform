@@ -1,10 +1,10 @@
-//! Local builtin tool implementations — read, write, glob, grep, bash, web_search.
+//! Local builtin tool implementations — read, write, glob, grep, web_search.
 
 use anyhow::Context;
+use regex::Regex;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
-use tokio::process::Command;
 
 /// Read a file from the local filesystem. Supports offset and limit for pagination.
 pub async fn execute_read(args: Value) -> anyhow::Result<Value> {
@@ -38,7 +38,7 @@ pub async fn execute_read(args: Value) -> anyhow::Result<Value> {
     }))
 }
 
-/// Search files for a regex pattern using grep.
+/// Search text files for a regex pattern without spawning a host process.
 pub async fn execute_grep(args: Value) -> anyhow::Result<Value> {
     let pattern = required_string(&args, "pattern")?;
     let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -47,77 +47,20 @@ pub async fn execute_grep(args: Value) -> anyhow::Result<Value> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
 
-    let output = tokio::time::timeout(
+    let canonical = canonical_allowed_path(search_path)?;
+    let regex = Regex::new(&pattern).context("无效正则表达式")?;
+    let lines = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new("grep")
-            .arg("-rnE")
-            .arg("--include=*.{txt,md,json,html,js,ts,rs,py,sh,yml,yaml,toml,cfg,ini,conf}")
-            .arg("--color=never")
-            .arg(if context_lines > 0 {
-                format!("-C{}", context_lines)
-            } else {
-                String::from("-n")
-            })
-            .arg(&pattern)
-            .arg(search_path)
-            .kill_on_drop(true)
-            .output(),
+        tokio::task::spawn_blocking(move || search_text_files(&canonical, &regex, context_lines)),
     )
     .await
-    .context("grep 超时")?
-    .context("grep 执行失败")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let lines: Vec<&str> = stdout.lines().take(200).collect();
+    .context("grep 超时")??;
 
     Ok(json!({
         "matches": lines,
         "match_count": lines.len(),
-        "exit_code": output.status.code().unwrap_or(-1),
-        "stderr": stderr.to_string(),
-    }))
-}
-
-/// Execute a bash command in a sandboxed environment.
-pub async fn execute_bash(args: Value) -> anyhow::Result<Value> {
-    let command = required_string(&args, "command")?;
-    let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60);
-
-    // Simple safety checks
-    anyhow::ensure!(!command.is_empty(), "命令不能为空");
-    anyhow::ensure!(
-        !command.contains("rm -rf /") && !command.contains("mkfs."),
-        "危险命令被禁止"
-    );
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        Command::new("bash")
-            .arg("-c")
-            .arg(&command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .context("bash 命令超时")?
-    .context("bash 执行失败")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Truncate output
-    let stdout_truncated: String = stdout.chars().take(50_000).collect();
-    let stderr_truncated: String = stderr.chars().take(10_000).collect();
-
-    Ok(json!({
-        "stdout": stdout_truncated,
-        "stderr": stderr_truncated,
-        "exit_code": output.status.code().unwrap_or(-1),
-        "success": output.status.success(),
+        "exit_code": if lines.is_empty() { 1 } else { 0 },
+        "stderr": "",
     }))
 }
 
@@ -249,60 +192,34 @@ pub async fn execute_write(args: Value) -> anyhow::Result<Value> {
         );
         let target = canonical_parent.join(file_name);
         tokio::fs::write(&target, &content).await?;
-        Ok(
-            json!({"written": true, "file_path": target.to_string_lossy(), "bytes": content.len()}),
-        )
+        Ok(json!({"written": true, "file_path": target.to_string_lossy(), "bytes": content.len()}))
     }
 }
 
-/// Find files matching a glob pattern. Uses `find` for robust matching.
+/// Find files matching a glob pattern without spawning a host process.
 /// Simple patterns like `*.rs` match filenames; patterns with `/` match full paths.
 pub async fn execute_glob(args: Value) -> anyhow::Result<Value> {
     let pattern = required_string(&args, "pattern")?;
     let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-    let path = Path::new(&search_path);
-    let canonical = path.canonicalize()?;
-    let allowed_roots = allowed_filesystem_roots();
-    anyhow::ensure!(
-        allowed_roots.iter().any(|root| canonical.starts_with(root)),
-        "搜索路径不在允许的根目录中: {search_path}"
-    );
-
-    // Build find args: use -path for patterns with /, -name for simple filenames
-    let match_arg = if pattern.contains('/') {
-        "-path"
-    } else {
-        "-name"
-    };
-
-    let output = tokio::time::timeout(
+    let canonical = canonical_allowed_path(search_path)?;
+    let match_paths = pattern.contains('/');
+    let pattern_for_search = pattern.clone();
+    let matches = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new("find")
-            .arg(&canonical)
-            .arg("-type")
-            .arg("f")
-            .arg(match_arg)
-            .arg(&pattern)
-            .arg("-maxdepth")
-            .arg("40")
-            .kill_on_drop(true)
-            .output(),
+        tokio::task::spawn_blocking(move || {
+            find_matching_files(&canonical, &pattern_for_search, match_paths)
+        }),
     )
     .await
-    .context("find 超时")?
-    .context("find 执行失败")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let matches: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).take(500).collect();
+    .context("文件搜索超时")??;
 
     Ok(json!({
         "pattern": pattern,
-        "path": canonical.to_string_lossy(),
+        "path": search_path,
         "matches": matches,
         "match_count": matches.len(),
-        "stderr": stderr.to_string(),
+        "stderr": "",
     }))
 }
 
@@ -326,6 +243,106 @@ fn allowed_filesystem_roots() -> Vec<std::path::PathBuf> {
     roots
 }
 
+fn canonical_allowed_path(path: &str) -> anyhow::Result<std::path::PathBuf> {
+    let canonical = Path::new(path).canonicalize()?;
+    let allowed = allowed_filesystem_roots()
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| canonical.starts_with(root));
+    anyhow::ensure!(allowed, "搜索路径不在允许的根目录中: {path}");
+    Ok(canonical)
+}
+
+fn visit_files(root: &Path, max_depth: usize, visitor: &mut impl FnMut(&Path)) {
+    fn walk(path: &Path, depth: usize, max_depth: usize, visitor: &mut impl FnMut(&Path)) {
+        if depth > max_depth {
+            return;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if metadata.is_file() {
+            visitor(path);
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            walk(&entry.path(), depth + 1, max_depth, visitor);
+        }
+    }
+    walk(root, 0, max_depth, visitor);
+}
+
+fn search_text_files(root: &Path, regex: &Regex, context: usize) -> Vec<String> {
+    const TEXT_EXTENSIONS: &[&str] = &[
+        "txt", "md", "json", "html", "js", "ts", "rs", "py", "sh", "yml", "yaml", "toml", "cfg",
+        "ini", "conf",
+    ];
+    let mut matches = Vec::new();
+    visit_files(root, 40, &mut |path| {
+        if matches.len() >= 200
+            || !path
+                .extension()
+                .and_then(|v| v.to_str())
+                .is_some_and(|ext| TEXT_EXTENSIONS.contains(&ext))
+        {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let lines: Vec<_> = content.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if regex.is_match(line) {
+                let start = index.saturating_sub(context);
+                let end = (index + context + 1).min(lines.len());
+                for (offset, value) in lines[start..end].iter().enumerate() {
+                    matches.push(format!(
+                        "{}:{}:{}",
+                        path.display(),
+                        start + offset + 1,
+                        value
+                    ));
+                    if matches.len() >= 200 {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    matches
+}
+
+fn find_matching_files(root: &Path, pattern: &str, match_paths: bool) -> Vec<String> {
+    let regex = Regex::new(&format!(
+        "^{}$",
+        regex::escape(pattern)
+            .replace(r"\*", ".*")
+            .replace(r"\?", ".")
+    ))
+    .expect("escaped glob is valid regex");
+    let mut matches = Vec::new();
+    visit_files(root, 40, &mut |path| {
+        if matches.len() >= 500 {
+            return;
+        }
+        let candidate = if match_paths {
+            path.strip_prefix(root).unwrap_or(path).to_string_lossy()
+        } else {
+            path.file_name().unwrap_or_default().to_string_lossy()
+        };
+        if regex.is_match(&candidate) {
+            matches.push(path.to_string_lossy().into_owned());
+        }
+    });
+    matches
+}
+
 fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -337,6 +354,34 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn grep_and_glob_use_confined_rust_traversal() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let root = cwd.join(format!("kairos-search-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("create test directory");
+        std::fs::write(root.join("sample.rs"), "alpha\nneedle-42\nomega\n").expect("write fixture");
+
+        let grep = execute_grep(json!({
+            "pattern": "needle-[0-9]+",
+            "path": root.to_string_lossy()
+        }))
+        .await
+        .expect("grep result");
+        assert_eq!(grep["match_count"], 1);
+        assert!(grep["matches"][0].as_str().unwrap().contains("needle-42"));
+
+        let glob = execute_glob(json!({
+            "pattern": "*.rs",
+            "path": root.to_string_lossy()
+        }))
+        .await
+        .expect("glob result");
+        assert_eq!(glob["match_count"], 1);
+        assert!(glob["matches"][0].as_str().unwrap().ends_with("sample.rs"));
+
+        std::fs::remove_dir_all(root).expect("remove test directory");
+    }
 
     #[tokio::test]
     async fn write_rejects_parent_directory_traversal() {

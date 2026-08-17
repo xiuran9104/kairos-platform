@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-pub use kairos_platform_pent_runtime::ports::RuntimeAgentProfile as AgentProfile;
 use kairos_platform_pent_runtime::ports::RoleResolver;
+pub use kairos_platform_pent_runtime::ports::RuntimeAgentProfile as AgentProfile;
 
 pub struct MarkdownRoleResolver;
 
@@ -29,15 +29,22 @@ pub(crate) fn agents_dir() -> PathBuf {
 /// Agent ids double as file names; restrict them to path-safe characters.
 pub(crate) fn is_valid_id(id: &str) -> bool {
     let id = id.trim();
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 pub fn load(role: &str) -> anyhow::Result<Option<AgentProfile>> {
     let root = agents_dir();
     let safe = role.trim();
-    if !is_valid_id(safe) { return Ok(None); }
+    if !is_valid_id(safe) {
+        return Ok(None);
+    }
     let path = root.join(format!("{safe}.md"));
-    if !path.exists() { return Ok(None); }
+    if !path.exists() {
+        return Ok(None);
+    }
     parse(&path, safe).map(Some)
 }
 
@@ -71,8 +78,16 @@ pub(crate) fn parse(path: &Path, fallback_id: &str) -> anyhow::Result<AgentProfi
     let content = std::fs::read_to_string(path)?;
     let (header, body) = if let Some(rest) = content.strip_prefix("---\n") {
         rest.split_once("\n---\n").unwrap_or(("", rest))
-    } else { ("", content.as_str()) };
-    let field = |name: &str| header.lines().find_map(|line| line.split_once(':').filter(|(key, _)| key.trim()==name).map(|(_, value)| value.trim().trim_matches('"').to_string()));
+    } else {
+        ("", content.as_str())
+    };
+    let field = |name: &str| {
+        header.lines().find_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.trim() == name)
+                .map(|(_, value)| value.trim().trim_matches('"').to_string())
+        })
+    };
     Ok(AgentProfile {
         id: field("id").unwrap_or_else(|| fallback_id.into()),
         name: field("name").unwrap_or_else(|| fallback_id.into()),
@@ -100,13 +115,23 @@ mod tests {
             if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
                 continue;
             }
-            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
             let profile = parse(&path, id).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert!(!profile.id.is_empty(), "{}: missing id", path.display());
             assert!(!profile.name.is_empty(), "{}: missing name", path.display());
-            assert!(!profile.instruction.is_empty(), "{}: empty body", path.display());
+            assert!(
+                !profile.instruction.is_empty(),
+                "{}: empty body",
+                path.display()
+            );
             count += 1;
         }
-        assert!(count >= 12, "expected at least 12 shipped profiles, got {count}");
+        assert!(
+            count >= 12,
+            "expected at least 12 shipped profiles, got {count}"
+        );
     }
 }

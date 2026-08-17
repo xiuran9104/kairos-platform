@@ -67,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!(%error, "conversation tool responder unavailable");
     }
+    if let Err(error) = kairos_platform_pent_server::transport::mq::spawn_terminal_responder(
+        &nats_bus,
+        database.clone(),
+    )
+    .await
+    {
+        tracing::warn!(%error, "governed terminal responder unavailable");
+    }
 
     // Start the in-process MITM traffic-capture proxy when enabled.
     let _mitm_proxy =

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use sha2::Digest;
 use kairos_platform_pent_api::{
     AgentMessage, AgentTurnRequest, AgentTurnResult, ConversationContext, ConversationIntent,
     ConversationMessageType, ConversationTurnStatus,
 };
+use sha2::Digest;
 
 use super::rmos::{
     AttackGraph, KnowledgeCache, PentestMemory,

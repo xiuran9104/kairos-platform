@@ -186,7 +186,11 @@ impl<'a> RunEventSink<'a> {
 pub(crate) fn is_evidence_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "evidence_list" | "evidence_search" | "evidence_view" | "query_execution_result" | "query-execution-result"
+        "evidence_list"
+            | "evidence_search"
+            | "evidence_view"
+            | "query_execution_result"
+            | "query-execution-result"
     )
 }
 

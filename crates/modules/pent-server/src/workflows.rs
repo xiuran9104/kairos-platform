@@ -22,7 +22,9 @@ pub fn routes() -> Router<PentState> {
         .route("/pent/workflows", get(list_workflows).post(create_workflow))
         .route(
             "/pent/workflows/{id}",
-            get(get_workflow).put(update_workflow).delete(delete_workflow),
+            get(get_workflow)
+                .put(update_workflow)
+                .delete(delete_workflow),
         )
         .route("/pent/workflows/validate", post(validate_handler))
         .route("/pent/workflows/dry-run", post(dry_run_handler))
@@ -38,8 +40,7 @@ pub(crate) fn valid_workflow_id(id: &str) -> bool {
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return false;
     }
-    id.len() <= 100
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    id.len() <= 100 && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn node_id(node: &Value) -> &str {
@@ -149,7 +150,9 @@ pub(crate) fn validate_graph(graph: &Value) -> Vec<String> {
                     errors.push(format!("condition 节点 {id} 缺少 config.expression"));
                 }
                 if out_count > 2 {
-                    errors.push(format!("condition 节点 {id} 出边数量必须为 1-2 条，当前 {out_count} 条"));
+                    errors.push(format!(
+                        "condition 节点 {id} 出边数量必须为 1-2 条，当前 {out_count} 条"
+                    ));
                 }
                 let mut branches = HashSet::new();
                 for edge in edges.iter().filter(|e| edge_endpoint(e, "source") == id) {
@@ -224,14 +227,10 @@ pub(crate) fn simulate_graph(graph: &Value, inputs: &Value) -> Value {
     let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
     let edges = graph["edges"].as_array().cloned().unwrap_or_default();
     let by_id: HashMap<&str, &Value> = nodes.iter().map(|n| (node_id(n), n)).collect();
-    let message = inputs
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let message = inputs.get("message").and_then(Value::as_str).unwrap_or("");
 
-    let first_out_edge = |id: &str| -> Option<&Value> {
-        edges.iter().find(|e| edge_endpoint(e, "source") == id)
-    };
+    let first_out_edge =
+        |id: &str| -> Option<&Value> { edges.iter().find(|e| edge_endpoint(e, "source") == id) };
 
     let mut trace = Vec::new();
     let mut visited = HashSet::new();
@@ -492,12 +491,17 @@ async fn dry_run_handler(
 /// `output contains "x"`, `output == "x"`, `last_tool == "name"`.
 pub(crate) fn evaluate_condition(expression: &str, context: &Value) -> Result<bool, String> {
     let expr = expression.trim();
-    let success = context.get("success").and_then(Value::as_bool).unwrap_or(false);
+    let success = context
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let output = context.get("output").and_then(Value::as_str).unwrap_or("");
-    let last_tool = context.get("last_tool").and_then(Value::as_str).unwrap_or("");
-    let needle = |rest: &str| -> String {
-        rest.trim().trim_matches('"').trim_matches('\'').to_string()
-    };
+    let last_tool = context
+        .get("last_tool")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let needle =
+        |rest: &str| -> String { rest.trim().trim_matches('"').trim_matches('\'').to_string() };
     match expr {
         "true" => Ok(true),
         "false" => Ok(false),
@@ -524,18 +528,25 @@ pub(crate) fn evaluate_condition(expression: &str, context: &Value) -> Result<bo
 
 /// Execute a workflow graph for real: tool nodes run through the sandboxed
 /// executor, condition nodes branch on accumulated context, output nodes
-/// collect results. `agent`/`hitl` nodes are recorded but not yet executed by
-/// the conversation runtime. Returns `{trace, outputs, status}`.
+/// collect results. Unsupported agent nodes fail explicitly and HITL nodes
+/// pause explicitly, so callers can never mistake a partial run for completion.
 pub(crate) async fn execute_workflow_graph(
     graph: &Value,
     inputs: &Value,
-    pool: &kairos_platform_framework_database::PgPool,
+    bus: Option<&crate::transport::mq::NatsHandle>,
+    agent_session: Option<&std::sync::Arc<dyn crate::conversation::AgentSession>>,
+    pool: Option<&kairos_platform_framework_database::PgPool>,
 ) -> Value {
     let errors = validate_graph(graph);
     if !errors.is_empty() {
         return json!({"trace": [], "outputs": {}, "errors": errors, "status": "invalid"});
     }
-    let target = inputs.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let target = inputs
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
     let edges = graph["edges"].as_array().cloned().unwrap_or_default();
     let by_id: HashMap<String, Value> = nodes
@@ -555,7 +566,15 @@ pub(crate) async fn execute_workflow_graph(
     let mut trace: Vec<Value> = Vec::new();
     let mut visited = HashSet::new();
     let mut status = "completed";
-    let mut current = nodes.iter().find(|n| node_type(n) == "start").cloned();
+    let mut current = inputs
+        .get("_workflow_resume_after")
+        .and_then(Value::as_str)
+        .and_then(|resume_after| {
+            out_edges(resume_after)
+                .first()
+                .and_then(|edge| by_id.get(edge_endpoint(edge, "target")).cloned())
+        })
+        .or_else(|| nodes.iter().find(|n| node_type(n) == "start").cloned());
 
     while let Some(node) = current {
         let id = node_id(&node).to_string();
@@ -601,39 +620,73 @@ pub(crate) async fn execute_workflow_graph(
                     });
                 match node_target {
                     Some(target) => {
-                        let limits = crate::infrastructure::process::ToolExecutionLimits {
-                            timeout_seconds: 300,
-                            network_access: crate::infrastructure::process::NetworkPolicy::TargetOnly(
-                                target.clone(),
-                            ),
-                            ..Default::default()
+                        let Some(bus) = bus else {
+                            detail = "pent-agent 工具执行通道不可用".into();
+                            node_status = "failed";
+                            status = "failed";
+                            trace.push(json!({"node_id":id,"label":label,"type":ty,"status":node_status,"detail":detail}));
+                            break;
                         };
-                        match crate::infrastructure::process::execute_tool(
-                            &tool_name,
-                            &[target.clone()],
-                            &limits,
-                        )
-                        .await
-                        {
-                            Ok(output) => {
-                                let stdout = output.stdout;
-                                context["success"] = json!(output.exit_code == 0);
-                                context["last_tool"] = json!(tool_name);
-                                context["output"] = json!(stdout.chars().take(2_000).collect::<String>());
-                                detail = format!(
-                                    "执行 {tool_name} 完成（exit {}）",
-                                    output.exit_code
-                                );
-                                if output.exit_code != 0 {
+                        if inputs.get("scope_confirmed").and_then(Value::as_bool) != Some(true) {
+                            detail = "工作流目标范围尚未明确确认".into();
+                            node_status = "failed";
+                        } else {
+                            let mut arguments = config
+                                .get("arguments")
+                                .and_then(Value::as_object)
+                                .cloned()
+                                .unwrap_or_default();
+                            arguments.entry("target").or_insert(json!(target.clone()));
+                            let timeout_seconds = crate::infrastructure::recipe::lookup(&tool_name)
+                                .map(|recipe| recipe.resource_profile.timeout_seconds)
+                                .unwrap_or(300);
+                            let request = crate::transport::mq::RemoteToolExecutionRequest {
+                                execution_id: uuid::Uuid::new_v4().to_string(),
+                                tool_name: tool_name.clone(),
+                                arguments: Value::Object(arguments),
+                                scope_snapshot: json!({"targets":[target],"confirmed":true}),
+                                session_id: format!("workflow-{}", uuid::Uuid::new_v4()),
+                                run_id: inputs
+                                    .get("run_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                timeout_seconds,
+                            };
+                            match bus.request_tool_execution(&request).await {
+                                Ok(response)
+                                    if response.error.is_none() && response.output.is_some() =>
+                                {
+                                    let output = response.output.expect("checked");
+                                    context["success"] = json!(output.exit_code == 0);
+                                    context["last_tool"] = json!(tool_name);
+                                    context["output"] = json!(
+                                        output.stdout.chars().take(2_000).collect::<String>()
+                                    );
+                                    detail = format!(
+                                        "执行 {tool_name} 完成（exit {}）",
+                                        output.exit_code
+                                    );
+                                    if output.exit_code != 0 {
+                                        node_status = "failed";
+                                    }
+                                }
+                                Ok(response) => {
+                                    let error = response
+                                        .error
+                                        .unwrap_or_else(|| "pent-agent 返回空结果".into());
+                                    context["success"] = json!(false);
+                                    context["last_tool"] = json!(tool_name);
+                                    context["output"] = json!("");
+                                    detail = format!("执行 {tool_name} 失败: {error}");
                                     node_status = "failed";
                                 }
-                            }
-                            Err(error) => {
-                                context["success"] = json!(false);
-                                context["last_tool"] = json!(tool_name);
-                                context["output"] = json!("");
-                                detail = format!("执行 {tool_name} 失败: {error}");
-                                node_status = "failed";
+                                Err(error) => {
+                                    context["success"] = json!(false);
+                                    context["last_tool"] = json!(tool_name);
+                                    context["output"] = json!("");
+                                    detail = format!("执行 {tool_name} 失败: {error}");
+                                    node_status = "failed";
+                                }
                             }
                         }
                     }
@@ -644,8 +697,100 @@ pub(crate) async fn execute_workflow_graph(
                 }
             }
             "agent" => {
-                detail = format!("Agent 节点 {label} 需由对话运行时执行，本次未接入");
-                node_status = "skipped";
+                let Some(agent_session) = agent_session else {
+                    detail = format!("Agent 节点 {label} 的调度器不可用");
+                    node_status = "failed";
+                    status = "failed";
+                    trace.push(json!({"node_id":id,"label":label,"type":ty,"status":node_status,"detail":detail}));
+                    break;
+                };
+                let Some(run_id) = inputs.get("run_id").and_then(Value::as_str) else {
+                    detail = format!("Agent 节点 {label} 缺少 run_id");
+                    node_status = "failed";
+                    status = "failed";
+                    trace.push(json!({"node_id":id,"label":label,"type":ty,"status":node_status,"detail":detail}));
+                    break;
+                };
+                let Some(session_id) = inputs.get("session_id").and_then(Value::as_str) else {
+                    detail = format!("Agent 节点 {label} 缺少关联的 session_id");
+                    node_status = "failed";
+                    status = "failed";
+                    trace.push(json!({"node_id":id,"label":label,"type":ty,"status":node_status,"detail":detail}));
+                    break;
+                };
+                let description = config
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&label)
+                    .to_string();
+                let prompt = config
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&description)
+                    .to_string();
+                let request = crate::conversation::AgentSpawnRequest {
+                    description,
+                    prompt,
+                    session_id: session_id.to_string(),
+                    parent_run_id: run_id.to_string(),
+                    target: context
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned),
+                    child_budget: crate::conversation::AgentChildBudget {
+                        max_rounds: config
+                            .get("max_rounds")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(12)
+                            .clamp(1, 64) as usize,
+                        max_duration_seconds: config
+                            .get("max_duration_seconds")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(900)
+                            .clamp(30, 3600),
+                        max_requests: config
+                            .get("max_requests")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(80)
+                            .clamp(1, 500) as usize,
+                        max_tokens: config
+                            .get("max_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(100_000)
+                            .clamp(1_000, 1_000_000),
+                        stall_limit: config
+                            .get("stall_limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(4)
+                            .clamp(1, 20) as usize,
+                    },
+                };
+                match agent_session.spawn(request).await {
+                    Ok(agent_id) => match agent_session.collect(&agent_id).await {
+                        Some(result) => {
+                            context["success"] = json!(true);
+                            context["output"] =
+                                json!(result.chars().take(2_000).collect::<String>());
+                            detail = format!("Agent {agent_id} 执行完成");
+                        }
+                        None => {
+                            let error = agent_session
+                                .status(&agent_id)
+                                .await
+                                .and_then(|agent| agent.error)
+                                .unwrap_or_else(|| "Agent 未返回结果".into());
+                            context["success"] = json!(false);
+                            detail = format!("Agent {agent_id} 执行失败: {error}");
+                            node_status = "failed";
+                        }
+                    },
+                    Err(error) => {
+                        context["success"] = json!(false);
+                        detail = format!("Agent 节点 {label} 调度失败: {error}");
+                        node_status = "failed";
+                    }
+                }
             }
             "condition" => {
                 let expression = config
@@ -679,8 +824,23 @@ pub(crate) async fn execute_workflow_graph(
                 }
             }
             "hitl" => {
-                detail = "人工确认节点（本次执行记录为待确认）".to_string();
-                node_status = "pending";
+                if let (Some(pool), Some(run_id)) =
+                    (pool, inputs.get("run_id").and_then(Value::as_str))
+                {
+                    match create_workflow_approval(pool, run_id, &id, &label, graph, inputs).await {
+                        Ok(approval_id) => {
+                            detail = format!("人工确认节点等待审批：{approval_id}");
+                            node_status = "pending";
+                        }
+                        Err(error) => {
+                            detail = format!("创建 Workflow 审批失败: {error}");
+                            node_status = "failed";
+                        }
+                    }
+                } else {
+                    detail = "人工确认节点（本次执行记录为待确认）".to_string();
+                    node_status = "pending";
+                }
             }
             "output" => {
                 let output_key = config
@@ -716,6 +876,10 @@ pub(crate) async fn execute_workflow_graph(
             status = "failed";
             break;
         }
+        if node_status == "pending" {
+            status = "awaiting_approval";
+            break;
+        }
         if let Some(target_id) = next {
             current = by_id.get(&target_id).cloned();
         } else {
@@ -725,12 +889,116 @@ pub(crate) async fn execute_workflow_graph(
         }
     }
 
-    let _ = pool;
     json!({
         "trace": trace,
         "outputs": outputs,
         "status": status,
     })
+}
+
+async fn create_workflow_approval(
+    pool: &kairos_platform_framework_database::PgPool,
+    run_id: &str,
+    node_id: &str,
+    label: &str,
+    graph: &Value,
+    inputs: &Value,
+) -> Result<String, sqlx::Error> {
+    let approval_id = format!("approval-{}", uuid::Uuid::new_v4());
+    let state = json!({
+        "kind": "workflow",
+        "node_id": node_id,
+        "graph": redact_workflow_state(graph.clone()),
+        "inputs": redact_workflow_state(inputs.clone()),
+    });
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 947231))")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO pent_approvals(
+             id,run_id,tool_call_id,risk_level,tool_name,description,status,
+             expires_at,hitl_mode,reviewer,original_arguments,effective_arguments,audit_request
+         ) VALUES($1,$2,$1,'high','workflow_hitl',$3,'pending',
+             now()+make_interval(secs=>1800),'approval','human',$4,$4,$4)",
+    )
+    .bind(&approval_id)
+    .bind(run_id)
+    .bind(format!("Workflow 人工确认：{label}"))
+    .bind(&state)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO pent_run_events(event_id,run_id,sequence,event_type,payload)
+         VALUES($1,$2,(SELECT COALESCE(max(sequence),0)+1 FROM pent_run_events WHERE run_id=$2),
+                'workflow.awaiting_approval',$3)",
+    )
+    .bind(format!("event-{}", uuid::Uuid::new_v4()))
+    .bind(run_id)
+    .bind(json!({"approval_id":approval_id,"node_id":node_id}))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(approval_id)
+}
+
+fn redact_workflow_state(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(object) => {
+            for (key, item) in object {
+                if matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "authorization" | "cookie" | "password" | "token" | "api_key"
+                ) {
+                    *item = Value::String("[REDACTED]".into());
+                } else {
+                    *item = redact_workflow_state(item.take());
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                *item = redact_workflow_state(item.take());
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+pub(crate) async fn resume_approved_workflow(state: &PentState, saved: &Value) -> Value {
+    if saved.get("kind").and_then(Value::as_str) != Some("workflow") {
+        return json!({"status":"invalid","errors":["审批记录不是 Workflow 状态"]});
+    }
+    let Some(graph) = saved.get("graph") else {
+        return json!({"status":"invalid","errors":["Workflow 审批缺少 graph"]});
+    };
+    let Some(resume_node_id) = saved.get("node_id").and_then(Value::as_str) else {
+        return json!({"status":"invalid","errors":["Workflow 审批缺少 node_id"]});
+    };
+    if !graph["nodes"].as_array().is_some_and(|nodes| {
+        nodes
+            .iter()
+            .any(|node| node_id(node) == resume_node_id && node_type(node) == "hitl")
+    }) {
+        return json!({"status":"invalid","errors":["Workflow 审批的 HITL 节点无效"]});
+    }
+    let mut inputs = saved.get("inputs").cloned().unwrap_or_else(|| json!({}));
+    inputs["_workflow_resume_after"] = json!(resume_node_id);
+    let has_agent_node = graph["nodes"]
+        .as_array()
+        .is_some_and(|nodes| nodes.iter().any(|node| node_type(node) == "agent"));
+    let agent_session =
+        has_agent_node.then(|| crate::conversation::build_agent_session(&state.pool, 1));
+    execute_workflow_graph(
+        graph,
+        &inputs,
+        state.nats.as_ref(),
+        agent_session.as_ref(),
+        Some(&state.pool),
+    )
+    .await
 }
 
 async fn execute_handler(
@@ -739,18 +1007,87 @@ async fn execute_handler(
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     security::tenant_id(&user)?;
+    security::require(
+        &user,
+        kairos_platform_pent_api::permission_codes::RUN_EXECUTE,
+    )?;
     let graph = body
         .get("graph")
         .ok_or_else(|| AppError::bad_request("graph 不能为空"))?;
-    let inputs = body.get("inputs").cloned().unwrap_or_else(|| json!({}));
+    let mut inputs = body.get("inputs").cloned().unwrap_or_else(|| json!({}));
+    if let Some(object) = inputs.as_object_mut() {
+        object.remove("_workflow_resume_after");
+    }
+    let has_tool_node = graph["nodes"]
+        .as_array()
+        .is_some_and(|nodes| nodes.iter().any(|node| node_type(node) == "tool"));
+    let has_agent_node = graph["nodes"]
+        .as_array()
+        .is_some_and(|nodes| nodes.iter().any(|node| node_type(node) == "agent"));
+    if has_tool_node || has_agent_node {
+        let run_id = inputs
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::bad_request("执行工具节点必须提供 inputs.run_id"))?;
+        security::ensure_run_access(&s.pool, run_id, &user).await?;
+        if has_agent_node {
+            let session_id: Option<String> = sqlx::query_scalar::<_, String>(
+                "SELECT session_id FROM pent_runs WHERE id=$1 AND session_id IS NOT NULL",
+            )
+            .bind(run_id)
+            .fetch_optional(&s.pool)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?;
+            let session_id = session_id.ok_or_else(|| {
+                AppError::bad_request("Workflow Agent 节点要求 Run 关联有效的 Pent session")
+            })?;
+            inputs["session_id"] = json!(session_id);
+        }
+    }
+    let agent_session =
+        has_agent_node.then(|| crate::conversation::build_agent_session(&s.pool, 1));
     Ok(Json(ApiResponse::new(
-        execute_workflow_graph(graph, &inputs, &s.pool).await,
+        execute_workflow_graph(
+            graph,
+            &inputs,
+            s.nats.as_ref(),
+            agent_session.as_ref(),
+            Some(&s.pool),
+        )
+        .await,
     )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SuccessfulAgentSession;
+
+    #[async_trait::async_trait]
+    impl crate::conversation::AgentSession for SuccessfulAgentSession {
+        async fn recover(&self, _: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn active_count(&self) -> usize {
+            0
+        }
+        async fn spawn(&self, _: crate::conversation::AgentSpawnRequest) -> anyhow::Result<String> {
+            Ok("workflow-agent-1".into())
+        }
+        async fn status(&self, _: &str) -> Option<crate::conversation::RuntimeSubAgent> {
+            None
+        }
+        async fn collect(&self, _: &str) -> Option<String> {
+            Some("agent verified result".into())
+        }
+        async fn list(&self) -> Vec<crate::conversation::RuntimeSubAgent> {
+            Vec::new()
+        }
+        async fn abort_all(&self) {}
+    }
 
     fn base_graph() -> Value {
         json!({
@@ -824,6 +1161,94 @@ mod tests {
         graph["nodes"][1]["config"] = json!({});
         let errors = validate_graph(&graph);
         assert!(errors.iter().any(|e| e.contains("tool_name")));
+    }
+
+    #[tokio::test]
+    async fn agent_node_cannot_report_false_completion() {
+        let graph = json!({
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "a", "type": "agent", "label": "分析"},
+                {"id": "o", "type": "output", "config": {"output_key": "result"}}
+            ],
+            "edges": [
+                {"source": "s", "target": "a"},
+                {"source": "a", "target": "o"}
+            ]
+        });
+        let result = execute_workflow_graph(&graph, &json!({}), None, None, None).await;
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["trace"][1]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn agent_node_uses_governed_scheduler_and_collects_result() {
+        let graph = json!({
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "a", "type": "agent", "label": "分析", "config": {"prompt": "验证目标"}},
+                {"id": "o", "type": "output", "config": {"output_key": "result"}}
+            ],
+            "edges": [
+                {"source": "s", "target": "a"},
+                {"source": "a", "target": "o"}
+            ]
+        });
+        let session: std::sync::Arc<dyn crate::conversation::AgentSession> =
+            std::sync::Arc::new(SuccessfulAgentSession);
+        let result = execute_workflow_graph(
+            &graph,
+            &json!({"run_id":"run-1","session_id":"session-1"}),
+            None,
+            Some(&session),
+            None,
+        )
+        .await;
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["outputs"]["result"], "agent verified result");
+    }
+
+    #[tokio::test]
+    async fn hitl_node_pauses_instead_of_reporting_completion() {
+        let graph = json!({
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "h", "type": "hitl", "label": "审批"},
+                {"id": "o", "type": "output", "config": {"output_key": "result"}}
+            ],
+            "edges": [
+                {"source": "s", "target": "h"},
+                {"source": "h", "target": "o"}
+            ]
+        });
+        let result = execute_workflow_graph(&graph, &json!({}), None, None, None).await;
+        assert_eq!(result["status"], "awaiting_approval");
+        assert_eq!(result["trace"][1]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn approved_hitl_resumes_at_the_following_node() {
+        let graph = json!({
+            "nodes": [
+                {"id": "s", "type": "start"},
+                {"id": "h", "type": "hitl", "label": "审批"},
+                {"id": "o", "type": "output", "config": {"output_key": "result"}}
+            ],
+            "edges": [
+                {"source": "s", "target": "h"},
+                {"source": "h", "target": "o"}
+            ]
+        });
+        let result = execute_workflow_graph(
+            &graph,
+            &json!({"_workflow_resume_after":"h"}),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["trace"][0]["node_id"], "o");
     }
 
     #[test]

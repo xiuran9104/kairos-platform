@@ -245,17 +245,47 @@ impl CognitiveExecutor for ProcessExecutor {
             ..Default::default()
         };
         let started = std::time::Instant::now();
-        let output = crate::infrastructure::process::execute_tool(&tool_name, &command, &limits)
-            .await
-            .map_err(|error| anyhow::anyhow!("工具执行失败: {error}"))?;
-        let result = kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
-            &tool_name,
-            &proposal.target,
-            output.exit_code,
-            &output.stdout,
-            &output.stderr,
-            output.duration_ms,
-        );
+        let execution =
+            crate::infrastructure::process::execute_tool(&tool_name, &command, &limits).await;
+        let (result, exit_code, outcome, error_code) = match execution {
+            Ok(output) => {
+                let result =
+                    kairos_platform_pent_core::tools::adapters::normalize_security_tool_output(
+                        &tool_name,
+                        &proposal.target,
+                        output.exit_code,
+                        &output.stdout,
+                        &output.stderr,
+                        output.duration_ms,
+                    );
+                let outcome = if output.exit_code == 0 {
+                    "succeeded"
+                } else {
+                    "failed"
+                };
+                (result, output.exit_code, outcome, None)
+            }
+            Err(error) => {
+                let result = ToolExecutionResult {
+                    schema_version: 1,
+                    tool_name: tool_name.clone(),
+                    target: proposal.target.clone(),
+                    status: ToolExecutionStatus::Failed,
+                    summary: "工具执行失败".into(),
+                    observations: Vec::new(),
+                    findings: Vec::new(),
+                    artifacts: Vec::new(),
+                    raw_output_ref: None,
+                    metrics: kairos_platform_pent_api::ToolExecutionMetrics {
+                        exit_code: -1,
+                        duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    },
+                    warnings: vec![error],
+                    occurred_at: Utc::now(),
+                };
+                (result, -1, "failed", Some("TOOL_EXECUTION_FAILED"))
+            }
+        };
 
         // Persist tool call + raw evidence so the fact layer stays complete.
         let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -272,13 +302,15 @@ impl CognitiveExecutor for ProcessExecutor {
         .bind(&tool_name)
         .bind(json!({"target": proposal.target, "capability": proposal.capability}))
         .bind(duration_ms)
-        .bind(output.exit_code)
+        .bind(exit_code)
         .bind(backend_name)
         .bind(json!({
             "backend": backend_name,
             "plan_id": proposal.plan_id,
             "plan_version": proposal.plan_version,
             "node_id": proposal.node_id,
+            "outcome": outcome,
+            "error_code": error_code,
         }))
         .execute(&mut *tx)
         .await?;

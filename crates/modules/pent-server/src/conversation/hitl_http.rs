@@ -119,7 +119,50 @@ async fn decide_approval(
     if affected == 0 {
         return Err(AppError::bad_request("审批不存在、已处理或已过期"));
     }
-    Ok(Json(ApiResponse::new(json!({"id":id,"decision":decision}))))
+    let workflow_state = sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT audit_request FROM pent_approvals WHERE id=$1 AND tool_name='workflow_hitl'",
+    )
+    .bind(&id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(internal)?
+    .flatten();
+    let workflow_result = if decision == "approve" {
+        match workflow_state.as_ref() {
+            Some(saved) => Some(crate::workflows::resume_approved_workflow(&s, saved).await),
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(saved) = workflow_state.as_ref()
+        && let Some(run_id) = saved
+            .get("inputs")
+            .and_then(|inputs| inputs.get("run_id"))
+            .and_then(Value::as_str)
+    {
+        let event_type = if decision == "approve" {
+            "workflow.resumed"
+        } else {
+            "workflow.rejected"
+        };
+        sqlx::query(
+            "INSERT INTO pent_run_events(event_id,run_id,sequence,event_type,payload)
+             VALUES($1,$2,(SELECT COALESCE(max(sequence),0)+1 FROM pent_run_events WHERE run_id=$2),$3,$4)",
+        )
+        .bind(format!("event-{}", uuid::Uuid::new_v4()))
+        .bind(run_id)
+        .bind(event_type)
+        .bind(json!({"approval_id":id,"decision":decision,"result":workflow_result}))
+        .execute(&s.pool)
+        .await
+        .map_err(internal)?;
+    }
+    Ok(Json(ApiResponse::new(json!({
+        "id":id,
+        "decision":decision,
+        "workflow_result":workflow_result
+    }))))
 }
 
 fn internal(error: sqlx::Error) -> AppError {

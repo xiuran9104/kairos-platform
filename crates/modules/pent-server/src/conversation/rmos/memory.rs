@@ -223,10 +223,17 @@ impl PentestMemory {
                     id: format!("f-{}", self.findings.len() + 1),
                     vuln_type: title.to_string(),
                     endpoint: endpoint.to_string(),
-                    parameter: f.get("parameter").and_then(|v| v.as_str()).map(str::to_string),
+                    parameter: f
+                        .get("parameter")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     severity,
                     status: FindingStatus::Suspected,
-                    description: f.get("description").and_then(|v| v.as_str()).unwrap_or(title).to_string(),
+                    description: f
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(title)
+                        .to_string(),
                     evidence_refs: vec![],
                 };
                 self.findings.push(finding);
@@ -237,7 +244,8 @@ impl PentestMemory {
     /// Generate next_actions for methodology categories not yet covered.
     /// Called after each round to suggest what to test next.
     pub fn ensure_coverage_actions(&mut self) {
-        let vuln_types: HashSet<&str> = self.findings.iter().map(|f| f.vuln_type.as_str()).collect();
+        let vuln_types: HashSet<&str> =
+            self.findings.iter().map(|f| f.vuln_type.as_str()).collect();
         // M3: Dynamic vulnerability targets — use actually-discovered attack surface
         // paths instead of hardcoded Juice Shop endpoints.
         let discovered: Vec<String> = self.attack_surface.iter().map(|a| a.path.clone()).collect();
@@ -263,12 +271,11 @@ impl PentestMemory {
 
         for (vuln, tool, priority) in checklist {
             if !vuln_types.contains(vuln) {
-                let already_planned = self
-                    .next_actions
-                    .iter()
-                    .any(|a| a.action.contains(vuln));
+                let already_planned = self.next_actions.iter().any(|a| a.action.contains(vuln));
                 if !already_planned {
-                    let target = discovered.first().map(|s| s.to_string())
+                    let target = discovered
+                        .first()
+                        .map(|s| s.to_string())
                         .unwrap_or_else(|| fallback_target.clone());
                     self.next_actions.push(NextAction {
                         priority: *priority,
@@ -292,10 +299,7 @@ impl PentestMemory {
             parts.push(format!("**目标**: {}", self.target));
         }
         if !self.technologies.is_empty() {
-            parts.push(format!(
-                "**技术栈**: {}",
-                self.technologies.join(", ")
-            ));
+            parts.push(format!("**技术栈**: {}", self.technologies.join(", ")));
         }
 
         // Confirmed findings
@@ -373,9 +377,12 @@ mod tests {
     #[test]
     fn extracts_technologies_from_whatweb_output() {
         let mut m = PentestMemory::new("example.com");
-        m.absorb_tool_result("whatweb", &json!({
-            "result": "Apache/2.4.41 PHP/7.4.3 MySQL"
-        }));
+        m.absorb_tool_result(
+            "whatweb",
+            &json!({
+                "result": "Apache/2.4.41 PHP/7.4.3 MySQL"
+            }),
+        );
         assert!(m.technologies.contains(&"Apache".to_string()));
         assert!(m.technologies.contains(&"PHP".to_string()));
         assert!(m.technologies.contains(&"MySQL".to_string()));
@@ -384,16 +391,22 @@ mod tests {
     #[test]
     fn deduplicates_findings() {
         let mut m = PentestMemory::new("example.com");
-        m.absorb_tool_result("nuclei", &json!({
-            "findings": [
-                {"title": "SQL Injection", "severity": "high", "target": "/login.php"}
-            ]
-        }));
-        m.absorb_tool_result("nuclei", &json!({
-            "findings": [
-                {"title": "SQL Injection", "severity": "high", "target": "/login.php"}
-            ]
-        }));
+        m.absorb_tool_result(
+            "nuclei",
+            &json!({
+                "findings": [
+                    {"title": "SQL Injection", "severity": "high", "target": "/login.php"}
+                ]
+            }),
+        );
+        m.absorb_tool_result(
+            "nuclei",
+            &json!({
+                "findings": [
+                    {"title": "SQL Injection", "severity": "high", "target": "/login.php"}
+                ]
+            }),
+        );
         assert_eq!(m.findings.len(), 1);
     }
 

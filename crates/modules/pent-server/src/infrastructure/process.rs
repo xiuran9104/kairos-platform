@@ -44,6 +44,76 @@ pub struct ToolExecutionLimits {
     pub secret_environment: SecretEnvironment,
 }
 
+/// A long-lived interactive process hosted inside the same bubblewrap and
+/// cgroup boundary used by one-shot security tools.
+pub struct InteractiveSandbox {
+    pub child: tokio::process::Child,
+    _cgroup_guard: Option<crate::infrastructure::cgroup::CgroupGuard>,
+}
+
+pub async fn spawn_interactive_shell(
+    session_id: &str,
+    timeout_seconds: u64,
+) -> Result<InteractiveSandbox, String> {
+    let limits = ToolExecutionLimits {
+        cpu_cores: 1.0,
+        memory_mb: 512,
+        timeout_seconds: timeout_seconds.clamp(60, 3_600),
+        network_access: NetworkPolicy::None,
+        run_id: Some(session_id.to_owned()),
+        ..Default::default()
+    };
+    let prepared = PreparedTool {
+        program: "/bin/bash",
+        args: vec!["--noprofile".into(), "--norc".into()],
+    };
+    let sandbox = build_bubblewrap_command(&prepared, prepared.program, &limits, &[], &[])?;
+    let mut command = Command::new(&sandbox.program);
+    command
+        .args(&sandbox.args)
+        .env_clear()
+        .env("LANG", "C.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        let seccomp_fd = sandbox.seccomp_file.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(seccomp_fd, libc::F_GETFD);
+                if flags < 0
+                    || libc::fcntl(seccomp_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child_result = command.spawn();
+    drop(sandbox.seccomp_file);
+    let _ = std::fs::remove_file(&sandbox.seccomp_path);
+    let child = child_result.map_err(|error| format!("无法启动受治理终端: {error}"))?;
+    let cgroup_limits = crate::infrastructure::cgroup::CgroupLimits {
+        cpu_quota_us: Some(100_000),
+        memory_max_bytes: Some(512 * 1024 * 1024),
+        pids_max: Some(64),
+    };
+    let cgroup = crate::infrastructure::cgroup::CgroupGuard::create(
+        &format!("kairos-terminal-{session_id}"),
+        &cgroup_limits,
+    );
+    if let (Some(guard), Some(pid)) = (&cgroup, child.id()) {
+        guard.attach(pid);
+    }
+    Ok(InteractiveSandbox {
+        child,
+        _cgroup_guard: cgroup,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub enum NetworkPolicy {
     None,
@@ -551,9 +621,6 @@ fn build_bubblewrap_command(
         let mut args = vec![
             "--unshare-all".into(),
             "--unshare-user".into(),
-            // Network namespaces are intentionally out of scope. Network access
-            // remains governed by allow-listed tools and target validation.
-            "--share-net".into(),
             "--disable-userns".into(),
             "--new-session".into(),
             "--die-with-parent".into(),
@@ -581,6 +648,12 @@ fn build_bubblewrap_command(
             "/opt".into(),
             "/opt".into(),
         ];
+        // Arbitrary interactive/local execution never receives the host
+        // network. Allow-listed target tools are validated before reaching
+        // this builder and may share the network namespace.
+        if !matches!(limits.network_access, NetworkPolicy::None) {
+            args.insert(3, "--share-net".into());
+        }
         // Controlled tool directory: consolidated user-writable symlinks,
         // mounted read-only and prepended to PATH so tools resolve uniformly
         // without depending on root-owned system paths.
@@ -1155,8 +1228,8 @@ mod tests {
 
     #[test]
     fn bubblewrap_runner_enforces_local_isolation_layers() {
-        let bubblewrap = std::env::var("PENTA_BWRAP_PATH")
-            .unwrap_or_else(|_| DEFAULT_BWRAP_PATH.to_string());
+        let bubblewrap =
+            std::env::var("PENTA_BWRAP_PATH").unwrap_or_else(|_| DEFAULT_BWRAP_PATH.to_string());
         if !std::path::Path::new(&bubblewrap).is_file() {
             eprintln!("skipping bubblewrap command test: {bubblewrap} is unavailable");
             return;
@@ -1184,7 +1257,7 @@ mod tests {
         );
         assert!(command.args.contains(&"--seccomp".to_string()));
         assert!(command.args.contains(&"--unshare-all".to_string()));
-        assert!(command.args.contains(&"--share-net".to_string()));
+        assert!(!command.args.contains(&"--share-net".to_string()));
         assert!(command.args.contains(&"/workspace".to_string()));
         assert!(command.args.contains(&"/artifacts".to_string()));
         assert!(command.args.contains(&"/usr/bin/prlimit".to_string()));

@@ -95,7 +95,10 @@ pub async fn has_executable_step(pool: &PgPool, run_id: &str) -> anyhow::Result<
         .and_then(|value| value.get("nodes").and_then(Value::as_array).cloned())
         .is_some_and(|nodes| {
             nodes.iter().any(|node| {
-                matches!(node.get("status").and_then(Value::as_str), Some("ready" | "running"))
+                matches!(
+                    node.get("status").and_then(Value::as_str),
+                    Some("ready" | "running")
+                )
             })
         }))
 }
@@ -211,21 +214,52 @@ mod tests {
 
     #[tokio::test]
     async fn persists_plan_versions_and_replan_delta() {
-        let Ok(url) = std::env::var("TEST_DATABASE_URL") else { return };
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = PgPool::connect(&url).await.unwrap();
         let run_id = format!("plan-test-{}", uuid::Uuid::new_v4());
         sqlx::query("INSERT INTO pent_runs(id,task_id,tenant_id,user_id) VALUES($1,'plan-test-task',0,'test')")
             .bind(&run_id).execute(&pool).await.unwrap();
-        let created = create(&pool, &run_id, &json!({"objective":"test","steps":["recon","validate"]})).await.unwrap();
+        let created = create(
+            &pool,
+            &run_id,
+            &json!({"objective":"test","steps":["recon","validate"]}),
+        )
+        .await
+        .unwrap();
         assert_eq!(created["version"], 1);
         assert!(has_executable_step(&pool, &run_id).await.unwrap());
-        let updated = update(&pool, &run_id, &json!({"node_id":"step-1","status":"completed","reason":"evidence collected"})).await.unwrap();
+        let updated = update(
+            &pool,
+            &run_id,
+            &json!({"node_id":"step-1","status":"completed","reason":"evidence collected"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(updated["version"], 2);
         assert_eq!(updated["nodes"][1]["status"], "ready");
-        let deltas: i64 = sqlx::query_scalar("SELECT count(*) FROM pent_plan_deltas WHERE run_id=$1").bind(&run_id).fetch_one(&pool).await.unwrap();
+        let deltas: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pent_plan_deltas WHERE run_id=$1")
+                .bind(&run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(deltas, 1);
-        sqlx::query("DELETE FROM pent_plan_deltas WHERE run_id=$1").bind(&run_id).execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM pent_plan_versions WHERE run_id=$1").bind(&run_id).execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM pent_runs WHERE id=$1").bind(&run_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM pent_plan_deltas WHERE run_id=$1")
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM pent_plan_versions WHERE run_id=$1")
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM pent_runs WHERE id=$1")
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

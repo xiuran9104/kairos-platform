@@ -144,11 +144,7 @@ impl AttackGraph {
     }
 
     /// Add a credential discovered through a vulnerability.
-    pub fn add_credential(
-        &mut self,
-        username: &str,
-        source_vuln: &str,
-    ) -> String {
+    pub fn add_credential(&mut self, username: &str, source_vuln: &str) -> String {
         let id = format!("cred-{}", self.next_id);
         self.next_id += 1;
         self.nodes.insert(
@@ -171,11 +167,7 @@ impl AttackGraph {
     }
 
     /// Add a privilege level gained through credentials or exploits.
-    pub fn add_privilege(
-        &mut self,
-        level: &str,
-        source_id: &str,
-    ) -> String {
+    pub fn add_privilege(&mut self, level: &str, source_id: &str) -> String {
         let id = format!("priv-{}", self.next_id);
         self.next_id += 1;
         self.nodes.insert(
@@ -224,10 +216,7 @@ impl AttackGraph {
                 let emoji = node_emoji(&tgt.kind);
                 lines.push(format!(
                     "  {} → {} {} ({})",
-                    src.name,
-                    emoji,
-                    tgt.name,
-                    edge.description
+                    src.name, emoji, tgt.name, edge.description
                 ));
                 // Follow the chain one level deep
                 self.follow_chain(&tgt.id, &mut lines, "    ", 2);

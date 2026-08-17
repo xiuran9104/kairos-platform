@@ -112,6 +112,7 @@ fn production_process_roles_do_not_overlap() {
         "spawn_mcp_reconciler",
         "mcp::registry::shared",
         "verify_bubblewrap",
+        "spawn_terminal_responder",
     ] {
         assert!(
             agent.contains(required),
@@ -123,6 +124,47 @@ fn production_process_roles_do_not_overlap() {
         "pent-agent",
         &["PentState", "routes(state)", "authenticate_pent"],
     );
+}
+
+#[test]
+fn gateway_reachable_local_tools_never_spawn_host_processes() {
+    for source in [
+        "crates/modules/pent-server/src/terminal.rs",
+        "crates/modules/pent-server/src/tooling/builtin/local_tools.rs",
+    ] {
+        let content = read(source);
+        assert_absent(
+            &content,
+            source,
+            &["Command::new", "process::Command", "tokio::process"],
+        );
+    }
+
+    let executor = read("crates/modules/pent-server/src/conversation/tool_executor.rs");
+    assert_absent(
+        &executor,
+        "conversation tool executor",
+        &[
+            "execute_bash",
+            "\"bash\" => execute_builtin_local",
+            "infrastructure::process::execute_tool",
+        ],
+    );
+    assert!(executor.contains("request_tool_execution"));
+    let terminal = read("crates/modules/pent-server/src/terminal.rs");
+    assert!(terminal.contains("system_operate_log"));
+    assert_absent(
+        &terminal,
+        "gateway terminal ownership",
+        &["SESSION_OWNERS", "OnceLock", "HashMap"],
+    );
+    let workflows = read("crates/modules/pent-server/src/workflows.rs");
+    assert_absent(
+        &workflows,
+        "gateway workflow execution",
+        &["infrastructure::process::execute_tool"],
+    );
+    assert!(workflows.contains("request_tool_execution"));
 }
 
 #[test]

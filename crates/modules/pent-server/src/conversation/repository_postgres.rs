@@ -14,6 +14,37 @@ const MAX_HISTORY_TOOL_CALLS: i64 = 500;
 const MAX_EVIDENCE_PAGE_SIZE: i64 = 50;
 const MAX_EVIDENCE_VIEW_CHARS: usize = 12_000;
 
+fn classify_persisted_tool_result(
+    success: bool,
+    content: Option<&serde_json::Value>,
+) -> (&'static str, &'static str, Option<String>, bool) {
+    let blocked = content
+        .and_then(|value| value.get("blocked"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let error_code = content
+        .and_then(|value| value.get("error_code"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let retryable = content
+        .and_then(|value| value.get("retryable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let outcome = if blocked {
+        "blocked"
+    } else {
+        match error_code.as_deref() {
+            Some("TOOL_CANCELLED") => "cancelled",
+            Some("TOOL_TIMEOUT") => "timed_out",
+            Some("WORKER_UNAVAILABLE") => "worker_unavailable",
+            _ if success => "succeeded",
+            _ => "failed",
+        }
+    };
+    let permission = if blocked { "denied" } else { "allowed" };
+    (outcome, permission, error_code, retryable)
+}
+
 pub struct PgConversationRepository {
     pool: PgPool,
 }
@@ -353,6 +384,8 @@ impl ConversationRepository for PgConversationRepository {
         let arguments = serde_json::from_str::<serde_json::Value>(arguments)
             .unwrap_or_else(|_| serde_json::json!({"invalid_arguments": true}));
         let content_value = serde_json::from_str::<serde_json::Value>(content).ok();
+        let (outcome, permission_decision, error_code, retryable) =
+            classify_persisted_tool_result(success, content_value.as_ref());
         let fallback_backend = if content_value
             .as_ref()
             .and_then(|value| value.get("blocked"))
@@ -388,6 +421,11 @@ impl ConversationRepository for PgConversationRepository {
                 })
             });
         if let Some(audit) = execution_audit.as_object_mut() {
+            audit.insert("outcome".into(), outcome.into());
+            audit.insert("retryable".into(), retryable.into());
+            if let Some(error_code) = error_code {
+                audit.insert("error_code".into(), error_code.into());
+            }
             audit.insert("successful_observation".into(), success.into());
             audit.insert(
                 "semantic_fingerprint".into(),
@@ -410,7 +448,7 @@ impl ConversationRepository for PgConversationRepository {
                  id,run_id,tool_name,params_summary,permission_decision,
                  started_at,completed_at,duration_ms,exit_code,executor_backend,
                  network_policy,execution_audit
-             ) VALUES($1,$2,$3,$4,'allowed',now(),now(),$5,$6,$7,$8,$9)
+             ) VALUES($1,$2,$3,$4,$5,now(),now(),$6,$7,$8,$9,$10)
              ON CONFLICT(id) DO UPDATE SET
                  completed_at=now(),duration_ms=excluded.duration_ms,
                  exit_code=excluded.exit_code,network_policy=excluded.network_policy,
@@ -420,6 +458,7 @@ impl ConversationRepository for PgConversationRepository {
         .bind(run_id)
         .bind(tool_name)
         .bind(redact_arguments(arguments.clone()))
+        .bind(permission_decision)
         .bind(i64::try_from(duration_ms).unwrap_or(i64::MAX))
         .bind(exit_code)
         .bind(&executor_backend)
@@ -660,7 +699,9 @@ impl ConversationRepository for PgConversationRepository {
                     .and_then(serde_json::Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty() && value.len() <= 100)
-                    .ok_or_else(|| anyhow::anyhow!("query_execution_result 缺少有效 execution_id"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("query_execution_result 缺少有效 execution_id")
+                    })?;
                 let page = arguments
                     .get("page")
                     .and_then(serde_json::Value::as_u64)
@@ -705,9 +746,7 @@ impl ConversationRepository for PgConversationRepository {
                 .bind(execution_id)
                 .fetch_optional(&self.pool)
                 .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("当前 Run 中不存在 execution {execution_id}")
-                })?;
+                .ok_or_else(|| anyhow::anyhow!("当前 Run 中不存在 execution {execution_id}"))?;
                 let content = sanitize_evidence_text(row.5.as_deref().unwrap_or_default());
                 let mut lines = content.lines().collect::<Vec<_>>();
                 if let Some(value) = filter {
@@ -1304,6 +1343,54 @@ fn compact_memory_observation(value: Option<&serde_json::Value>) -> serde_json::
         "truncated": true,
         "available_in_evidence": true
     })
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::classify_persisted_tool_result;
+
+    #[test]
+    fn distinguishes_all_terminal_tool_outcomes() {
+        let cases = [
+            (true, serde_json::json!({}), "succeeded", "allowed"),
+            (
+                false,
+                serde_json::json!({"blocked":true}),
+                "blocked",
+                "denied",
+            ),
+            (
+                false,
+                serde_json::json!({"error_code":"TOOL_CANCELLED"}),
+                "cancelled",
+                "allowed",
+            ),
+            (
+                false,
+                serde_json::json!({"error_code":"TOOL_TIMEOUT"}),
+                "timed_out",
+                "allowed",
+            ),
+            (
+                false,
+                serde_json::json!({"error_code":"WORKER_UNAVAILABLE"}),
+                "worker_unavailable",
+                "allowed",
+            ),
+            (
+                false,
+                serde_json::json!({"error_code":"TOOL_EXECUTION_FAILED"}),
+                "failed",
+                "allowed",
+            ),
+        ];
+        for (success, content, expected_outcome, expected_permission) in cases {
+            let (outcome, permission, _, _) =
+                classify_persisted_tool_result(success, Some(&content));
+            assert_eq!(outcome, expected_outcome);
+            assert_eq!(permission, expected_permission);
+        }
+    }
 }
 
 #[cfg(test)]

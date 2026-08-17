@@ -43,28 +43,45 @@ impl ToolCategory {
         match tool_name {
             // Reconnaissance tools
             "http_request" | "http_probe" | "dns_lookup" | "web_crawl" | "web_fingerprint"
-            | "web_url_collect" | "js_collect"
-            | "nmap" | "nmap_scan" | "tcp_scan" | "masscan" | "naabu"
-            | "subfinder" | "amass" | "dnsx" | "dnsrecon" | "dnsenum" | "fierce"
+            | "web_url_collect" | "js_collect" | "nmap" | "nmap_scan" | "tcp_scan" | "masscan"
+            | "naabu" | "subfinder" | "amass" | "dnsx" | "dnsrecon" | "dnsenum" | "fierce"
             | "dmitry" | "theharvester" | "nikto" | "whatweb" | "wafw00f" | "wpscan"
-            | "web_wordpress_scan" | "whois" | "whois_lookup" | "tls_inspect"
-            | "testssl" | "web_tls_scan" | "sslyze" | "qsslcaudit" | "sslscan"
-            | "enum4linux" | "smbmap" | "smtp-user-enum" | "swaks" | "davtest"
-            | "nbtscan" | "netdiscover" | "lbd"
-            | "hakrawler" | "httrack" | "arjun" | "url_extract" | "url_grep"
-            => Self::Recon,
+            | "web_wordpress_scan" | "whois" | "whois_lookup" | "tls_inspect" | "testssl"
+            | "web_tls_scan" | "sslyze" | "qsslcaudit" | "sslscan" | "enum4linux" | "smbmap"
+            | "smtp-user-enum" | "swaks" | "davtest" | "nbtscan" | "netdiscover" | "lbd"
+            | "hakrawler" | "httrack" | "arjun" | "url_extract" | "url_grep" => Self::Recon,
             // Vulnerability validation tools
-            "dir_fuzz" | "js_analyze" | "file_upload_validate"
-            | "nuclei" | "web_vuln_scan"
-            | "sqli_validate" | "xss_validate" | "csrf_validate"
-            | "command_injection_validate" | "file_inclusion_validate"
-            | "sqlmap" | "sqlmap_scan" | "xsser" | "dalfox" | "web_xss_scan" | "commix"
-            | "afrog" | "wapiti" | "skipfish"
-            | "ffuf" | "gobuster" | "feroxbuster" | "wfuzz" | "dirsearch" | "dirb"
-            => Self::VulnValidation,
+            "dir_fuzz"
+            | "js_analyze"
+            | "file_upload_validate"
+            | "nuclei"
+            | "web_vuln_scan"
+            | "sqli_validate"
+            | "xss_validate"
+            | "csrf_validate"
+            | "command_injection_validate"
+            | "file_inclusion_validate"
+            | "sqlmap"
+            | "sqlmap_scan"
+            | "xsser"
+            | "dalfox"
+            | "web_xss_scan"
+            | "commix"
+            | "afrog"
+            | "wapiti"
+            | "skipfish"
+            | "ffuf"
+            | "gobuster"
+            | "feroxbuster"
+            | "wfuzz"
+            | "dirsearch"
+            | "dirb" => Self::VulnValidation,
             "knowledge_search" => Self::Knowledge,
-            "evidence_list" | "evidence_search" | "evidence_view"
-            | "query_execution_result" | "query-execution-result" => Self::EvidenceRead,
+            "evidence_list"
+            | "evidence_search"
+            | "evidence_view"
+            | "query_execution_result"
+            | "query-execution-result" => Self::EvidenceRead,
             _ => Self::Unknown,
         }
     }
@@ -117,13 +134,20 @@ impl ScanProgress {
         // Questions about findings (e.g. "就是说没有漏洞？") are
         // conversational follow-ups — the model should answer freely
         // without the strict tool/evidence completion gates.
-        let has_target = [
-            "http://", "https://",
-        ].iter().any(|p| normalized.contains(p));
+        let has_target = ["http://", "https://"]
+            .iter()
+            .any(|p| normalized.contains(p));
         let has_test_command = [
-            "扫描", "渗透", "安全测试", "复测",
-            "scan", "pentest", "vulnerability",
-        ].iter().any(|p| normalized.contains(p));
+            "扫描",
+            "渗透",
+            "安全测试",
+            "复测",
+            "scan",
+            "pentest",
+            "vulnerability",
+        ]
+        .iter()
+        .any(|p| normalized.contains(p));
         let security_objective = has_target || has_test_command;
         Self {
             security_objective,
@@ -645,15 +669,21 @@ mod tests {
     fn verified_claim_requires_known_evidence_reference() {
         let mut progress = ScanProgress::new("扫描 https://example.test");
         progress.record_tool_result(
-            "http_request", true, true,
+            "http_request",
+            true,
+            true,
             r#"{"status":200,"marker":"proof"}"#,
         );
         progress.record_tool_result(
-            "dir_fuzz", true, true,
+            "dir_fuzz",
+            true,
+            true,
             r#"{"findings":[{"path":"/admin"}]}"#,
         );
         progress.record_tool_result(
-            "nmap", true, true,
+            "nmap",
+            true,
+            true,
             r#"{"ports":[{"port":80,"state":"open"}]}"#,
         );
         let evidence = vec!["ev-123".to_string()];
@@ -796,7 +826,12 @@ mod tests {
         let mut progress = ScanProgress::new("扫描 https://example.test");
         progress.record_tool_result("http_request", true, true, r#"{"status":200}"#);
         progress.record_tool_result("dir_fuzz", true, true, r#"{"findings":[]}"#);
-        progress.record_tool_result("nmap", true, true, r#"{"ports":[{"port":80,"state":"open"}]}"#);
+        progress.record_tool_result(
+            "nmap",
+            true,
+            true,
+            r#"{"ports":[{"port":80,"state":"open"}]}"#,
+        );
         assert!(
             progress
                 .final_rejection("FINAL: no vulns found", &[])

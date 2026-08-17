@@ -449,8 +449,11 @@ async fn execute_sub_agent_inline_tool(
                     .map(|guides| serde_json::json!({"query":query,"guides":guides}))
             }
         }
-        "evidence_list" | "evidence_search" | "evidence_view"
-        | "query_execution_result" | "query-execution-result" => {
+        "evidence_list"
+        | "evidence_search"
+        | "evidence_view"
+        | "query_execution_result"
+        | "query-execution-result" => {
             repository
                 .execute_evidence_tool(run_id, tool_name, arguments)
                 .await

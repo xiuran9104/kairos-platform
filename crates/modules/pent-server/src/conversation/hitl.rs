@@ -225,8 +225,13 @@ impl HitlGate {
             HitlMode::Approval => policy.audit_system_prompt.trim(),
             HitlMode::ReviewEdit => policy.audit_user_prompt.trim(),
         };
-        let system = if custom_prompt.is_empty() { default_audit_system(policy.mode) } else { custom_prompt };
-        let parsed_arguments = serde_json::from_str::<Value>(args).unwrap_or_else(|_| Value::String(args.into()));
+        let system = if custom_prompt.is_empty() {
+            default_audit_system(policy.mode)
+        } else {
+            custom_prompt
+        };
+        let parsed_arguments =
+            serde_json::from_str::<Value>(args).unwrap_or_else(|_| Value::String(args.into()));
         let user = json!({"hitlMode":policy.mode.as_str(),"toolName":name,"arguments":args,"argumentsObj":parsed_arguments}).to_string();
         let response = AiModelFactory::new(self.pool.clone())
             .chat(
@@ -363,7 +368,10 @@ fn parse_audit_decision(content: &str, mode: HitlMode) -> anyhow::Result<AuditDe
         .trim();
     let mut value: AuditDecision = serde_json::from_str(trimmed)?;
     if value.arguments.is_none() {
-        value.arguments = value.edited_arguments.take().map(|arguments| arguments.to_string());
+        value.arguments = value
+            .edited_arguments
+            .take()
+            .map(|arguments| arguments.to_string());
     }
     value.decision = value.decision.trim().to_ascii_lowercase();
     if !matches!(value.decision.as_str(), "approve" | "reject") {
