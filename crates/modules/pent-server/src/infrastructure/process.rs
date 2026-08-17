@@ -169,13 +169,30 @@ pub(crate) fn inject_run_id_header(
 
 /// Execute a recipe from the model's structured JSON arguments using the
 /// DesRed-style `parameters` declarative mapping.
-pub async fn execute_tool_json(
+pub(crate) async fn execute_tool_json_direct(
     tool_name: &str,
     arguments: &serde_json::Value,
     limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
     let prepared = prepare_tool_from_json(tool_name, arguments, &limits.network_access)?;
     execute_prepared_tool(tool_name, &prepared, limits).await
+}
+
+/// Execute a structured recipe call through the global elastic executor when
+/// available, matching the scheduling path used by Run-mode tools.
+pub async fn execute_tool_json(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    limits: &ToolExecutionLimits,
+) -> Result<ToolOutput, String> {
+    let configured_limits = limits_with_recipe_profile(tool_name, limits);
+    if let Some(executor) = crate::infrastructure::execution::global_executor() {
+        executor
+            .execute_json(tool_name, arguments, &configured_limits)
+            .await
+    } else {
+        execute_tool_json_direct(tool_name, arguments, &configured_limits).await
+    }
 }
 
 async fn execute_prepared_tool(
@@ -407,11 +424,27 @@ pub async fn execute_tool(
     command: &[String],
     limits: &ToolExecutionLimits,
 ) -> Result<ToolOutput, String> {
+    let configured_limits = limits_with_recipe_profile(tool_name, limits);
     if let Some(executor) = crate::infrastructure::execution::global_executor() {
-        executor.execute(tool_name, command, limits).await
+        executor
+            .execute(tool_name, command, &configured_limits)
+            .await
     } else {
-        execute_tool_direct(tool_name, command, limits).await
+        execute_tool_direct(tool_name, command, &configured_limits).await
     }
+}
+
+fn limits_with_recipe_profile(
+    tool_name: &str,
+    limits: &ToolExecutionLimits,
+) -> ToolExecutionLimits {
+    let mut configured = limits.clone();
+    if let Some(recipe) = super::recipe::lookup(tool_name) {
+        configured.cpu_cores = recipe.resource_profile.cpu_cores.clamp(0.1, 16.0);
+        configured.memory_mb = recipe.resource_profile.memory_mb.clamp(32, 32_768);
+        configured.timeout_seconds = recipe.resource_profile.timeout_seconds.clamp(1, 3_600);
+    }
+    configured
 }
 
 fn execution_audit(limits: &ToolExecutionLimits, layout: &SandboxLayout) -> ToolExecutionAudit {

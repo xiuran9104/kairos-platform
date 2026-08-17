@@ -31,6 +31,10 @@ async fn main() -> anyhow::Result<()> {
     let database = connect(&DatabaseConfig::from_env()?).await?;
     ensure_initialized(&database).await?;
     let config = PentConfig::from_env();
+    let nats_bus = kairos_platform_pent_server::transport::mq::NatsEventBus::connect(
+        &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
+    )
+    .await;
     let mcp_registry = kairos_platform_pent_tooling::mcp::registry::shared().await;
     let worker_id = format!(
         "worker-{}-{}-{}",
@@ -54,6 +58,15 @@ async fn main() -> anyhow::Result<()> {
             kairos_platform_pent_server::infrastructure::execution::ElasticExecutor::from_env(),
         ),
     );
+    if let Err(error) =
+        kairos_platform_pent_server::transport::mq::spawn_conversation_tool_responder(
+            &nats_bus,
+            database.clone(),
+        )
+        .await
+    {
+        tracing::warn!(%error, "conversation tool responder unavailable");
+    }
 
     // Start the in-process MITM traffic-capture proxy when enabled.
     let _mitm_proxy =

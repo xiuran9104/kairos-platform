@@ -17,6 +17,7 @@
 | `WEB_PERMISSIVE_CORS` | 否 | `false` | 开发调试跨域开关，设为 `true`/`1`/`yes` 时允许任意来源 |
 | `REDIS_URL` | 否 | 无 | 不配置时缓存和限流自动关闭 |
 | `REDIS_KEY_PREFIX` | 否 | `kairos-platform` | Redis 键前缀 |
+| `NATS_URL` | Pent 必填 | `nats://localhost:4222` | Gateway 与 pent-agent 共用；对话 recipe 工具通过该通道委派给 pent-agent |
 | `BOOTSTRAP_ADMIN_USERNAME` | 否 | `admin` | 初始管理员用户名 |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 否 | 无 | 不配置时跳过管理员初始化 |
 | `RUST_LOG` | 否 | 框架默认 | tracing 日志过滤规则 |
@@ -28,6 +29,7 @@
 ## Pent 本地工具执行
 
 Pent 的主动检测工具统一在 pent-agent 宿主机通过 bubblewrap 执行，不使用 Docker/OCI 工具镜像或容器执行器。
+Run 与对话中的 recipe 工具均由 pent-agent 执行；Gateway 不安装或启动安全工具。没有可用 worker 时，对话调用会在约 2 秒内失败。
 Docker Compose 仍只用于 PostgreSQL、Redis、NATS、MinIO、Neo4j、Graphiti、
 headless Chrome 和 mitmproxy 等本地基础设施。
 

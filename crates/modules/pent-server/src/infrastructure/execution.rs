@@ -328,6 +328,32 @@ impl ElasticExecutor {
         self.collect(&id).await
     }
 
+    /// Execute a structured recipe call with the same per-tool concurrency
+    /// and circuit-breaker policy used by positional Run-mode calls.
+    pub async fn execute_json(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        limits: &ToolExecutionLimits,
+    ) -> Result<ToolOutput, String> {
+        self.breaker.check(tool_name).await?;
+        let semaphore = self.registry.semaphore(tool_name).await;
+        let _permit = semaphore
+            .acquire()
+            .await
+            .map_err(|error| format!("concurrency semaphore closed: {error}"))?;
+        match super::process::execute_tool_json_direct(tool_name, arguments, limits).await {
+            Ok(output) => {
+                self.breaker.record_success(tool_name).await;
+                Ok(output)
+            }
+            Err(error) => {
+                self.breaker.record_failure(tool_name).await;
+                Err(error)
+            }
+        }
+    }
+
     /// Start a tool execution asynchronously, returning its id immediately.
     /// The caller may poll `collect` or `ExecutionRegistry::state` in later
     /// turns instead of blocking the current agent turn.

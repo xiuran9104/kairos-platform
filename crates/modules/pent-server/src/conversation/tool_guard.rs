@@ -17,7 +17,10 @@ pub(super) fn validate_tool_scope(
     arguments: &str,
     scope_snapshot: &Value,
 ) -> Result<(), String> {
-    if !NETWORK_TOOLS.contains(&tool_name) {
+    let recipe_is_network = crate::infrastructure::recipe::lookup(tool_name).is_some_and(|recipe| {
+        recipe.target_type == crate::infrastructure::recipe::TargetType::Network
+    });
+    if !NETWORK_TOOLS.contains(&tool_name) && !recipe_is_network {
         return Ok(());
     }
     if scope_snapshot.get("confirmed_at").is_none()

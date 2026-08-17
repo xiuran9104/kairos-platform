@@ -45,6 +45,11 @@ async fn main() -> anyhow::Result<()> {
         &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
     )
     .await;
+    if let Err(error) = kairos_platform_pent_server::transport::mq::init_conversation_tool_bus(
+        nats_bus.handle(),
+    ) {
+        tracing::warn!(%error, "conversation recipe tools unavailable");
+    }
     let pent_state =
         kairos_platform_pent_server::PentState::new(database.clone()).with_nats(nats_bus.handle());
     system_state.bootstrap().await?;

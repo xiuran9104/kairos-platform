@@ -353,7 +353,7 @@ impl ConversationRepository for PgConversationRepository {
         let arguments = serde_json::from_str::<serde_json::Value>(arguments)
             .unwrap_or_else(|_| serde_json::json!({"invalid_arguments": true}));
         let content_value = serde_json::from_str::<serde_json::Value>(content).ok();
-        let executor_backend = if content_value
+        let fallback_backend = if content_value
             .as_ref()
             .and_then(|value| value.get("blocked"))
             .and_then(serde_json::Value::as_bool)
@@ -365,32 +365,66 @@ impl ConversationRepository for PgConversationRepository {
         } else {
             "host"
         };
+        let executor_backend = content_value
+            .as_ref()
+            .and_then(|value| value.get("execution_audit"))
+            .and_then(|value| value.get("backend"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(fallback_backend)
+            .to_owned();
         let hash = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+        let mut execution_audit = content_value
+            .as_ref()
+            .and_then(|value| value.get("execution_audit"))
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "backend": &executor_backend,
+                    "successful_observation": success,
+                    "semantic_fingerprint": super::scan_progress::semantic_result_fingerprint(
+                        tool_name,
+                        content
+                    )
+                })
+            });
+        if let Some(audit) = execution_audit.as_object_mut() {
+            audit.insert("successful_observation".into(), success.into());
+            audit.insert(
+                "semantic_fingerprint".into(),
+                super::scan_progress::semantic_result_fingerprint(tool_name, content).into(),
+            );
+        }
+        let exit_code = content_value
+            .as_ref()
+            .and_then(|value| value.get("exit_code"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(if success { 0 } else { 1 });
+        let network_policy = execution_audit
+            .get("network_policy")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO pent_tool_calls(
                  id,run_id,tool_name,params_summary,permission_decision,
-                 started_at,completed_at,duration_ms,exit_code,executor_backend,execution_audit
-             ) VALUES($1,$2,$3,$4,'allowed',now(),now(),$5,$6,$7,$8)
+                 started_at,completed_at,duration_ms,exit_code,executor_backend,
+                 network_policy,execution_audit
+             ) VALUES($1,$2,$3,$4,'allowed',now(),now(),$5,$6,$7,$8,$9)
              ON CONFLICT(id) DO UPDATE SET
                  completed_at=now(),duration_ms=excluded.duration_ms,
-                 exit_code=excluded.exit_code,execution_audit=excluded.execution_audit",
+                 exit_code=excluded.exit_code,network_policy=excluded.network_policy,
+                 execution_audit=excluded.execution_audit",
         )
         .bind(tool_call_id)
         .bind(run_id)
         .bind(tool_name)
         .bind(redact_arguments(arguments.clone()))
         .bind(i64::try_from(duration_ms).unwrap_or(i64::MAX))
-        .bind(if success { 0 } else { 1 })
-        .bind(executor_backend)
-        .bind(serde_json::json!({
-            "backend": executor_backend,
-            "successful_observation": success,
-            "semantic_fingerprint": super::scan_progress::semantic_result_fingerprint(
-                tool_name,
-                content
-            )
-        }))
+        .bind(exit_code)
+        .bind(&executor_backend)
+        .bind(network_policy)
+        .bind(execution_audit)
         .execute(&mut *tx)
         .await?;
         sqlx::query(

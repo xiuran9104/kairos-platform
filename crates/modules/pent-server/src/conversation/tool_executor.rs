@@ -238,7 +238,14 @@ pub async fn execute_tool(
             // through the sandboxed host executor with scope-derived policy.
             if let Some(recipe) = crate::infrastructure::recipe::lookup(other) {
                 if !recipe.parameters.is_empty() {
-                    return execute_recipe_tool(other, arguments, scope_snapshot).await;
+                    return execute_recipe_tool(
+                        other,
+                        arguments,
+                        scope_snapshot,
+                        session_id,
+                        run_id,
+                    )
+                    .await;
                 }
             }
             ConversationToolResult {
@@ -260,30 +267,53 @@ async fn execute_recipe_tool(
     name: &str,
     arguments: &str,
     scope_snapshot: &serde_json::Value,
+    session_id: &str,
+    run_id: Option<&str>,
 ) -> ConversationToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
         Err(error) => return tool_error(name, format!("参数解析失败: {error}")),
     };
-    let policy = crate::infrastructure::process::NetworkPolicy::derive_from_scope(scope_snapshot);
-    let limits = crate::infrastructure::process::ToolExecutionLimits {
-        timeout_seconds: 300,
-        network_access: policy,
-        ..Default::default()
+    let Some(bus) = crate::transport::mq::conversation_tool_bus() else {
+        return tool_error(
+            name,
+            "pent-agent 工具执行通道不可用；请检查 NATS 和 pent-agent 状态",
+        );
     };
-    match crate::infrastructure::process::execute_tool_json(name, &args, &limits).await {
-        Ok(output) => ConversationToolResult {
-            tool_call_id: String::new(),
-            tool_name: name.into(),
-            content: serde_json::json!({
-                "stdout": output.stdout,
-                "stderr": output.stderr,
-                "exit_code": output.exit_code,
-                "duration_ms": output.duration_ms,
-            })
-            .to_string(),
-            success: output.exit_code == 0,
-        },
+    let request = crate::transport::mq::RemoteToolExecutionRequest {
+        execution_id: uuid::Uuid::new_v4().to_string(),
+        tool_name: name.to_string(),
+        arguments: args,
+        scope_snapshot: scope_snapshot.clone(),
+        session_id: session_id.to_string(),
+        run_id: run_id.map(ToOwned::to_owned),
+        timeout_seconds: crate::infrastructure::recipe::lookup(name)
+            .map(|recipe| recipe.resource_profile.timeout_seconds)
+            .unwrap_or(300),
+    };
+    match bus.request_tool_execution(&request).await {
+        Ok(response) if response.error.is_some() => {
+            tool_error(name, response.error.unwrap_or_default())
+        }
+        Ok(response) if response.output.is_none() => {
+            tool_error(name, "pent-agent 返回了空执行结果")
+        }
+        Ok(response) => {
+            let output = response.output.expect("checked above");
+            ConversationToolResult {
+                tool_call_id: String::new(),
+                tool_name: name.into(),
+                content: serde_json::json!({
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                    "exit_code": output.exit_code,
+                    "duration_ms": output.duration_ms,
+                    "execution_audit": output.audit,
+                })
+                .to_string(),
+                success: output.exit_code == 0,
+            }
+        }
         Err(error) => tool_error(name, error),
     }
 }

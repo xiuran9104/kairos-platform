@@ -146,7 +146,7 @@ pub enum TargetType {
     File,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RecipeResourceProfile {
     #[serde(default = "default_cpu_cores")]
     pub cpu_cores: f64,
@@ -154,6 +154,16 @@ pub struct RecipeResourceProfile {
     pub memory_mb: u64,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+}
+
+impl Default for RecipeResourceProfile {
+    fn default() -> Self {
+        Self {
+            cpu_cores: default_cpu_cores(),
+            memory_mb: default_memory_mb(),
+            timeout_seconds: default_timeout_seconds(),
+        }
+    }
 }
 
 fn default_version() -> String {
@@ -342,6 +352,7 @@ pub struct ExecutableRecipe {
     pub normalize_target: NormalizeTarget,
     pub target_type: TargetType,
     pub parameters: Vec<ParameterConfig>,
+    pub resource_profile: RecipeResourceProfile,
 }
 
 impl ExecutableRecipe {
@@ -353,14 +364,17 @@ impl ExecutableRecipe {
         if recipe.executor.args.is_empty() && recipe.parameters.is_empty() {
             return None;
         }
-        Some(Self::new(
-            program,
-            recipe.executor.args.clone(),
-            recipe.executor.target_position,
-            recipe.executor.normalize_target,
-            recipe.executor.target_type,
-            recipe.parameters.clone(),
-        ))
+        Some(
+            Self::new(
+                program,
+                recipe.executor.args.clone(),
+                recipe.executor.target_position,
+                recipe.executor.normalize_target,
+                recipe.executor.target_type,
+                recipe.parameters.clone(),
+            )
+            .with_resource_profile(recipe.resource_profile.clone()),
+        )
     }
 
     fn new(
@@ -381,7 +395,13 @@ impl ExecutableRecipe {
             normalize_target,
             target_type,
             parameters,
+            resource_profile: RecipeResourceProfile::default(),
         }
+    }
+
+    pub fn with_resource_profile(mut self, profile: RecipeResourceProfile) -> Self {
+        self.resource_profile = profile;
+        self
     }
 
     /// Build an executable recipe from a `pent_tool_definitions.executor` JSON
@@ -460,8 +480,8 @@ pub fn has_executable(tool_name: &str) -> bool {
 pub async fn load_from_db(
     pool: &kairos_platform_framework_database::PgPool,
 ) -> anyhow::Result<usize> {
-    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-        "SELECT tool_id, executor FROM pent_tool_definitions
+    let rows: Vec<(String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
+        "SELECT tool_id, executor, resource_profile FROM pent_tool_definitions
          WHERE lifecycle_status = 'active'
            AND executor ? 'args'
            AND executor ? 'command'",
@@ -469,8 +489,10 @@ pub async fn load_from_db(
     .fetch_all(pool)
     .await?;
     let mut recipes = HashMap::new();
-    for (tool_id, executor) in rows {
+    for (tool_id, executor, resource_profile) in rows {
         if let Some(recipe) = ExecutableRecipe::from_executor_json(&executor) {
+            let profile = serde_json::from_value(resource_profile).unwrap_or_default();
+            let recipe = recipe.with_resource_profile(profile);
             recipes.insert(tool_id, recipe);
         }
     }
@@ -811,6 +833,20 @@ mod tests {
             embedding_document: String::new(),
             parameters: vec![],
         }
+    }
+
+    #[test]
+    fn executable_recipe_keeps_resource_profile() {
+        let mut recipe = sample_recipe();
+        recipe.resource_profile = RecipeResourceProfile {
+            cpu_cores: 2.0,
+            memory_mb: 768,
+            timeout_seconds: 900,
+        };
+        let executable = ExecutableRecipe::from_recipe(&recipe).unwrap();
+        assert_eq!(executable.resource_profile.cpu_cores, 2.0);
+        assert_eq!(executable.resource_profile.memory_mb, 768);
+        assert_eq!(executable.resource_profile.timeout_seconds, 900);
     }
 
     #[test]
