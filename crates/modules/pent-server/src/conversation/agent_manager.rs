@@ -350,6 +350,7 @@ impl AgentSchedulerEventSink for ServerAgentSchedulerEventSink {
                         .unwrap_or_default()
                         .to_string(),
                     completed_at: None,
+                    collected: false,
                 };
                 let request = serde_json::from_value(payload["request"].clone())?;
                 Ok(RecoveredAgent { state, request })

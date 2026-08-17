@@ -202,6 +202,7 @@ impl AgentScheduler {
             error: None,
             started_at: chrono::Utc::now().to_rfc3339(),
             completed_at: None,
+            collected: false,
         };
 
         {
@@ -385,12 +386,15 @@ impl AgentScheduler {
             let notified = self.changed.notified();
             match self.status(agent_id).await {
                 Some(agent) if agent.status == RuntimeAgentStatus::Completed => {
+                    self.mark_collected(agent_id).await;
                     return agent.result;
                 }
                 Some(agent) if agent.status == RuntimeAgentStatus::Failed => {
+                    self.mark_collected(agent_id).await;
                     return agent.error.map(|error| format!("子代理执行失败: {error}"));
                 }
                 Some(agent) if agent.status == RuntimeAgentStatus::Cancelled => {
+                    self.mark_collected(agent_id).await;
                     return agent.error.or_else(|| Some("子代理已取消".into()));
                 }
                 None => return Some("子代理不存在".into()),
@@ -399,6 +403,12 @@ impl AgentScheduler {
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 return Some("等待子代理结果超时".into());
             }
+        }
+    }
+
+    async fn mark_collected(&self, agent_id: &str) {
+        if let Some(record) = self.state.lock().await.agents.get_mut(agent_id) {
+            record.state.collected = true;
         }
     }
 
@@ -553,6 +563,7 @@ mod tests {
             scheduler.status(&id).await.unwrap().status,
             RuntimeAgentStatus::Completed
         );
+        assert!(scheduler.status(&id).await.unwrap().collected);
     }
 
     #[tokio::test]
@@ -605,6 +616,7 @@ mod tests {
                         error: None,
                         started_at: chrono::Utc::now().to_rfc3339(),
                         completed_at: None,
+                        collected: false,
                     },
                     request: request(1),
                 }],

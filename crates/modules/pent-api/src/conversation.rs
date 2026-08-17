@@ -165,4 +165,6 @@ pub struct RuntimeSubAgent {
     pub error: Option<String>,
     pub started_at: String,
     pub completed_at: Option<String>,
+    #[serde(default)]
+    pub collected: bool,
 }

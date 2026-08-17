@@ -125,12 +125,51 @@ pub trait FindingRecorder: Send + Sync {
 pub trait PlanStore: Send + Sync {
     async fn exists(&self, run_id: &str) -> anyhow::Result<bool>;
     async fn has_executable_step(&self, run_id: &str) -> anyhow::Result<bool>;
+    /// Return a bounded lifecycle summary for completion gates. Adapters that
+    /// do not persist plans may keep the default during migration.
+    async fn progress(&self, _run_id: &str) -> anyhow::Result<Option<PlanProgress>> {
+        Ok(None)
+    }
+    async fn begin_action(
+        &self,
+        _run_id: &str,
+        _tool_name: &str,
+        _tool_call_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+    async fn finish_action(
+        &self,
+        _run_id: &str,
+        _node_id: &str,
+        _success: bool,
+        _evidence_ids: &[String],
+        _reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn execute(
         &self,
         run_id: &str,
         tool_name: &str,
         arguments: &str,
     ) -> anyhow::Result<serde_json::Value>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanProgress {
+    pub total: usize,
+    pub pending: usize,
+    pub active: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub blocked: usize,
+}
+
+impl PlanProgress {
+    pub fn is_complete(&self) -> bool {
+        self.total > 0 && self.pending == 0 && self.active == 0 && self.blocked == 0
+    }
 }
 
 #[derive(Debug, Clone)]

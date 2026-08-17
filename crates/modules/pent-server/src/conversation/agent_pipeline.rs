@@ -1,5 +1,7 @@
 //! Provider-independent Agent middleware pipeline inspired by DesRed/Eino.
 
+use kairos_platform_pent_api::{RuntimeAgentStatus, RuntimeSubAgent};
+use kairos_platform_pent_runtime::ports::PlanProgress;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +97,39 @@ pub fn is_transient_model_error(error: &anyhow::Error) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+pub fn plan_completion_rejection(progress: &PlanProgress) -> Option<String> {
+    (!progress.is_complete()).then(|| format!(
+        "计划尚未收敛：总计 {}，待执行 {}，进行中 {}，阻塞 {}；请继续执行或显式更新步骤状态",
+        progress.total, progress.pending, progress.active, progress.blocked
+    ))
+}
+
+pub fn supervisor_completion_rejection(agents: &[RuntimeSubAgent]) -> Option<String> {
+    if agents.is_empty() {
+        return Some("supervisor 尚未委派任何专业子代理".into());
+    }
+    let running = agents
+        .iter()
+        .filter(|agent| agent.status == RuntimeAgentStatus::Running)
+        .count();
+    if running > 0 {
+        return Some(format!("仍有 {running} 个子代理运行中，请先 agent_collect"));
+    }
+    if !agents
+        .iter()
+        .any(|agent| agent.status == RuntimeAgentStatus::Completed)
+    {
+        return Some("所有子代理均未成功完成，请重新委派或说明 NO_PATH".into());
+    }
+    let uncollected = agents.iter().filter(|agent| !agent.collected).count();
+    if uncollected > 0 {
+        return Some(format!(
+            "仍有 {uncollected} 个子代理结果未收集，请逐一调用 agent_collect 后再汇总"
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +155,52 @@ mod tests {
             "multi_agent": {"multi_agent_enabled": true}
         })));
         assert!(multi_agent_enabled(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn plan_completion_requires_terminal_steps() {
+        assert!(
+            plan_completion_rejection(&PlanProgress {
+                total: 2,
+                completed: 1,
+                active: 1,
+                ..Default::default()
+            })
+            .is_some()
+        );
+        assert!(
+            plan_completion_rejection(&PlanProgress {
+                total: 2,
+                completed: 1,
+                failed: 1,
+                ..Default::default()
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn supervisor_completion_requires_successful_settled_delegate() {
+        let agent = |status| RuntimeSubAgent {
+            collected: status == RuntimeAgentStatus::Completed,
+            agent_id: "agent-1".into(),
+            description: "test".into(),
+            status,
+            result: None,
+            error: None,
+            started_at: "now".into(),
+            completed_at: None,
+        };
+        assert!(supervisor_completion_rejection(&[]).is_some());
+        assert!(
+            supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Running)]).is_some()
+        );
+        assert!(supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Failed)]).is_some());
+        assert!(
+            supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Completed)]).is_none()
+        );
+        let mut uncollected = agent(RuntimeAgentStatus::Completed);
+        uncollected.collected = false;
+        assert!(supervisor_completion_rejection(&[uncollected]).is_some());
     }
 }

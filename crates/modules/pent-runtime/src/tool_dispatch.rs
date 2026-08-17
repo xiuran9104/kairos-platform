@@ -17,6 +17,9 @@ pub struct ToolDispatchPolicy {
     pub plan_required: bool,
     /// A persisted plan exists but currently has no ready/running step.
     pub plan_step_blocked: bool,
+    /// Plan-Execute advances one observable action at a time. Plan board
+    /// inspection/update calls do not consume the action slot.
+    pub single_operational_action: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +75,10 @@ impl<'a> ToolDispatcher<'a> {
                 .map(|call| prepare_call(call, &context.policy))
                 .collect(),
         };
+
+        if context.policy.single_operational_action {
+            enforce_single_operational_action(calls, &mut plan);
+        }
 
         let Some(run_id) = context.run_id.as_deref() else {
             return plan;
@@ -193,6 +200,27 @@ fn is_agent_management_tool(tool_name: &str) -> bool {
     )
 }
 
+fn is_plan_management_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "plan_create" | "plan_get" | "plan_update")
+}
+
+fn enforce_single_operational_action(calls: &[ModelToolCall], plan: &mut ToolDispatchPlan) {
+    let mut seen = false;
+    for (call, decision) in calls.iter().zip(plan.decisions.iter_mut()) {
+        if is_plan_management_tool(&call.name) || decision.blocked.is_some() {
+            continue;
+        }
+        if seen {
+            decision.blocked = Some(
+                "plan_execute 每轮只允许执行一个计划动作；请等待本步结果后再重排或推进"
+                    .into(),
+            );
+        } else {
+            seen = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,12 +253,36 @@ mod tests {
             agent_management_only: true,
             plan_required: false,
             plan_step_blocked: false,
+            single_operational_action: false,
         };
         let mut scan = call("nmap", "{}", ToolExecutionClass::ReadOnly);
         let mut spawn = call("agent_spawn", "{}", ToolExecutionClass::Inline);
 
         assert!(prepare_call(&mut scan, &policy).blocked.is_some());
         assert!(prepare_call(&mut spawn, &policy).blocked.is_none());
+    }
+
+    #[test]
+    fn plan_execute_allows_only_one_operational_action_per_round() {
+        let policy = ToolDispatchPolicy {
+            single_operational_action: true,
+            ..Default::default()
+        };
+        let mut calls = vec![
+            call("plan_get", "{}", ToolExecutionClass::Inline),
+            call("nmap", "{}", ToolExecutionClass::ReadOnly),
+            call("nuclei", "{}", ToolExecutionClass::ReadOnly),
+        ];
+        let mut plan = ToolDispatchPlan {
+            decisions: calls
+                .iter_mut()
+                .map(|call| prepare_call(call, &policy))
+                .collect(),
+        };
+        enforce_single_operational_action(&calls, &mut plan);
+        assert!(plan.decisions[0].blocked.is_none());
+        assert!(plan.decisions[1].blocked.is_none());
+        assert!(plan.decisions[2].blocked.is_some());
     }
 
     #[test]

@@ -415,6 +415,8 @@ impl ConversationRuntime {
                                 == super::agent_pipeline::OrchestrationMode::Supervisor,
                             plan_required,
                             plan_step_blocked,
+                            single_operational_action: orchestration
+                                == super::agent_pipeline::OrchestrationMode::PlanExecute,
                         },
                     },
                 )
@@ -528,6 +530,28 @@ impl ConversationRuntime {
                 session_id: session_id.to_string(),
                 run_id: context.run_id.clone(),
             };
+            let plan_action = if orchestration
+                == super::agent_pipeline::OrchestrationMode::PlanExecute
+            {
+                if let Some(run_id) = context.run_id.as_deref() {
+                    let action_call = output.tool_calls[..allowed_calls].iter().find(|call| {
+                        !matches!(call.name.as_str(), "plan_create" | "plan_get" | "plan_update")
+                            && dispatch_plan.blocked_reason(&call.id).is_none()
+                    });
+                    if let Some(call) = action_call {
+                        self.plan_store
+                            .begin_action(run_id, &call.name, &call.id)
+                            .await?
+                            .map(|node_id| (node_id, call.id.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let tool_results = ToolExecutionCoordinator::from_env(self.tool_executor.clone())
                 .execute(
                     &output.tool_calls[..allowed_calls],
@@ -539,6 +563,9 @@ impl ConversationRuntime {
 
             // ── Track unreachable targets for diagnostic ──
             let mut unreachable_targets: Vec<String> = Vec::new();
+            let mut plan_action_success = true;
+            let mut plan_action_evidence = Vec::new();
+            let mut plan_action_error: Option<String> = None;
 
             // ── Phase 3: process all results (SSE + evidence + traffic + summary) ──
             for item in &tool_results {
@@ -562,6 +589,15 @@ impl ConversationRuntime {
                     )
                     .await?;
                 let succeeded = processed.succeeded;
+                if plan_action
+                    .as_ref()
+                    .is_some_and(|(_, call_id)| call_id == &item.call_id)
+                {
+                    plan_action_success = succeeded;
+                    if !succeeded {
+                        plan_action_error = Some(result.content.chars().take(500).collect());
+                    }
+                }
                 // Detect unreachable targets so the model doesn't retry dead hosts
                 if !succeeded && is_unreachable_error(&result.content) {
                     if let Some(target) = extract_target_from_content(&result.content) {
@@ -589,6 +625,12 @@ impl ConversationRuntime {
                 if let Some(eid) = evidence_id.as_ref() {
                     evidence_ids.push(eid.clone());
                     scan_progress.record_evidence_tool(&eid, tool_name);
+                    if plan_action
+                        .as_ref()
+                        .is_some_and(|(_, action_call_id)| action_call_id == call_id)
+                    {
+                        plan_action_evidence.push(eid.clone());
+                    }
                 }
                 append_run_summary(
                     run_summary,
@@ -599,6 +641,19 @@ impl ConversationRuntime {
                     &result.content,
                 );
                 context.recent_messages.push(processed.model_message);
+            }
+            if let (Some(run_id), Some((node_id, _))) =
+                (context.run_id.as_deref(), plan_action.as_ref())
+            {
+                self.plan_store
+                    .finish_action(
+                        run_id,
+                        node_id,
+                        plan_action_success,
+                        &plan_action_evidence,
+                        plan_action_error.as_deref(),
+                    )
+                    .await?;
             }
             if runner.stop_reason().is_some() {
                 return Ok(AgentRoundOutcome::Continue);
@@ -729,6 +784,27 @@ impl ConversationRuntime {
                 return Ok(AgentRoundOutcome::Continue);
             }
             AgentDirective::Final(candidate) | AgentDirective::Candidate(candidate) => {
+                let orchestration_rejection = if super::agent_pipeline::multi_agent_enabled(
+                    &context.policy_snapshot,
+                ) {
+                    self.orchestration_completion_rejection(
+                        orchestration,
+                        context.run_id.as_deref(),
+                        agent_session,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if let Some(rejection) = orchestration_rejection {
+                    push_gate_rejection(
+                        context,
+                        round,
+                        &output.content,
+                        &format!("FINAL 被拒绝：{rejection}"),
+                    );
+                    return Ok(AgentRoundOutcome::Continue);
+                }
                 if let Some(rejection) = scan_progress.final_rejection(&candidate, &evidence_ids) {
                     push_gate_rejection(
                         context,
@@ -793,6 +869,30 @@ impl ConversationRuntime {
             }
         }
         Ok(AgentRoundOutcome::Complete(output))
+    }
+
+    async fn orchestration_completion_rejection(
+        &self,
+        orchestration: super::agent_pipeline::OrchestrationMode,
+        run_id: Option<&str>,
+        agent_session: &Arc<dyn AgentSession>,
+    ) -> anyhow::Result<Option<String>> {
+        match orchestration {
+            super::agent_pipeline::OrchestrationMode::Deep => Ok(None),
+            super::agent_pipeline::OrchestrationMode::PlanExecute => {
+                let Some(run_id) = run_id else {
+                    return Ok(Some("plan_execute 缺少可持久化的 Run".into()));
+                };
+                let Some(progress) = self.plan_store.progress(run_id).await? else {
+                    return Ok(Some("尚未创建执行计划，请先调用 plan_create".into()));
+                };
+                Ok(super::agent_pipeline::plan_completion_rejection(&progress))
+            }
+            super::agent_pipeline::OrchestrationMode::Supervisor => {
+                let agents = agent_session.list().await;
+                Ok(super::agent_pipeline::supervisor_completion_rejection(&agents))
+            }
+        }
     }
 
     pub fn new(
