@@ -76,11 +76,15 @@ pub fn is_transient_model_error(error: &anyhow::Error) -> bool {
         "connection reset",
         "connection refused",
         "connection closed",
+        "closed connection",
+        "peer closed",
+        "close_notify",
         "i/o timeout",
         "network is unreachable",
         "broken pipe",
         "tls handshake timeout",
         "unexpected eof",
+        "unexpectedeof",
         "stream error",
         "http 500",
         "http 502",
@@ -98,6 +102,9 @@ mod tests {
     fn classifies_retryable_errors() {
         assert!(is_transient_model_error(&anyhow::anyhow!(
             "HTTP 503 service unavailable"
+        )));
+        assert!(is_transient_model_error(&anyhow::anyhow!(
+            "读取模型响应失败: reqwest UnexpectedEof: peer closed connection without sending TLS close_notify"
         )));
         assert!(!is_transient_model_error(&anyhow::anyhow!(
             "HTTP 401 invalid api key"
