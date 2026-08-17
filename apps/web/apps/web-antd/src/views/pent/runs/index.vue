@@ -12,6 +12,7 @@ import {
   getPentRunFindings,
   getPentRunPlan,
   getPentRunToolCalls,
+  getPentToolCallResult,
   getPentRunTraffic,
   getPentRuns,
   getPentTasks,
@@ -64,6 +65,34 @@ const toolCalls = ref<any[]>([]);
 const traffic = ref<any[]>([]);
 const findings = ref<any[]>([]);
 const plan = ref<any>({ nodes: [] });
+const resultVisible = ref(false);
+const resultLoading = ref(false);
+const selectedToolCall = ref<any>(null);
+const executionResult = ref<any>({ lines: [], page: 1, limit: 100, total_lines: 0 });
+const resultSearch = ref('');
+
+async function loadToolResult(page = 1) {
+  if (!detailRun.value?.id || !selectedToolCall.value?.id) return;
+  resultLoading.value = true;
+  try {
+    executionResult.value = await getPentToolCallResult(
+      detailRun.value.id,
+      selectedToolCall.value.id,
+      { page, limit: 100, search: resultSearch.value || undefined },
+    );
+  } catch (error: any) {
+    message.error(error?.message || '加载工具结果失败');
+  } finally {
+    resultLoading.value = false;
+  }
+}
+
+async function showToolResult(call: any) {
+  selectedToolCall.value = call;
+  resultSearch.value = '';
+  resultVisible.value = true;
+  await loadToolResult(1);
+}
 
 const statusColor: Record<string, string> = {
   queued: 'default',
@@ -488,6 +517,9 @@ const columns = [
                       <a-tag :color="call.exit_code === 0 ? 'success' : 'error'">
                         {{ call.exit_code === 0 ? '成功' : `退出码 ${call.exit_code ?? '-'}` }}
                       </a-tag>
+                      <a-button type="link" size="small" @click="showToolResult(call)">
+                        查看执行结果
+                      </a-button>
                     </div>
                     <a-space v-if="executionAudit(call).backend" wrap style="margin: 6px 0">
                       <a-tag color="blue">{{ executionAudit(call).backend }}</a-tag>
@@ -561,6 +593,38 @@ const columns = [
           </a-tab-pane>
         </a-tabs>
       </template>
+    </a-modal>
+
+    <a-modal
+      v-model:open="resultVisible"
+      :title="`工具结果 · ${selectedToolCall?.tool_name || ''}`"
+      width="900px"
+      :footer="null"
+    >
+      <a-space style="width: 100%; margin-bottom: 12px">
+        <a-input-search
+          v-model:value="resultSearch"
+          allow-clear
+          placeholder="在执行结果中搜索"
+          style="width: 360px"
+          @search="loadToolResult(1)"
+        />
+        <a-tag>{{ executionResult.status || '-' }}</a-tag>
+        <span>共 {{ executionResult.total_lines || 0 }} 行</span>
+        <span v-if="executionResult.redacted">敏感信息已脱敏</span>
+      </a-space>
+      <a-spin :spinning="resultLoading">
+        <pre class="tool-result-content">{{ (executionResult.lines || []).join('\n') || '暂无持久化结果' }}</pre>
+        <a-pagination
+          v-if="executionResult.total_lines > executionResult.limit"
+          :current="executionResult.page"
+          :page-size="executionResult.limit"
+          :total="executionResult.total_lines"
+          :show-size-changer="false"
+          size="small"
+          @change="loadToolResult"
+        />
+      </a-spin>
     </a-modal>
 
     <a-modal v-model:open="createTaskVisible" title="新建任务" @ok="handleCreateTask" width="520px">
@@ -749,6 +813,18 @@ details pre {
 }
 .tool-call-row strong {
   margin-right: 8px;
+}
+.tool-result-content {
+  min-height: 240px;
+  max-height: 560px;
+  padding: 12px;
+  overflow: auto;
+  color: var(--ant-color-text);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--ant-color-fill-quaternary);
+  border-radius: 8px;
 }
 .traffic-list {
   display: flex;

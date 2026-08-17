@@ -124,6 +124,7 @@ pub trait FindingRecorder: Send + Sync {
 #[async_trait]
 pub trait PlanStore: Send + Sync {
     async fn exists(&self, run_id: &str) -> anyhow::Result<bool>;
+    async fn has_executable_step(&self, run_id: &str) -> anyhow::Result<bool>;
     async fn execute(
         &self,
         run_id: &str,
@@ -462,6 +463,10 @@ mod tests {
     #[async_trait]
     impl PlanStore for StubPlanStore {
         async fn exists(&self, _run_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn has_executable_step(&self, _run_id: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
 

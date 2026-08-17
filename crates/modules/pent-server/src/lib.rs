@@ -26,8 +26,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     middleware::from_fn,
-    response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
 };
 use kairos_platform_framework_common::ApiResponse;
 use kairos_platform_framework_database::PgPool;
@@ -89,6 +88,10 @@ pub fn routes(state: PentState) -> Router {
         .route("/pent/runs/{id}/resume", post(resume_run))
         .route("/pent/runs/{id}/events", get(get_run_events))
         .route("/pent/runs/{id}/tool-calls", get(get_tool_calls))
+        .route(
+            "/pent/runs/{run_id}/tool-calls/{execution_id}/result",
+            get(get_tool_call_result),
+        )
         .route("/pent/runs/{id}/plan", get(get_run_plan))
         // /pent/chat removed — was a demo stub with keyword-fixed replies
         .merge(tooling::http::routes())
@@ -970,6 +973,85 @@ async fn get_tool_calls(
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(rows)))
+}
+
+async fn get_tool_call_result(
+    State(s): State<PentState>,
+    Path((run_id, execution_id)): Path<(String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let page = params
+        .get("page")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let search = params.get("search").map(String::as_str).filter(|v| !v.is_empty());
+    let filter = params.get("filter").map(String::as_str).filter(|v| !v.is_empty());
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<i32>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT tc.tool_name,tc.exit_code,tc.completed_at::text,tc.duration_ms,e.id,e.source
+         FROM pent_tool_calls tc
+         JOIN pent_runs r ON r.id=tc.run_id
+         LEFT JOIN pent_evidence e ON e.tool_call_id=tc.id AND e.run_id=tc.run_id
+         WHERE tc.run_id=$1 AND tc.id=$2 AND r.tenant_id=$3 AND ($4 OR r.user_id=$5)
+         ORDER BY e.created_at DESC NULLS LAST LIMIT 1",
+    )
+    .bind(&run_id)
+    .bind(&execution_id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .ok_or_else(|| AppError::not_found("工具执行不存在或无权访问"))?;
+    let content = sanitize_sensitive_data(row.5.as_deref().unwrap_or_default());
+    let mut lines = content.lines().collect::<Vec<_>>();
+    if let Some(value) = filter {
+        lines.retain(|line| line.contains(value));
+    }
+    if let Some(value) = search {
+        lines.retain(|line| line.contains(value));
+    }
+    let total_lines = lines.len();
+    let total_pages = total_lines.div_ceil(limit);
+    let start = page.saturating_sub(1).saturating_mul(limit);
+    let lines = lines
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .collect::<Vec<_>>();
+    Ok(Json(ApiResponse::new(json!({
+        "execution_id": execution_id,
+        "tool_name": row.0,
+        "status": if row.2.is_none() { "running" } else if row.1 == Some(0) { "completed" } else { "failed" },
+        "exit_code": row.1,
+        "completed_at": row.2,
+        "duration_ms": row.3,
+        "evidence_id": row.4,
+        "page": page,
+        "limit": limit,
+        "total_lines": total_lines,
+        "total_pages": total_pages,
+        "lines": lines,
+        "redacted": true,
+    }))))
 }
 
 // ── Worker executor with AI agent and lease renewal ─────────────────────

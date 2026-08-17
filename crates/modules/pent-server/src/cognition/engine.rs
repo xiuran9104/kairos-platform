@@ -226,7 +226,7 @@ pub async fn execute_cognition_run_with_backend(
                         .map_err(|error| error.to_string())?;
                     match cycle.intervention {
                         MetaIntervention::Continue => {
-                            graph = apply_outcome_deltas(pool, &plans, current, &cycle).await?;
+                            apply_outcome_deltas(pool, &plans, current, &cycle).await?;
                             made_progress = true;
                         }
                         MetaIntervention::Stop
@@ -265,7 +265,7 @@ pub async fn execute_cognition_run_with_backend(
                                     }],
                                 )
                                 .await?;
-                                graph = apply_outcome_deltas(pool, &plans, graph, &cycle).await?;
+                                apply_outcome_deltas(pool, &plans, graph, &cycle).await?;
                                 made_progress = true;
                             }
                         }
@@ -567,12 +567,16 @@ async fn finish_completed(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL), MinIO and /usr/bin/nmap"]
     async fn cognition_engine_completes_run_end_to_end() {
         if !std::path::Path::new("/usr/bin/nmap").exists() {
             return;
         }
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        if std::env::var("MINIO_ENDPOINT").is_err() {
+            return;
+        }
         let config = kairos_platform_framework_database::DatabaseConfig::new(
             url,
             1,

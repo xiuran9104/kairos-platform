@@ -427,9 +427,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL)"]
     async fn published_skills_are_listed_and_loadable() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let config = kairos_platform_framework_database::DatabaseConfig::new(
             url,
             1,

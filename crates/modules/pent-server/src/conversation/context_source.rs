@@ -155,7 +155,7 @@ impl ConversationContextSource for PgContextSource {
                 }
                 None => None,
             };
-        if let Some((role_name, role_prompt, role_tools)) = &role {
+        if let Some((role_name, _role_prompt, role_tools)) = &role {
             policy_snapshot["_role"] = serde_json::json!({
                 "name": role_name,
                 "tool_whitelist": role_tools,

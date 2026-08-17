@@ -69,7 +69,6 @@ struct ToolCallRow {
 }
 
 struct HttpTrafficRow {
-    id: String,
     tool_call_id: Option<String>,
     method: String,
     url: String,
@@ -343,7 +342,6 @@ async fn load_evidence(pool: &PgPool, run_id: &str) -> Result<Vec<EvidenceRow>, 
 
 async fn load_http_traffic(pool: &PgPool, run_id: &str) -> Result<Vec<HttpTrafficRow>, String> {
     let rows: Vec<(
-        String,
         Option<String>,
         String,
         String,
@@ -353,7 +351,7 @@ async fn load_http_traffic(pool: &PgPool, run_id: &str) -> Result<Vec<HttpTraffi
         Option<String>,
         Option<i64>,
     )> = sqlx::query_as(
-        "SELECT id, tool_call_id, method, url, request_headers, request_body,
+        "SELECT tool_call_id, method, url, request_headers, request_body,
                 response_status, response_body, duration_ms
          FROM pent_http_traffic WHERE run_id=$1 ORDER BY created_at",
     )
@@ -365,7 +363,6 @@ async fn load_http_traffic(pool: &PgPool, run_id: &str) -> Result<Vec<HttpTraffi
         .into_iter()
         .map(
             |(
-                id,
                 tool_call_id,
                 method,
                 url,
@@ -375,7 +372,6 @@ async fn load_http_traffic(pool: &PgPool, run_id: &str) -> Result<Vec<HttpTraffi
                 response_body,
                 duration_ms,
             )| HttpTrafficRow {
-                id,
                 tool_call_id,
                 method,
                 url,
@@ -960,9 +956,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL) and MinIO"]
     async fn generates_and_stores_report_end_to_end() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        if std::env::var("MINIO_ENDPOINT").is_err() {
+            return;
+        }
         let config = kairos_platform_framework_database::DatabaseConfig::new(
             url,
             1,

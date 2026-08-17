@@ -253,6 +253,7 @@ fn execution_request(
             workspace_dir: limits.workspace_dir.clone(),
             artifact_dir: limits.artifact_dir.clone(),
             allowed_paths: limits.allowed_paths.clone(),
+            secret_environment: limits.secret_environment.clone(),
         },
     }
 }
@@ -533,6 +534,23 @@ mod tests {
             .unwrap();
         assert_eq!(output.stdout, "fake_tool");
         assert_eq!(output.audit.backend, "fake");
+    }
+
+    #[test]
+    fn elastic_request_keeps_secrets_local_and_redacted() {
+        let limits = ToolExecutionLimits {
+            secret_environment: super::super::process::SecretEnvironment::new(vec![(
+                "AWS_SECRET_ACCESS_KEY".into(),
+                "must-not-leak".into(),
+            )]),
+            ..Default::default()
+        };
+        let request = execution_request("prowler", &[], &limits);
+        assert_eq!(request.sandbox.secret_environment.len(), 1);
+        let serialized = serde_json::to_string(&request).unwrap();
+        let debug = format!("{request:?}");
+        assert!(!serialized.contains("must-not-leak"));
+        assert!(!debug.contains("must-not-leak"));
     }
 
     #[tokio::test]

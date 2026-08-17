@@ -63,7 +63,8 @@ impl ToolCategory {
             | "ffuf" | "gobuster" | "feroxbuster" | "wfuzz" | "dirsearch" | "dirb"
             => Self::VulnValidation,
             "knowledge_search" => Self::Knowledge,
-            "evidence_list" | "evidence_search" | "evidence_view" => Self::EvidenceRead,
+            "evidence_list" | "evidence_search" | "evidence_view"
+            | "query_execution_result" | "query-execution-result" => Self::EvidenceRead,
             _ => Self::Unknown,
         }
     }

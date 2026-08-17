@@ -22,6 +22,10 @@ impl PlanStore for PgPlanStore {
         exists(&self.pool, run_id).await
     }
 
+    async fn has_executable_step(&self, run_id: &str) -> anyhow::Result<bool> {
+        has_executable_step(&self.pool, run_id).await
+    }
+
     async fn execute(
         &self,
         run_id: &str,
@@ -78,6 +82,22 @@ pub async fn exists(pool: &PgPool, run_id: &str) -> anyhow::Result<bool> {
             .fetch_one(pool)
             .await?,
     )
+}
+
+pub async fn has_executable_step(pool: &PgPool, run_id: &str) -> anyhow::Result<bool> {
+    let graph: Option<Value> = sqlx::query_scalar(
+        "SELECT graph FROM pent_plan_versions WHERE run_id=$1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(graph
+        .and_then(|value| value.get("nodes").and_then(Value::as_array).cloned())
+        .is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                matches!(node.get("status").and_then(Value::as_str), Some("ready" | "running"))
+            })
+        }))
 }
 
 async fn create(pool: &PgPool, run_id: &str, args: &Value) -> anyhow::Result<Value> {
@@ -198,6 +218,7 @@ mod tests {
             .bind(&run_id).execute(&pool).await.unwrap();
         let created = create(&pool, &run_id, &json!({"objective":"test","steps":["recon","validate"]})).await.unwrap();
         assert_eq!(created["version"], 1);
+        assert!(has_executable_step(&pool, &run_id).await.unwrap());
         let updated = update(&pool, &run_id, &json!({"node_id":"step-1","status":"completed","reason":"evidence collected"})).await.unwrap();
         assert_eq!(updated["version"], 2);
         assert_eq!(updated["nodes"][1]["status"], "ready");

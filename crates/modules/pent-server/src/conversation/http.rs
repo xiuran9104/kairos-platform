@@ -59,15 +59,6 @@ async fn create_pent_task(
             ));
         }
     }
-    // ── M2-F11: Per-task LLM provider (task-level → project-level → default) ─
-    let model_config_id: Option<i64> = body
-        .get("model_config_id")
-        .and_then(|v| v.as_i64())
-        .filter(|&id| id > 0)
-        .or_else(|| {
-            // Fallback: project-level model binding (async lookup below)
-            None
-        });
     // Resolve project: explicit project_id or auto-create a default project
     let project_id = match body["project_id"].as_str() {
         Some(pid) => {

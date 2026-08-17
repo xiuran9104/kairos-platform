@@ -346,6 +346,50 @@ async fn execute_remote_tool_request(
         };
     }
     let profile = recipe.resource_profile;
+    let mut arguments = request.arguments;
+    let expected_provider = arguments
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let credential_required = recipe
+        .parameters
+        .iter()
+        .any(|parameter| {
+            parameter.runtime_only
+                && parameter.required
+                && parameter.name == "_credential_ref"
+        });
+    let credential_ref = arguments
+        .as_object_mut()
+        .and_then(|object| object.remove("_credential_ref"))
+        .and_then(|value| value.as_str().map(str::to_owned));
+    if credential_required && credential_ref.is_none() {
+        return RemoteToolExecutionResponse {
+            output: None,
+            error: Some("工具要求租户绑定的 _credential_ref".into()),
+        };
+    }
+    let secret_environment = match credential_ref {
+        Some(reference) => match crate::infrastructure::cloud_credentials::resolve_for_execution(
+            pool,
+            &reference,
+            &request.tool_name,
+            expected_provider.as_deref(),
+            request.run_id.as_deref(),
+            &request.session_id,
+        )
+        .await
+        {
+            Ok(environment) => environment,
+            Err(error) => {
+                return RemoteToolExecutionResponse {
+                    output: None,
+                    error: Some(error),
+                };
+            }
+        },
+        None => Default::default(),
+    };
     let artifact_run_id = request.run_id.clone();
     let limits = ToolExecutionLimits {
         cpu_cores: profile.cpu_cores.clamp(0.1, 16.0),
@@ -353,6 +397,7 @@ async fn execute_remote_tool_request(
         timeout_seconds: profile.timeout_seconds.clamp(1, 3_600),
         network_access: NetworkPolicy::derive_from_scope(&request.scope_snapshot),
         run_id: request.run_id,
+        secret_environment,
         ..Default::default()
     };
     let cancel_subject = subjects::tool_cancel(&request.execution_id);
@@ -368,7 +413,7 @@ async fn execute_remote_tool_request(
     let result = tokio::select! {
         result = crate::infrastructure::process::execute_tool_json(
             &request.tool_name,
-            &request.arguments,
+            &arguments,
             &limits,
         ) => result,
         _ = cancellations.next() => Err("工具执行已取消".to_string()),

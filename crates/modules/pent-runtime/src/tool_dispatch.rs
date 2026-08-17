@@ -15,6 +15,8 @@ pub const DEFAULT_MAX_SHELL_COMMAND_BYTES: usize = 64 * 1024;
 pub struct ToolDispatchPolicy {
     pub agent_management_only: bool,
     pub plan_required: bool,
+    /// A persisted plan exists but currently has no ready/running step.
+    pub plan_step_blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +134,12 @@ fn policy_rejection(tool_name: &str, policy: &ToolDispatchPolicy) -> Option<Stri
     if policy.plan_required && tool_name != "plan_create" {
         return Some("plan_execute 模式必须先调用 plan_create 创建持久化计划".into());
     }
+    if policy.plan_step_blocked && !matches!(tool_name, "plan_get" | "plan_update") {
+        return Some(
+            "plan_execute 模式当前没有 ready/running 步骤；请先用 plan_get 检查并通过 plan_update 重排计划"
+                .into(),
+        );
+    }
     None
 }
 
@@ -216,12 +224,28 @@ mod tests {
         let policy = ToolDispatchPolicy {
             agent_management_only: true,
             plan_required: false,
+            plan_step_blocked: false,
         };
         let mut scan = call("nmap", "{}", ToolExecutionClass::ReadOnly);
         let mut spawn = call("agent_spawn", "{}", ToolExecutionClass::Inline);
 
         assert!(prepare_call(&mut scan, &policy).blocked.is_some());
         assert!(prepare_call(&mut spawn, &policy).blocked.is_none());
+    }
+
+    #[test]
+    fn plan_execute_blocks_tools_without_an_executable_step() {
+        let policy = ToolDispatchPolicy {
+            plan_step_blocked: true,
+            ..Default::default()
+        };
+        let mut scan = call("nmap", "{}", ToolExecutionClass::ReadOnly);
+        let mut inspect = call("plan_get", "{}", ToolExecutionClass::Inline);
+        let mut replan = call("plan_update", "{}", ToolExecutionClass::Inline);
+
+        assert!(prepare_call(&mut scan, &policy).blocked.is_some());
+        assert!(prepare_call(&mut inspect, &policy).blocked.is_none());
+        assert!(prepare_call(&mut replan, &policy).blocked.is_none());
     }
 
     #[test]

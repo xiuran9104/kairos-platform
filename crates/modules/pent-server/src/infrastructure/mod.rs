@@ -1,4 +1,5 @@
 pub mod cgroup;
+pub mod cloud_credentials;
 pub mod embedding;
 pub mod execution;
 pub mod knowledge;

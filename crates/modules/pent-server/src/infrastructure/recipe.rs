@@ -93,6 +93,10 @@ pub struct ParameterConfig {
     pub template: Option<String>,
     #[serde(default)]
     pub options: Vec<String>,
+    /// Accepted in the public input schema but consumed by the worker before
+    /// command rendering (for example an opaque cloud credential reference).
+    #[serde(default)]
+    pub runtime_only: bool,
     /// Marks the parameter that carries the network target (scope-validated).
     #[serde(default)]
     pub target: bool,
@@ -323,6 +327,20 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
     }
     for arg in &recipe.executor.args {
         validate_template(arg).map_err(|e| format!("{}: {e}", recipe.tool_id))?;
+    }
+    for parameter in &recipe.parameters {
+        if parameter.runtime_only
+            && (parameter.name != "_credential_ref"
+                || parameter.flag.is_some()
+                || parameter.position.is_some()
+                || parameter.template.is_some()
+                || parameter.target)
+        {
+            return Err(format!(
+                "{}: runtime_only 参数只能是无命令映射的 _credential_ref",
+                recipe.tool_id
+            ));
+        }
     }
     Ok(())
 }
@@ -635,6 +653,29 @@ pub fn render_recipe_from_json(
     let mut target: Option<String> = None;
 
     for param in &recipe.parameters {
+        if param.runtime_only {
+            continue;
+        }
+        if matches!(param.type_.as_str(), "bool" | "boolean") {
+            let enabled = match args.get(&param.name).or(param.default.as_ref()) {
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    format!("参数 {} 必须是布尔值", param.name)
+                })?,
+                None if param.required => {
+                    return Err(format!("缺少必需参数: {}", param.name));
+                }
+                None => false,
+            };
+            if enabled {
+                let flag = param
+                    .flag
+                    .as_deref()
+                    .filter(|flag| !flag.is_empty())
+                    .ok_or_else(|| format!("布尔参数 {} 缺少 flag", param.name))?;
+                command.push(flag.to_string());
+            }
+            continue;
+        }
         let value = match param_value(param, args)? {
             Some(value) => value,
             None => continue,
@@ -721,16 +762,28 @@ fn param_value(
                 .collect::<Vec<_>>()
                 .join(","),
         ),
-        Some(other) => Some(other.to_string()),
-        None | Some(serde_json::Value::Null) => match &param.default {
+        Some(serde_json::Value::Null) | None => match &param.default {
             Some(default) => Some(value_to_string(default)),
             None if param.required => {
                 return Err(format!("缺少必需参数: {}", param.name));
             }
             None => None,
         },
+        Some(other) => Some(other.to_string()),
     };
-    Ok(rendered.filter(|s| !s.is_empty()))
+    let rendered = rendered.filter(|s| !s.is_empty());
+    if let Some(value) = rendered.as_deref()
+        && !param.options.is_empty()
+        && !param.options.iter().any(|option| option == value)
+    {
+        return Err(format!(
+            "参数 {} 的值 '{}' 不在允许范围内: {}",
+            param.name,
+            value,
+            param.options.join(", ")
+        ));
+    }
+    Ok(rendered)
 }
 
 fn value_to_string(value: &serde_json::Value) -> String {
@@ -1007,6 +1060,7 @@ recipes:
             format: Some(format.into()),
             template: None,
             options: vec![],
+            runtime_only: false,
             target: false,
         }
     }
@@ -1063,6 +1117,31 @@ recipes:
     }
 
     #[test]
+    fn json_rendering_emits_boolean_flags_without_values() {
+        let mut target = p("target", "positional");
+        target.target = true;
+        let mut introspection = p("introspection", "flag");
+        introspection.type_ = "bool".into();
+        introspection.flag = Some("--introspection".into());
+        introspection.default = Some(serde_json::json!(true));
+        let mut mutations = p("mutations", "flag");
+        mutations.type_ = "boolean".into();
+        mutations.flag = Some("--mutations".into());
+        let recipe = param_recipe(vec![target, introspection, mutations]);
+
+        let prepared = render_recipe_from_json(
+            &recipe,
+            &serde_json::json!({"target": "example.com", "mutations": false}),
+            &NetworkPolicy::Full,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.args,
+            vec!["-sT", "example.com", "--introspection"]
+        );
+    }
+
+    #[test]
     fn json_rendering_rejects_missing_required() {
         let mut target = p("target", "positional");
         target.required = true;
@@ -1070,6 +1149,23 @@ recipes:
         assert!(
             render_recipe_from_json(&recipe, &serde_json::json!({}), &NetworkPolicy::Full).is_err()
         );
+    }
+
+    #[test]
+    fn json_rendering_rejects_values_outside_declared_options() {
+        let mut target = p("target", "positional");
+        target.target = true;
+        let mut format = p("format", "flag");
+        format.flag = Some("--format".into());
+        format.options = vec!["json".into(), "yaml".into()];
+        let recipe = param_recipe(vec![target, format]);
+
+        let result = render_recipe_from_json(
+            &recipe,
+            &serde_json::json!({"target": "example.com", "format": "xml"}),
+            &NetworkPolicy::Full,
+        );
+        assert!(result.unwrap_err().contains("不在允许范围内"));
     }
 
     #[test]
@@ -1087,6 +1183,55 @@ recipes:
                 .iter()
                 .any(|v| v == "target")
         );
+    }
+
+    #[test]
+    fn runtime_credential_reference_is_required_but_never_rendered() {
+        let content = include_str!("../../tools/recipes.yaml");
+        let recipes = parse_recipe_file(content).expect("repository recipes");
+        let prowler = recipes
+            .iter()
+            .find(|recipe| recipe.tool_id == "prowler")
+            .expect("prowler recipe");
+        let schema = parameters_to_input_schema(&prowler.parameters);
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("_credential_ref"))
+        );
+        let executable = ExecutableRecipe::from_recipe(prowler).unwrap();
+        let command = render_recipe_from_json(
+            &executable,
+            &serde_json::json!({
+                "_credential_ref": "credential-opaque-1",
+                "provider": "aws",
+                "checks": "account_security_contact_enabled"
+            }),
+            &NetworkPolicy::Full,
+        )
+        .unwrap();
+        assert_eq!(command.program, "/usr/local/bin/prowler");
+        assert!(command.args.contains(&"aws".to_string()));
+        assert!(!command.args.iter().any(|arg| arg.contains("credential-opaque-1")));
+        assert!(!command.args.iter().any(|arg| arg.contains("credential_ref")));
+
+        let scout = recipes
+            .iter()
+            .find(|recipe| recipe.tool_id == "scout-suite")
+            .expect("scout-suite recipe");
+        let scout_command = render_recipe_from_json(
+            &ExecutableRecipe::from_recipe(scout).unwrap(),
+            &serde_json::json!({
+                "_credential_ref": "credential-opaque-2",
+                "provider": "azure"
+            }),
+            &NetworkPolicy::Full,
+        )
+        .unwrap();
+        assert_eq!(scout_command.program, "/usr/local/bin/scout");
+        assert!(scout_command.args.contains(&"azure".to_string()));
+        assert!(!scout_command.args.iter().any(|arg| arg.contains("credential-opaque-2")));
     }
 
     #[test]
@@ -1136,6 +1281,11 @@ recipes:
         // Every tool name handled by the hardcoded prepare_tool whitelist must
         // have a recipe (executable, or builtin metadata for http_request).
         for tool in [
+            "api-schema-analyzer",
+            "graphql-scanner",
+            "jwt-analyzer",
+            "kube-bench",
+            "hashpump",
             "tcp_scan",
             "nmap",
             "nmap_scan",

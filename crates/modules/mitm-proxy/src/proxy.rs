@@ -203,7 +203,10 @@ impl ProxyHandler {
             .uri(parts.uri.clone())
             .version(parts.version);
         for (name, value) in parts.headers.iter() {
-            if is_hop_by_hop(name.as_str()) || name == header::HOST {
+            if is_hop_by_hop(name.as_str())
+                || name == header::HOST
+                || name.as_str().eq_ignore_ascii_case("x-kairos-run-id")
+            {
                 continue;
             }
             builder = builder.header(name, value);
@@ -332,7 +335,17 @@ fn extract_run_id(req: &Request<Incoming>) -> Option<String> {
     req.headers()
         .get("x-kairos-run-id")
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| valid_run_id(value))
         .map(str::to_string)
+}
+
+fn valid_run_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -386,4 +399,25 @@ fn bad_gateway() -> Response<Full<Bytes>> {
         .status(StatusCode::BAD_GATEWAY)
         .body(Full::new(Bytes::new()))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_marker_accepts_only_safe_opaque_ids() {
+        assert!(valid_run_id("run-123_valid"));
+        assert!(!valid_run_id(""));
+        assert!(!valid_run_id("../other-run"));
+        assert!(!valid_run_id("run\nforged"));
+        assert!(!valid_run_id(&"x".repeat(97)));
+    }
+
+    #[test]
+    fn internal_run_header_is_not_a_hop_by_hop_header() {
+        // It is removed explicitly while rebuilding the outbound request; do
+        // not silently classify arbitrary x-* headers as hop-by-hop.
+        assert!(!is_hop_by_hop("x-kairos-run-id"));
+    }
 }

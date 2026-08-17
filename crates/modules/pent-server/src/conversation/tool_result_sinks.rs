@@ -186,7 +186,7 @@ impl<'a> RunEventSink<'a> {
 pub(crate) fn is_evidence_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "evidence_list" | "evidence_search" | "evidence_view"
+        "evidence_list" | "evidence_search" | "evidence_view" | "query_execution_result" | "query-execution-result"
     )
 }
 
@@ -199,4 +199,15 @@ pub(crate) fn is_traffic_tool(tool_name: &str) -> bool {
 
 pub(crate) fn is_finding_tool(tool_name: &str) -> bool {
     tool_name == "record_finding"
+}
+
+#[cfg(test)]
+mod execution_result_tests {
+    use super::is_evidence_tool;
+
+    #[test]
+    fn execution_result_names_route_to_run_scoped_evidence_store() {
+        assert!(is_evidence_tool("query_execution_result"));
+        assert!(is_evidence_tool("query-execution-result"));
+    }
 }

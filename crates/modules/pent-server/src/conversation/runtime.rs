@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use sha2::Digest;
 use kairos_platform_pent_api::{
     AgentMessage, AgentTurnRequest, AgentTurnResult, ConversationContext, ConversationIntent,
     ConversationMessageType, ConversationTurnStatus,
@@ -391,6 +392,18 @@ impl ConversationRuntime {
                 } else {
                     false
                 };
+            let plan_step_blocked = orchestration
+                == super::agent_pipeline::OrchestrationMode::PlanExecute
+                && !plan_required
+                && if let Some(run_id) = context.run_id.as_deref() {
+                    !self
+                        .plan_store
+                        .has_executable_step(run_id)
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
             let dispatch_plan = ToolDispatcher::new(self.approval_gate.as_ref())
                 .prepare(
                     &mut output.tool_calls,
@@ -401,6 +414,7 @@ impl ConversationRuntime {
                             agent_management_only: orchestration
                                 == super::agent_pipeline::OrchestrationMode::Supervisor,
                             plan_required,
+                            plan_step_blocked,
                         },
                     },
                 )
@@ -1490,15 +1504,22 @@ impl ConversationRuntime {
                     }
                 }
             }
-        }
-        if let Ok(memories) = self.enrichment.search_memories(query, 3).await {
-            for memory in memories {
-                guides.push(KnowledgeGuide {
-                    id: format!("vec-{}", uuid::Uuid::new_v4()),
-                    title: "向量记忆匹配".into(),
-                    source: Some("pgvector".into()),
-                    content: memory,
-                });
+            // Vector recall follows the same expanded query set as lexical
+            // recall. This closes the multi-query hybrid loop instead of
+            // embedding only the original wording.
+            if let Ok(memories) = self.enrichment.search_memories(variant, 3).await {
+                for memory in memories {
+                    let digest = hex::encode(sha2::Sha256::digest(memory.as_bytes()));
+                    let key = format!("vector|{digest}");
+                    if seen.insert(key) {
+                        guides.push(KnowledgeGuide {
+                            id: format!("vec-{}", &digest[..24]),
+                            title: "向量记忆匹配".into(),
+                            source: Some("pgvector".into()),
+                            content: memory,
+                        });
+                    }
+                }
             }
         }
         // Rerank by term overlap against the original query (title 3x body).

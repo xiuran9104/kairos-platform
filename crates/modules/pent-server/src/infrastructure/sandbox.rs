@@ -26,6 +26,7 @@ impl ExecutionBackend for BubblewrapSandboxBackend {
             artifact_dir: request.sandbox.artifact_dir,
             allowed_paths: request.sandbox.allowed_paths,
             run_id: request.run_id,
+            secret_environment: request.sandbox.secret_environment,
         };
         execute_tool_direct(&request.tool_name, &request.arguments, &limits).await
     }

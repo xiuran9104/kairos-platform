@@ -195,6 +195,7 @@ mod tool_execution_tests {
             artifact_dir: None,
             allowed_paths: vec!["/tmp".into()],
             run_id: None,
+            secret_environment: Default::default(),
         };
         assert!(limits.cpu_cores > 0.0);
         assert!(limits.memory_mb >= 128);
@@ -213,6 +214,7 @@ mod tool_execution_tests {
             artifact_dir: None,
             allowed_paths: vec![],
             run_id: None,
+            secret_environment: Default::default(),
         };
         assert!(matches!(limits.network_access, NetworkPolicy::Full));
         assert!(limits.allowed_paths.is_empty());

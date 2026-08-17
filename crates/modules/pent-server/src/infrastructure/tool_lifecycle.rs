@@ -361,7 +361,7 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
         },
         ToolLifecycle {
             tool_name: "curl",
-            aliases: &["http_probe", "http_request"],
+            aliases: &["http_probe", "http_request", "http-framework-test"],
             binary_path: "/usr/bin/curl",
             install_methods: &[InstallMethod {
                 label: "apt",
@@ -369,6 +369,61 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
             }],
             update_commands: &["apt-get install -y --only-upgrade curl"],
             uninstall_commands: &["apt-get remove -y curl"],
+        },
+        ToolLifecycle {
+            tool_name: "spectral",
+            aliases: &["api-schema-analyzer"],
+            binary_path: "/usr/local/bin/spectral",
+            install_methods: &[InstallMethod {
+                label: "npm",
+                command: "npm install -g @stoplight/spectral-cli",
+            }],
+            update_commands: &["npm update -g @stoplight/spectral-cli"],
+            uninstall_commands: &["npm uninstall -g @stoplight/spectral-cli"],
+        },
+        ToolLifecycle {
+            tool_name: "x8",
+            aliases: &[],
+            binary_path: "/usr/local/bin/x8",
+            install_methods: &[InstallMethod {
+                label: "cargo",
+                command: "cargo install x8",
+            }],
+            update_commands: &["cargo install x8 --force"],
+            uninstall_commands: &["cargo uninstall x8"],
+        },
+        ToolLifecycle {
+            tool_name: "graphqlmap",
+            aliases: &["graphql-scanner"],
+            binary_path: "/usr/local/bin/graphqlmap",
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install graphqlmap",
+            }],
+            update_commands: &["pip3 install --upgrade graphqlmap"],
+            uninstall_commands: &["pip3 uninstall -y graphqlmap"],
+        },
+        ToolLifecycle {
+            tool_name: "jwt_tool",
+            aliases: &["jwt-analyzer"],
+            binary_path: "/usr/local/bin/jwt_tool",
+            install_methods: &[InstallMethod {
+                label: "pip",
+                command: "pip3 install jwt-tool",
+            }],
+            update_commands: &["pip3 install --upgrade jwt-tool"],
+            uninstall_commands: &["pip3 uninstall -y jwt-tool"],
+        },
+        ToolLifecycle {
+            tool_name: "kube-bench",
+            aliases: &[],
+            binary_path: "/usr/local/bin/kube-bench",
+            install_methods: &[InstallMethod {
+                label: "go",
+                command: "go install github.com/aquasecurity/kube-bench@latest",
+            }],
+            update_commands: &["go install github.com/aquasecurity/kube-bench@latest"],
+            uninstall_commands: &["rm -f /usr/local/bin/kube-bench"],
         },
         // ── Vulnerability scanners ───────────────────────────────────────
         ToolLifecycle {
@@ -487,7 +542,7 @@ pub fn all_host_tools() -> Vec<ToolLifecycle> {
         },
         ToolLifecycle {
             tool_name: "dnsx",
-            aliases: &[],
+            aliases: &["dns-enum"],
             binary_path: "/usr/local/bin/dnsx",
             install_methods: &[InstallMethod {
                 label: "go",

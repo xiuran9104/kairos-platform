@@ -572,7 +572,7 @@ pub(crate) async fn execute_workflow_graph(
         let config = node.get("config").cloned().unwrap_or_else(|| json!({}));
 
         let mut next: Option<String> = None;
-        let mut detail = String::new();
+        let detail: String;
         let mut node_status = "completed";
 
         match ty.as_str() {

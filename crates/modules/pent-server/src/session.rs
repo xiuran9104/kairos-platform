@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use kairos_platform_framework_security::CurrentUser;
 use kairos_platform_framework_web::AppError;
@@ -556,10 +556,22 @@ async fn create_message(
         .map_err(|error| AppError::internal(error.to_string()))?;
     let pool = state.pool.clone();
     let turn_id_clone = turn_id.clone();
+    let tasks = state.conversation_tasks.clone();
+    let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
+    tasks.register(turn_id.clone(), abort_handle);
     tokio::spawn(async move {
-        let runtime = crate::conversation::build_runtime(&pool, None);
-        if let Err(error) = runtime.execute_turn(turn_id_clone, &turn_request).await {
-            tracing::warn!(error = %error, "conversation turn execution failed");
+        let execution = async {
+            let runtime = crate::conversation::build_runtime(&pool, None);
+            if let Err(error) = runtime.execute_turn(turn_id_clone.clone(), &turn_request).await {
+                tracing::warn!(error = %error, "conversation turn execution failed");
+            }
+        };
+        let aborted = futures_util::future::Abortable::new(execution, abort_registration)
+            .await
+            .is_err();
+        tasks.remove(&turn_id_clone);
+        if aborted {
+            tracing::info!(turn_id = %turn_id_clone, "conversation turn execution aborted");
         }
     });
 

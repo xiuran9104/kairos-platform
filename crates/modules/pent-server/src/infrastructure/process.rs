@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 pub use kairos_platform_pent_tooling::backend::{
-    ExecutionAudit as ToolExecutionAudit, ExecutionOutput as ToolOutput,
+    ExecutionAudit as ToolExecutionAudit, ExecutionOutput as ToolOutput, SecretEnvironment,
 };
 
 use super::tool_registry::{PreparedTool, prepare_tool, prepare_tool_from_json};
@@ -39,6 +39,9 @@ pub struct ToolExecutionLimits {
     /// Run id used to tag captured traffic. Injected as `x-kairos-run-id` for
     /// curl-based tools so the MITM proxy can associate exchanges with a run.
     pub run_id: Option<String>,
+    /// Ephemeral cloud credentials resolved by the worker from an opaque
+    /// credential reference. Values are redacted and never serialized.
+    pub secret_environment: SecretEnvironment,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +108,7 @@ impl Default for ToolExecutionLimits {
             artifact_dir: None,
             allowed_paths: vec![],
             run_id: None,
+            secret_environment: SecretEnvironment::default(),
         }
     }
 }
@@ -269,6 +273,10 @@ async fn execute_prepared_tool(
     let proxy_addr =
         std::env::var("PENTA_TRAFFIC_PROXY").unwrap_or_else(|_| "http://127.0.0.1:8085".into());
     let mut sandbox_env = vec![("LANG".to_string(), "C.UTF-8".to_string())];
+    for (name, value) in limits.secret_environment.iter() {
+        validate_secret_environment(name, value)?;
+        sandbox_env.push((name.to_string(), value.to_string()));
+    }
     let mut readonly_paths = Vec::new();
     // ── M2-F13: mitmproxy traffic capture ──────────────────────────
     if capture {
@@ -389,6 +397,35 @@ async fn execute_prepared_tool(
         duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         audit,
     })
+}
+
+const CLOUD_SECRET_ENV_ALLOWLIST: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_TENANT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CORE_PROJECT",
+    "ALIBABA_CLOUD_ACCESS_KEY_ID",
+    "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+    "TENCENTCLOUD_SECRET_ID",
+    "TENCENTCLOUD_SECRET_KEY",
+    "TENCENTCLOUD_SESSION_TOKEN",
+    "TENCENTCLOUD_REGION",
+];
+
+fn validate_secret_environment(name: &str, value: &str) -> Result<(), String> {
+    if !CLOUD_SECRET_ENV_ALLOWLIST.contains(&name) {
+        return Err(format!("不允许向工具沙箱注入环境变量: {name}"));
+    }
+    if value.is_empty() || value.contains(['\0', '\r', '\n']) {
+        return Err(format!("工具沙箱环境变量 {name} 的值无效"));
+    }
+    Ok(())
 }
 
 fn resolve_tool_program(tool_name: &str, configured_program: &str) -> String {
@@ -1118,6 +1155,12 @@ mod tests {
 
     #[test]
     fn bubblewrap_runner_enforces_local_isolation_layers() {
+        let bubblewrap = std::env::var("PENTA_BWRAP_PATH")
+            .unwrap_or_else(|_| DEFAULT_BWRAP_PATH.to_string());
+        if !std::path::Path::new(&bubblewrap).is_file() {
+            eprintln!("skipping bubblewrap command test: {bubblewrap} is unavailable");
+            return;
+        }
         crate::infrastructure::recipe::load_recipes_for_tests();
         let prepared = super::prepare_tool(
             "tcp_scan",
@@ -1174,5 +1217,15 @@ mod tests {
             "targets": []
         }));
         assert!(matches!(empty_targets, NetworkPolicy::Full));
+    }
+
+    #[test]
+    fn cloud_secret_environment_uses_a_strict_allowlist() {
+        assert!(validate_secret_environment("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE").is_ok());
+        assert!(validate_secret_environment("AWS_SECRET_ACCESS_KEY", "secret").is_ok());
+        assert!(validate_secret_environment("PATH", "/attacker/bin").is_err());
+        assert!(validate_secret_environment("LD_PRELOAD", "/tmp/inject.so").is_err());
+        assert!(validate_secret_environment("AWS_SESSION_TOKEN", "line\nbreak").is_err());
+        assert!(validate_secret_environment("AWS_SESSION_TOKEN", "").is_err());
     }
 }

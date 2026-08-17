@@ -7,7 +7,7 @@
 
 use super::embedding::EmbeddingProvider;
 use super::knowledge::{InsertKnowledgeParams, KnowledgeDocType, KnowledgeFilter, KnowledgeStore};
-use serde_json::{Value, json};
+use serde_json::json;
 use uuid::Uuid;
 
 pub struct AutoMemory {

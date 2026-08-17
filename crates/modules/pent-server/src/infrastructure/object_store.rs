@@ -151,8 +151,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires the local MinIO service"]
     async fn minio_round_trip() {
+        if std::env::var("MINIO_ENDPOINT").is_err() {
+            return;
+        }
         let store = ObjectStore::from_env();
         let key = format!("pent/tests/{}.txt", uuid::Uuid::new_v4());
         store

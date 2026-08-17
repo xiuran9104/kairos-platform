@@ -1,6 +1,595 @@
 # Pent 工具配方清单。
 # 由 import_tool_recipes 校验后 upsert 进 pent_tool_definitions。
 recipes:
+- tool_id: dns-enum
+  version: 1.0.0
+  manifest_version: 1
+  namespace: recon
+  name: Passive DNS Enumeration
+  description: 使用 dnsx 对授权域名执行被动 DNS 记录枚举，替代 DesRedTeam 中仅适用于 Windows PowerShell 的实现。
+  capabilities:
+  - dns
+  - recon
+  - passive
+  tags:
+  - dnsx
+  - dns
+  - enumeration
+  source: builtin
+  risk_level: low
+  approval_policy: conditional
+  supported_target_types:
+  - domain
+  executor:
+    type: host
+    program: /usr/local/bin/dnsx
+    args:
+    - -silent
+    - -json
+  resource_profile:
+    cpu_cores: 0.25
+    memory_mb: 128
+    timeout_seconds: 300
+  embedding_document: Linux/Arch/Debian 通用的被动 DNS A、AAAA、CNAME、MX、NS、TXT、SOA、PTR 枚举。
+  parameters:
+  - name: domain
+    type: string
+    description: 已授权的域名
+    required: true
+    target: true
+    position: 0
+    format: positional
+  - name: record_type
+    type: string
+    description: DNS 记录类型
+    required: false
+    options:
+    - a
+    - aaaa
+    - cname
+    - mx
+    - ns
+    - txt
+    - soa
+    - ptr
+    template: -{value}
+    format: template
+  - name: resolver
+    type: string
+    description: 可选的 DNS Resolver
+    required: false
+    flag: -r
+    format: flag
+- tool_id: http-framework-test
+  version: 1.0.0
+  manifest_version: 1
+  namespace: web
+  name: Structured HTTP Framework Test
+  description: 使用 curl 对授权 URL 执行结构化 HTTP 请求，支持常用方法、请求体、Header、Cookie、代理和 TLS 选项。
+  capabilities:
+  - web
+  - http
+  - api
+  tags:
+  - curl
+  - http
+  - request
+  source: builtin
+  risk_level: high
+  approval_policy: always
+  supported_target_types:
+  - url
+  executor:
+    type: host
+    program: /usr/bin/curl
+    args:
+    - --silent
+    - --show-error
+    - --max-filesize
+    - '10485760'
+  resource_profile:
+    cpu_cores: 0.25
+    memory_mb: 128
+    timeout_seconds: 300
+  embedding_document: 结构化 HTTP 和 API 测试工具，所有网络目标均经过当前 Run 授权范围校验。
+  parameters:
+  - name: url
+    type: string
+    description: 已授权的完整 URL
+    required: true
+    target: true
+    position: 0
+    format: positional
+  - name: method
+    type: string
+    description: HTTP 方法
+    required: false
+    default: GET
+    options:
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    - HEAD
+    - OPTIONS
+    flag: --request
+    format: flag
+  - name: data
+    type: string
+    description: 请求体
+    required: false
+    flag: --data
+    format: flag
+  - name: headers
+    type: string
+    description: 单个自定义 Header
+    required: false
+    flag: --header
+    format: flag
+  - name: cookies
+    type: string
+    description: Cookie 字符串
+    required: false
+    flag: --cookie
+    format: flag
+  - name: user_agent
+    type: string
+    description: User-Agent
+    required: false
+    flag: --user-agent
+    format: flag
+  - name: proxy
+    type: string
+    description: HTTP 或 SOCKS 代理
+    required: false
+    flag: --proxy
+    format: flag
+  - name: timeout
+    type: int
+    description: 请求超时秒数
+    required: false
+    default: 30
+    flag: --max-time
+    format: flag
+  - name: include_headers
+    type: bool
+    description: 在输出中包含响应头
+    required: false
+    default: true
+    flag: --include
+    format: flag
+  - name: follow_redirects
+    type: bool
+    description: 跟随重定向
+    required: false
+    default: false
+    flag: --location
+    format: flag
+  - name: allow_insecure
+    type: bool
+    description: 允许无效 TLS 证书
+    required: false
+    default: false
+    flag: --insecure
+    format: flag
+  - name: http2
+    type: bool
+    description: 使用 HTTP/2
+    required: false
+    default: false
+    flag: --http2
+    format: flag
+- tool_id: scout-suite
+  version: 1.0.0
+  manifest_version: 1
+  namespace: cloud
+  name: Scout Suite Cloud Audit
+  description: 使用租户绑定的临时凭据执行多云配置与安全最佳实践评估。
+  capabilities:
+  - cloud
+  - compliance
+  - configuration-audit
+  tags:
+  - scout-suite
+  - aws
+  - azure
+  - aliyun
+  source: builtin
+  risk_level: high
+  approval_policy: always
+  supported_target_types:
+  - cloud-account
+  executor:
+    type: host
+    program: /usr/local/bin/scout
+    args:
+    - --report-dir
+    - /artifacts
+    - --no-browser
+    target_type: file
+  resource_profile:
+    cpu_cores: 1.0
+    memory_mb: 1024
+    timeout_seconds: 1800
+  embedding_document: Scout Suite AWS、Azure 与阿里云安全配置审计，报告写入 Run Artifact。
+  parameters:
+  - name: _credential_ref
+    type: string
+    description: 当前租户中已授权给 scout-suite 的不透明云凭据引用
+    required: true
+    runtime_only: true
+  - name: provider
+    type: string
+    description: 云提供商
+    required: true
+    default: aws
+    options:
+    - aws
+    - azure
+    - aliyun
+    position: 0
+    format: positional
+  - name: services
+    type: string
+    description: 可选的服务名称列表
+    required: false
+    flag: --services
+    format: flag
+- tool_id: prowler
+  version: 1.0.0
+  manifest_version: 1
+  namespace: cloud
+  name: Prowler Cloud Security Audit
+  description: 使用租户绑定的临时凭据对 AWS 或 Azure 执行云安全与合规检查。
+  capabilities:
+  - cloud
+  - compliance
+  - configuration-audit
+  tags:
+  - prowler
+  - aws
+  - azure
+  source: builtin
+  risk_level: high
+  approval_policy: always
+  supported_target_types:
+  - cloud-account
+  executor:
+    type: host
+    program: /usr/local/bin/prowler
+    args:
+    - -o
+    - /artifacts
+    - -M
+    - json-ocsf
+    target_type: file
+  resource_profile:
+    cpu_cores: 1.0
+    memory_mb: 1024
+    timeout_seconds: 1800
+  embedding_document: Prowler AWS 与 Azure 云配置、最佳实践和合规基线审计。
+  parameters:
+  - name: _credential_ref
+    type: string
+    description: 当前租户中已授权给 prowler 的不透明云凭据引用
+    required: true
+    runtime_only: true
+  - name: provider
+    type: string
+    description: 云提供商
+    required: true
+    default: aws
+    options:
+    - aws
+    - azure
+    position: 0
+    format: positional
+  - name: region
+    type: string
+    description: 可选的云区域限制
+    required: false
+    flag: -r
+    format: flag
+  - name: checks
+    type: string
+    description: 可选的检查 ID；不接受任意附加命令参数
+    required: false
+    flag: -c
+    format: flag
+- tool_id: x8
+  version: 1.0.0
+  manifest_version: 1
+  namespace: web
+  name: X8 Hidden Parameter Discovery
+  description: 使用 x8 对授权 Web 端点进行隐藏参数发现，不接受任意附加命令参数。
+  capabilities:
+  - web
+  - parameter-discovery
+  - fuzzing
+  tags:
+  - x8
+  - parameters
+  - discovery
+  source: builtin
+  risk_level: medium
+  approval_policy: always
+  supported_target_types:
+  - url
+  executor:
+    type: host
+    program: /usr/local/bin/x8
+    args: []
+  resource_profile:
+    cpu_cores: 0.5
+    memory_mb: 256
+    timeout_seconds: 600
+  embedding_document: x8 Web 隐藏参数发现工具；目标必须处于已确认授权范围内。
+  parameters:
+  - name: url
+    type: string
+    description: 已授权的目标 URL
+    required: true
+    target: true
+    flag: --url
+    format: flag
+  - name: wordlist
+    type: string
+    description: 沙箱内可读的参数字典路径
+    required: false
+    flag: --wordlist
+    format: flag
+  - name: method
+    type: string
+    description: HTTP 请求方法
+    required: false
+    default: GET
+    options:
+    - GET
+    - POST
+    flag: --method
+    format: flag
+  - name: body
+    type: string
+    description: POST 请求体
+    required: false
+    flag: --body
+    format: flag
+  - name: headers
+    type: string
+    description: 单个自定义请求头
+    required: false
+    flag: --headers
+    format: flag
+- tool_id: api-schema-analyzer
+  version: 1.0.0
+  manifest_version: 1
+  namespace: api
+  name: API Schema Analyzer
+  description: 使用 Spectral 对 OpenAPI、Swagger 等 API 描述执行静态安全与质量检查。
+  capabilities:
+  - api
+  - static-analysis
+  - discovery
+  tags:
+  - spectral
+  - openapi
+  - swagger
+  source: builtin
+  risk_level: low
+  approval_policy: conditional
+  supported_target_types:
+  - url
+  executor:
+    type: host
+    program: /usr/local/bin/spectral
+    args:
+    - lint
+  resource_profile:
+    cpu_cores: 0.5
+    memory_mb: 256
+    timeout_seconds: 180
+  embedding_document: Spectral API Schema 静态分析工具，用于检查 OpenAPI 和 Swagger 描述中的安全与规范问题。
+  parameters:
+  - name: schema_url
+    type: string
+    description: 已授权的 OpenAPI 或 Swagger Schema URL
+    required: true
+    target: true
+    position: 1
+    format: positional
+- tool_id: graphql-scanner
+  version: 1.0.0
+  manifest_version: 1
+  namespace: api
+  name: GraphQL Scanner
+  description: 使用 GraphQLmap 对已授权 GraphQL 端点执行自省和安全测试。
+  capabilities:
+  - api
+  - graphql
+  - scanning
+  tags:
+  - graphqlmap
+  - graphql
+  source: builtin
+  risk_level: high
+  approval_policy: always
+  supported_target_types:
+  - url
+  executor:
+    type: host
+    program: /usr/local/bin/graphqlmap
+    args: []
+  resource_profile:
+    cpu_cores: 0.5
+    memory_mb: 256
+    timeout_seconds: 600
+  embedding_document: GraphQLmap GraphQL 自省、查询深度和 mutation 安全测试。
+  parameters:
+  - name: endpoint
+    type: string
+    description: 已授权的 GraphQL 端点 URL
+    required: true
+    target: true
+    flag: -u
+    format: flag
+  - name: introspection
+    type: bool
+    description: 执行 GraphQL 自省测试
+    required: false
+    default: true
+    flag: --introspection
+    format: flag
+  - name: query_depth
+    type: int
+    description: 最大查询深度
+    required: false
+    default: 10
+    flag: --depth
+    format: flag
+  - name: test_mutations
+    type: bool
+    description: 执行 mutation 安全测试
+    required: false
+    default: false
+    flag: --mutations
+    format: flag
+- tool_id: jwt-analyzer
+  version: 1.0.0
+  manifest_version: 1
+  namespace: api
+  name: JWT Analyzer
+  description: 使用 jwt_tool 在本地分析 JWT 结构、算法和常见配置风险，不向外部目标发送令牌。
+  capabilities:
+  - api
+  - jwt
+  - static-analysis
+  tags:
+  - jwt_tool
+  - jwt
+  source: builtin
+  risk_level: low
+  approval_policy: conditional
+  supported_target_types: []
+  executor:
+    type: host
+    program: /usr/local/bin/jwt_tool
+    args: []
+    target_type: file
+  resource_profile:
+    cpu_cores: 0.25
+    memory_mb: 128
+    timeout_seconds: 120
+  embedding_document: jwt_tool JWT 本地静态分析；不包含在线攻击或令牌投递。
+  parameters:
+  - name: jwt_token
+    type: string
+    description: 待分析的 JWT 令牌
+    required: true
+    flag: -t
+    format: flag
+- tool_id: kube-bench
+  version: 1.0.0
+  manifest_version: 1
+  namespace: container
+  name: Kube Bench
+  description: 使用 kube-bench 对 Pent Agent 所在 Kubernetes 环境执行 CIS 基线检查。
+  capabilities:
+  - kubernetes
+  - compliance
+  - local-audit
+  tags:
+  - kube-bench
+  - cis
+  - kubernetes
+  source: builtin
+  risk_level: medium
+  approval_policy: always
+  supported_target_types: []
+  executor:
+    type: host
+    program: /usr/local/bin/kube-bench
+    args: []
+    target_type: file
+  resource_profile:
+    cpu_cores: 1.0
+    memory_mb: 512
+    timeout_seconds: 900
+  embedding_document: kube-bench Kubernetes CIS Benchmark 本地合规检查。
+  parameters:
+  - name: targets
+    type: string
+    description: 检查范围，例如 master、node、etcd 或 policies
+    required: false
+    flag: --targets
+    format: flag
+  - name: version
+    type: string
+    description: Kubernetes 版本
+    required: false
+    flag: --version
+    format: flag
+  - name: output_format
+    type: string
+    description: 输出格式
+    required: false
+    default: json
+    options:
+    - json
+    - yaml
+    flag: --output
+    format: flag
+- tool_id: hashpump
+  version: 1.0.0
+  manifest_version: 1
+  namespace: crypto
+  name: HashPump
+  description: 对授权测试数据执行哈希长度扩展验证，用于确认不安全的前缀 MAC 设计。
+  capabilities:
+  - crypto
+  - validation
+  tags:
+  - hashpump
+  - length-extension
+  source: builtin
+  risk_level: high
+  approval_policy: always
+  supported_target_types: []
+  executor:
+    type: host
+    program: /usr/local/bin/hashpump
+    args: []
+    target_type: file
+  resource_profile:
+    cpu_cores: 0.25
+    memory_mb: 128
+    timeout_seconds: 120
+  embedding_document: HashPump 哈希长度扩展验证工具，仅处理调用方明确提供的测试数据。
+  parameters:
+  - name: signature
+    type: string
+    description: 原始哈希签名
+    required: true
+    flag: -s
+    format: flag
+  - name: data
+    type: string
+    description: 原始数据
+    required: true
+    flag: -d
+    format: flag
+  - name: key_length
+    type: int
+    description: 推测的密钥长度
+    required: true
+    flag: -k
+    format: flag
+  - name: append_data
+    type: string
+    description: 待追加的验证数据
+    required: true
+    flag: -a
+    format: flag
 - tool_id: dir_fuzz
   version: 1.0.0
   manifest_version: 1

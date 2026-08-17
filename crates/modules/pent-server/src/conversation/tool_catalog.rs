@@ -272,6 +272,7 @@ pub async fn load_tools_for_intent(
         "evidence_list",
         "evidence_search",
         "evidence_view",
+        "query_execution_result",
         "traffic_list",
         "traffic_view",
         "skill_list",
@@ -305,6 +306,25 @@ pub async fn load_tools_for_intent(
 
 fn evidence_tool_definitions() -> Vec<Value> {
     vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "query_execution_result",
+                "description": "按 execution_id 分页读取当前 Run 内已持久化的工具结果，可按行搜索和过滤。不会访问其他 Run。",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["execution_id"],
+                    "properties": {
+                        "execution_id": {"type": "string", "minLength": 1, "maxLength": 100},
+                        "page": {"type": "integer", "minimum": 1},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                        "search": {"type": "string", "maxLength": 500},
+                        "filter": {"type": "string", "maxLength": 500}
+                    }
+                }
+            }
+        }),
         json!({
             "type": "function",
             "function": {
@@ -694,6 +714,28 @@ mod tests {
     }
 
     #[test]
+    fn execution_result_query_is_run_scoped_and_bounded() {
+        let definition = evidence_tool_definitions()
+            .into_iter()
+            .find(|value| value["function"]["name"] == "query_execution_result")
+            .expect("query_execution_result definition");
+        assert_eq!(
+            definition["function"]["parameters"]["required"],
+            serde_json::json!(["execution_id"])
+        );
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["limit"]["maximum"],
+            500
+        );
+        assert!(
+            definition["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("当前 Run")
+        );
+    }
+
+    #[test]
     fn evidence_tools_are_read_only_and_run_scoped_by_runtime() {
         let definitions = evidence_tool_definitions();
         let names = definitions
@@ -703,13 +745,14 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                &serde_json::json!("query_execution_result"),
                 &serde_json::json!("evidence_list"),
                 &serde_json::json!("evidence_search"),
                 &serde_json::json!("evidence_view")
             ]
         );
         assert_eq!(
-            definitions[1]["function"]["parameters"]["required"],
+            definitions[2]["function"]["parameters"]["required"],
             serde_json::json!(["query"])
         );
     }
@@ -747,9 +790,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL)"]
     async fn routed_catalog_caps_action_tools_and_keeps_reference_tools() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let config = kairos_platform_framework_database::DatabaseConfig::new(
             url,
             1,

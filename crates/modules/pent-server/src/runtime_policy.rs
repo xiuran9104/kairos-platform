@@ -3,6 +3,7 @@ use kairos_platform_framework_database::PgPool;
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClaimedRun {
     pub id: String,
+    #[allow(dead_code)] // required by the tenant-aware claim row mapping
     pub tenant_id: Option<i64>,
     pub lease_ttl_seconds: i32,
     pub max_retries_per_run: i32,

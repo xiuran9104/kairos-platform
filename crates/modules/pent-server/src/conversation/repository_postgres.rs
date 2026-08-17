@@ -654,6 +654,93 @@ impl ConversationRepository for PgConversationRepository {
                     "redacted": true,
                 }))
             }
+            "query_execution_result" | "query-execution-result" => {
+                let execution_id = arguments
+                    .get("execution_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && value.len() <= 100)
+                    .ok_or_else(|| anyhow::anyhow!("query_execution_result 缺少有效 execution_id"))?;
+                let page = arguments
+                    .get("page")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100)
+                    .clamp(1, 500) as usize;
+                let search = arguments
+                    .get("search")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let filter = arguments
+                    .get("filter")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let row = sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<i32>,
+                        Option<String>,
+                        Option<i64>,
+                        Option<String>,
+                        Option<String>,
+                    ),
+                >(
+                    "SELECT tc.tool_name, tc.exit_code, tc.completed_at::text,
+                            tc.duration_ms, e.id, e.source
+                     FROM pent_tool_calls tc
+                     LEFT JOIN pent_evidence e
+                       ON e.tool_call_id=tc.id AND e.run_id=tc.run_id
+                     WHERE tc.run_id=$1 AND tc.id=$2
+                     ORDER BY e.created_at DESC NULLS LAST
+                     LIMIT 1",
+                )
+                .bind(run_id)
+                .bind(execution_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("当前 Run 中不存在 execution {execution_id}")
+                })?;
+                let content = sanitize_evidence_text(row.5.as_deref().unwrap_or_default());
+                let mut lines = content.lines().collect::<Vec<_>>();
+                if let Some(value) = filter {
+                    lines.retain(|line| line.contains(value));
+                }
+                if let Some(value) = search {
+                    lines.retain(|line| line.contains(value));
+                }
+                let total_lines = lines.len();
+                let total_pages = total_lines.div_ceil(limit);
+                let start = page.saturating_sub(1).saturating_mul(limit);
+                let items = lines
+                    .into_iter()
+                    .skip(start)
+                    .take(limit)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({
+                    "execution_id": execution_id,
+                    "tool_name": row.0,
+                    "status": if row.2.is_none() { "running" } else if row.1 == Some(0) { "completed" } else { "failed" },
+                    "exit_code": row.1,
+                    "completed_at": row.2,
+                    "duration_ms": row.3,
+                    "evidence_id": row.4,
+                    "page": page,
+                    "limit": limit,
+                    "total_lines": total_lines,
+                    "total_pages": total_pages,
+                    "lines": items,
+                    "redacted": true,
+                }))
+            }
             _ => anyhow::bail!("未知 Evidence 工具: {tool_name}"),
         }
     }
@@ -1158,7 +1245,12 @@ fn redact_arguments(mut value: serde_json::Value) -> serde_json::Value {
         for (key, item) in object {
             if matches!(
                 key.to_ascii_lowercase().as_str(),
-                "authorization" | "cookie" | "password" | "token" | "csrf_token"
+                "authorization"
+                    | "cookie"
+                    | "password"
+                    | "token"
+                    | "csrf_token"
+                    | "_credential_ref"
             ) {
                 *item = serde_json::Value::String("[REDACTED]".into());
             }
@@ -1180,6 +1272,7 @@ fn redact_sensitive_value(mut value: serde_json::Value) -> serde_json::Value {
                         | "token"
                         | "csrf_token"
                         | "api_key"
+                        | "_credential_ref"
                 ) {
                     *item = serde_json::Value::String("[REDACTED]".into());
                 } else {
@@ -1232,8 +1325,10 @@ mod traffic_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local PostgreSQL (TEST_DATABASE_URL)"]
     async fn records_and_queries_http_traffic() {
+        if std::env::var("TEST_DATABASE_URL").is_err() {
+            return;
+        }
         let pool = test_pool().await;
         let repository = PgConversationRepository::new(pool.clone());
         let run_id = "traffic-it-run";

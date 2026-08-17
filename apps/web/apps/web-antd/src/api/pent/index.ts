@@ -79,6 +79,16 @@ export function resumePentRun(id: string) { return requestClient.post(`/pent/run
 export function deletePentRun(id: string) { return requestClient.delete(`/pent/runs/${id}`); }
 export function getPentRunEvents(runId: string) { return requestClient.get(`/pent/runs/${runId}/events`); }
 export function getPentRunToolCalls(runId: string) { return requestClient.get(`/pent/runs/${runId}/tool-calls`); }
+export function getPentToolCallResult(
+  runId: string,
+  executionId: string,
+  params?: { filter?: string; limit?: number; page?: number; search?: string },
+) {
+  return requestClient.get(
+    `/pent/runs/${runId}/tool-calls/${executionId}/result`,
+    { params },
+  );
+}
 export function getPentRunPlan(runId: string) { return requestClient.get(`/pent/runs/${runId}/plan`); }
 
 /** Stream run events via SSE with proper Authorization header (no token in URL). */

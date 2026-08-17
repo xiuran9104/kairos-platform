@@ -6,7 +6,9 @@
 //! agent always knows "where we are and what's next".
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::collections::HashSet;
 
 /// Serialized pentest state persisted alongside the run.
@@ -174,7 +176,7 @@ impl PentestMemory {
         }
     }
 
-    fn extract_findings(&mut self, output: &Value, tool_name: &str) {
+    fn extract_findings(&mut self, output: &Value, _tool_name: &str) {
         let findings: Vec<&Value> = output
             .get("findings")
             .and_then(|v| v.as_array())

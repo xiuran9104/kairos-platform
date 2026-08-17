@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     http::StatusCode,
     extract::State,
-    routing::{get, post, put},
+    routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use kairos_platform_framework_security::CurrentUser;

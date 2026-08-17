@@ -529,7 +529,14 @@ mod tests {
                 get(|| async { StatusCode::METHOD_NOT_ALLOWED }).post(upload),
             )
             .route("/uploads/kairos-upload-marker.txt", get(uploaded_marker));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping local HTTP fixture: listener creation is not permitted");
+                return;
+            }
+            Err(error) => panic!("failed to bind local HTTP fixture: {error}"),
+        };
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

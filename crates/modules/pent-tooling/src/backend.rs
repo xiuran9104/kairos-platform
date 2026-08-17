@@ -3,6 +3,36 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Ephemeral secrets injected into a local execution sandbox.
+///
+/// Values intentionally never participate in serde or Debug output, so an
+/// execution request can be logged or transported without disclosing them.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretEnvironment(Vec<(String, String)>);
+
+impl SecretEnvironment {
+    pub fn new(values: Vec<(String, String)>) -> Self {
+        Self(values)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl std::fmt::Debug for SecretEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretEnvironment")
+            .field("variable_count", &self.0.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "mode", content = "target")]
 pub enum ExecutionNetworkPolicy {
@@ -30,6 +60,9 @@ pub struct SandboxSpec {
     /// exposed at `/state` for stateful HTTP tools.
     #[serde(default)]
     pub allowed_paths: Vec<String>,
+    /// Local-only secret values. Skipped in every serialized execution request.
+    #[serde(skip)]
+    pub secret_environment: SecretEnvironment,
 }
 
 impl Default for SandboxSpec {
@@ -42,6 +75,7 @@ impl Default for SandboxSpec {
             workspace_dir: None,
             artifact_dir: None,
             allowed_paths: Vec::new(),
+            secret_environment: SecretEnvironment::default(),
         }
     }
 }
@@ -101,5 +135,20 @@ mod tests {
         let spec = SandboxSpec::default();
         assert_eq!(spec.network_access, ExecutionNetworkPolicy::None);
         assert_eq!(spec.timeout_seconds, 300);
+    }
+
+    #[test]
+    fn secret_environment_is_redacted_and_not_serialized() {
+        let mut spec = SandboxSpec::default();
+        spec.secret_environment = SecretEnvironment::new(vec![(
+            "AWS_SECRET_ACCESS_KEY".into(),
+            "must-not-leak".into(),
+        )]);
+        let debug = format!("{spec:?}");
+        let serialized = serde_json::to_string(&spec).unwrap();
+        assert!(debug.contains("variable_count: 1"));
+        assert!(!debug.contains("must-not-leak"));
+        assert!(!serialized.contains("must-not-leak"));
+        assert!(!serialized.contains("AWS_SECRET_ACCESS_KEY"));
     }
 }
