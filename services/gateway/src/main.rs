@@ -26,6 +26,10 @@ async fn main() -> anyhow::Result<()> {
 
     let database = connect(&DatabaseConfig::from_env()?).await?;
     ensure_initialized(&database).await?;
+    match kairos_platform_pent_server::infrastructure::recipe::load_from_db(&database).await {
+        Ok(count) => tracing::info!(count, "tool recipes loaded from pent_tool_definitions"),
+        Err(error) => tracing::warn!(%error, "tool recipe load failed"),
+    }
     let redis = connect_redis().await;
     let tokens = TokenService::new(SecurityConfig::from_env()?);
     let system_state = kairos_platform_system_server::SystemState::with_cache(
