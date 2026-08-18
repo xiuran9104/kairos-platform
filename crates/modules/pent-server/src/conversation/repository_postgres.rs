@@ -539,6 +539,76 @@ impl ConversationRepository for PgConversationRepository {
         Ok(evidence_id)
     }
 
+    async fn begin_background_tool_execution(
+        &self,
+        run_id: &str,
+        execution_id: &str,
+        tool_name: &str,
+        arguments: &str,
+    ) -> anyhow::Result<()> {
+        let arguments = serde_json::from_str::<serde_json::Value>(arguments)
+            .map_err(|error| anyhow::anyhow!("后台工具参数不是有效 JSON: {error}"))?;
+        sqlx::query(
+            "INSERT INTO pent_tool_calls(
+                 id,run_id,tool_name,params_summary,permission_decision,
+                 started_at,executor_backend,execution_audit
+             ) VALUES($1,$2,$3,$4,'allowed',now(),'worker',$5)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(execution_id)
+        .bind(run_id)
+        .bind(tool_name)
+        .bind(redact_arguments(arguments))
+        .bind(serde_json::json!({
+            "outcome": "running",
+            "detached": true,
+            "successful_observation": false
+        }))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn cancel_background_tool_execution(
+        &self,
+        run_id: &str,
+        execution_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE pent_tool_calls SET
+                 completed_at=now(), exit_code=130,
+                 execution_audit=execution_audit || $3::jsonb
+             WHERE run_id=$1 AND id=$2 AND completed_at IS NULL",
+        )
+        .bind(run_id)
+        .bind(execution_id)
+        .bind(serde_json::json!({
+            "outcome": "cancelled",
+            "error_code": "TOOL_CANCELLED",
+            "cancel_reason": reason,
+            "successful_observation": false
+        }))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn pending_background_tool_executions(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM pent_tool_calls
+             WHERE run_id=$1 AND completed_at IS NULL
+               AND execution_audit->>'detached'='true'
+             ORDER BY started_at LIMIT 50",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn load_run_tool_history(&self, run_id: &str) -> anyhow::Result<RunToolHistory> {
         let rows = sqlx::query_as::<
             _,
@@ -771,10 +841,13 @@ impl ConversationRepository for PgConversationRepository {
                         Option<i64>,
                         Option<String>,
                         Option<String>,
+                        serde_json::Value,
+                        Option<String>,
                     ),
                 >(
                     "SELECT tc.tool_name, tc.exit_code, tc.completed_at::text,
-                            tc.duration_ms, e.id, e.source
+                            tc.duration_ms, e.id, e.source, tc.params_summary,
+                            tc.execution_audit->>'outcome'
                      FROM pent_tool_calls tc
                      LEFT JOIN pent_evidence e
                        ON e.tool_call_id=tc.id AND e.run_id=tc.run_id
@@ -807,11 +880,19 @@ impl ConversationRepository for PgConversationRepository {
                 Ok(serde_json::json!({
                     "execution_id": execution_id,
                     "tool_name": row.0,
-                    "status": if row.2.is_none() { "running" } else if row.1 == Some(0) { "completed" } else { "failed" },
+                    "status": match (row.2.is_none(), row.7.as_deref(), row.1) {
+                        (true, _, _) => "running",
+                        (_, Some("cancelled"), _) => "cancelled",
+                        (_, Some("timed_out"), _) => "timed_out",
+                        (_, _, Some(0)) => "completed",
+                        _ => "failed",
+                    },
                     "exit_code": row.1,
                     "completed_at": row.2,
                     "duration_ms": row.3,
                     "evidence_id": row.4,
+                    "arguments": row.6,
+                    "outcome": row.7,
                     "page": page,
                     "limit": limit,
                     "total_lines": total_lines,

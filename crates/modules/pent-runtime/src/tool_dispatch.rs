@@ -84,7 +84,7 @@ impl<'a> ToolDispatcher<'a> {
             return plan;
         };
         for (call, decision) in calls.iter_mut().zip(plan.decisions.iter_mut()) {
-            if decision.blocked.is_some() {
+            if decision.blocked.is_some() || is_deferred_execution_control(&call.name) {
                 continue;
             }
             match self
@@ -200,6 +200,16 @@ fn is_agent_management_tool(tool_name: &str) -> bool {
     )
 }
 
+fn is_deferred_execution_control(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "start_tool_execution"
+            | "get_tool_execution"
+            | "wait_tool_execution"
+            | "cancel_tool_execution"
+    )
+}
+
 fn is_plan_management_tool(tool_name: &str) -> bool {
     matches!(tool_name, "plan_create" | "plan_get" | "plan_update")
 }
@@ -224,6 +234,18 @@ fn enforce_single_operational_action(calls: &[ModelToolCall], plan: &mut ToolDis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RejectAll;
+
+    #[async_trait::async_trait]
+    impl ToolApprovalGate for RejectAll {
+        async fn review(
+            &self,
+            _request: &ToolApprovalRequest,
+        ) -> anyhow::Result<ToolApprovalOutcome> {
+            Ok(ToolApprovalOutcome::Rejected("outer review should be skipped".into()))
+        }
+    }
 
     fn call(name: &str, arguments: &str, execution_class: ToolExecutionClass) -> ModelToolCall {
         ModelToolCall {
@@ -318,5 +340,26 @@ mod tests {
         let decision = prepare_call(&mut shell, &ToolDispatchPolicy::default());
 
         assert!(decision.blocked.is_some());
+    }
+
+    #[tokio::test]
+    async fn deferred_execution_wrapper_skips_outer_approval() {
+        let mut calls = vec![call(
+            "start_tool_execution",
+            r#"{"tool_name":"nuclei","arguments":{"target":"https://example.test"}}"#,
+            ToolExecutionClass::Inline,
+        )];
+        let plan = ToolDispatcher::new(&RejectAll)
+            .prepare(
+                &mut calls,
+                &ToolDispatchContext {
+                    run_id: Some("run-1".into()),
+                    session_id: "session-1".into(),
+                    policy: ToolDispatchPolicy::default(),
+                },
+            )
+            .await;
+
+        assert!(plan.decisions[0].blocked.is_none());
     }
 }

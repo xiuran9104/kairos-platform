@@ -18,6 +18,7 @@ pub struct AiModelGateway {
     pool: PgPool,
     factory: AiModelFactory,
     exhausted_tools: Mutex<HashSet<String>>,
+    unlocked_tools: Mutex<HashSet<String>>,
 }
 
 impl AiModelGateway {
@@ -26,6 +27,7 @@ impl AiModelGateway {
             factory: AiModelFactory::new(pool.clone()),
             pool,
             exhausted_tools: Mutex::new(HashSet::new()),
+            unlocked_tools: Mutex::new(HashSet::new()),
         }
     }
 
@@ -114,6 +116,12 @@ impl ConversationModelGateway for AiModelGateway {
         }
     }
 
+    fn unlock_tools(&self, tools: HashSet<String>) {
+        if let Ok(mut guard) = self.unlocked_tools.lock() {
+            guard.extend(tools.into_iter().map(|tool| tool.to_ascii_lowercase()));
+        }
+    }
+
     async fn generate(
         &self,
         context: &ConversationContext,
@@ -169,6 +177,12 @@ impl ConversationModelGateway for AiModelGateway {
         } else {
             // Full catalog: all active tools, no routing truncation.
             // The LLM is best positioned to select tools for each task.
+            let mut unlocked = self
+                .unlocked_tools
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            unlocked.extend(recovered_tool_unlocks(context));
             super::tool_catalog::load_tools_for_intent(
                 &self.pool,
                 &routing_intent(context),
@@ -176,6 +190,7 @@ impl ConversationModelGateway for AiModelGateway {
                     .policy_snapshot
                     .get("multi_agent")
                     .unwrap_or(&Value::Null),
+                &unlocked,
             )
             .await?
         };
@@ -224,7 +239,8 @@ impl ConversationModelGateway for AiModelGateway {
                         && (multi_agent_enabled || !agent_tool)
                         && !(sub_agent
                             && (agent_tool
-                                || matches!(name, "plan_create" | "plan_get" | "plan_update")))
+                                || matches!(name, "plan_create" | "plan_get" | "plan_update")
+                                || super::async_tools::is_control_tool(name)))
                 })
                 .collect()
         };
@@ -367,6 +383,48 @@ impl ConversationModelGateway for AiModelGateway {
             },
             tool_calls,
         })
+    }
+}
+
+fn recovered_tool_unlocks(context: &ConversationContext) -> HashSet<String> {
+    let mut unlocked = HashSet::new();
+    for message in &context.recent_messages {
+        if message.role != "tool" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&message.content) else {
+            continue;
+        };
+        collect_tool_search_names(&value, &mut unlocked);
+    }
+    unlocked
+}
+
+fn collect_tool_search_names(value: &Value, unlocked: &mut HashSet<String>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(tools) = object.get("tools").and_then(Value::as_array) {
+                for tool in tools {
+                    if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                        unlocked.insert(name.to_ascii_lowercase());
+                    }
+                }
+            }
+            for child in object.values() {
+                collect_tool_search_names(child, unlocked);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_search_names(item, unlocked);
+            }
+        }
+        Value::String(encoded) => {
+            if let Ok(child) = serde_json::from_str::<Value>(encoded) {
+                collect_tool_search_names(&child, unlocked);
+            }
+        }
+        _ => {}
     }
 }
 

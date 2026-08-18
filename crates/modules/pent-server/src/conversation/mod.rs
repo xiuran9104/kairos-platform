@@ -4,6 +4,7 @@ mod finding_projection;
 mod runtime;
 mod web_coverage;
 mod web_session;
+mod async_tools;
 
 pub use kairos_platform_pent_runtime::ports::*;
 pub use runtime::*;
@@ -144,6 +145,8 @@ pub mod structured_output;
 pub mod tool_catalog;
 pub mod tool_executor;
 mod tool_extensions;
+mod tool_guidance;
+mod tool_health;
 pub mod tool_guard;
 mod tool_result_processor;
 mod tool_result_sinks;

@@ -211,6 +211,10 @@ pub(crate) fn is_evidence_tool(tool_name: &str) -> bool {
             | "evidence_view"
             | "query_execution_result"
             | "query-execution-result"
+            | "start_tool_execution"
+            | "get_tool_execution"
+            | "wait_tool_execution"
+            | "cancel_tool_execution"
     )
 }
 

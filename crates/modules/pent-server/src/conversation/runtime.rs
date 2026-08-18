@@ -23,6 +23,7 @@ use super::{
     ConversationToolExecutor, FindingRecorder, InlineToolExecutor, ModelToolCall, ModelTurnOutput,
     PlanStore, RoleResolver, RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall,
     RuntimeToolResult, SkillStore, ToolApprovalGate, ToolExecutionClass, ToolExecutionContext,
+    ToolApprovalOutcome, ToolApprovalRequest,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopLimits, parse_agent_directive,
@@ -162,6 +163,7 @@ pub struct ConversationRuntime {
     agent_sessions: Arc<dyn AgentSessionFactory>,
     events: Arc<dyn ConversationEventSink>,
     nats: Option<crate::transport::mq::NatsHandle>,
+    async_tools: super::async_tools::AsyncToolRegistry,
 }
 
 struct MainInlineToolExecutor<'a> {
@@ -378,6 +380,119 @@ impl MainAgentRunHooks<'_> {
 }
 
 impl ConversationRuntime {
+    async fn execute_async_control_tool(
+        &self,
+        tc: &RuntimeToolCall,
+        session_id: &str,
+        context: &ConversationContext,
+    ) -> RuntimeToolResult {
+        let content = async {
+            let run_id = context
+                .run_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("execution 控制工具只能在已有 Run 中使用"))?;
+            match tc.name.as_str() {
+                "start_tool_execution" => {
+                    let parsed = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        .map_err(|error| anyhow::anyhow!("启动参数不是有效 JSON: {error}"))?;
+                    let tool_name = parsed
+                        .get("tool_name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("start_tool_execution 缺少 tool_name"))?;
+                    let arguments = parsed
+                        .get("arguments")
+                        .filter(|value| value.is_object())
+                        .ok_or_else(|| anyhow::anyhow!("start_tool_execution.arguments 必须是对象"))?
+                        .to_string();
+                    anyhow::ensure!(
+                        super::tool_executor::has_conversation_handler(tool_name),
+                        "工具 {tool_name} 当前不可执行或未注册"
+                    );
+                    anyhow::ensure!(
+                        !is_runtime_reference_tool(tool_name),
+                        "内联控制/查询工具不能作为后台安全任务启动"
+                    );
+                    if let Some(whitelist) = context
+                        .policy_snapshot
+                        .pointer("/_role/tool_whitelist")
+                        .and_then(serde_json::Value::as_array)
+                        .filter(|values| !values.is_empty())
+                    {
+                        anyhow::ensure!(
+                            whitelist.iter().any(|value| value.as_str() == Some(tool_name)),
+                            "当前 Agent 角色不允许后台调用工具 {tool_name}"
+                        );
+                    }
+                    match self
+                        .approval_gate
+                        .review(&ToolApprovalRequest {
+                            run_id: run_id.to_string(),
+                            session_id: session_id.to_string(),
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tool_name.to_string(),
+                            arguments: arguments.clone(),
+                        })
+                        .await?
+                    {
+                        ToolApprovalOutcome::Approved(effective_arguments) => {
+                            self.async_tools
+                                .start(
+                                    self.repository.clone(),
+                                    self.tool_executor.clone(),
+                                    ToolExecutionContext {
+                                        scope_snapshot: context.scope_snapshot.clone(),
+                                        session_id: session_id.to_string(),
+                                        run_id: Some(run_id.to_string()),
+                                    },
+                                    tool_name.to_string(),
+                                    effective_arguments,
+                                )
+                                .await
+                        }
+                        ToolApprovalOutcome::Rejected(reason) => {
+                            Ok(serde_json::json!({
+                                "error": reason,
+                                "blocked": true,
+                                "retryable": false
+                            }))
+                        }
+                    }
+                }
+                "get_tool_execution" => {
+                    self.async_tools
+                        .get(self.repository.as_ref(), run_id, &tc.arguments)
+                        .await
+                }
+                "wait_tool_execution" => {
+                    self.async_tools
+                        .wait(self.repository.as_ref(), run_id, &tc.arguments)
+                        .await
+                }
+                "cancel_tool_execution" => {
+                    self.async_tools
+                        .cancel(self.repository.as_ref(), run_id, &tc.arguments)
+                        .await
+                }
+                _ => anyhow::bail!("未知 execution 控制工具: {}", tc.name),
+            }
+        }
+        .await;
+        RuntimeToolResult {
+            tool_call_id: tc.id.clone(),
+            tool_name: tc.name.clone(),
+            success: content
+                .as_ref()
+                .is_ok_and(|value| value.get("error").is_none()),
+            content: content
+                .map(|value| value.to_string())
+                .unwrap_or_else(|error| {
+                    serde_json::json!({"error":error.to_string(),"retryable":false}).to_string()
+                }),
+        }
+    }
+
     async fn process_main_agent_output(
         &self,
         round: usize,
@@ -630,19 +745,50 @@ impl ConversationRuntime {
                         },
                     )
                     .await?;
-                let succeeded = processed.succeeded;
-                web_session.observe(&item.arguments, &result.content);
-                scan_progress.record_tool_arguments(&item.tool_name, &item.arguments, succeeded);
-                web_coverage.observe(&item.tool_name, &item.arguments, &result.content, succeeded);
+                let detached = detached_tool_observation(&item.tool_name, &result.content);
+                let succeeded = detached
+                    .as_ref()
+                    .map(|value| value.succeeded)
+                    .unwrap_or(processed.succeeded);
+                let observed_tool_name = detached
+                    .as_ref()
+                    .map(|value| value.tool_name.as_str())
+                    .unwrap_or(item.tool_name.as_str());
+                let observed_arguments = detached
+                    .as_ref()
+                    .map(|value| value.arguments.as_str())
+                    .unwrap_or(item.arguments.as_str());
+                let observed_content = detached
+                    .as_ref()
+                    .map(|value| value.content.as_str())
+                    .unwrap_or(result.content.as_str());
+                web_session.observe(observed_arguments, observed_content);
+                scan_progress.record_tool_arguments(
+                    observed_tool_name,
+                    observed_arguments,
+                    succeeded,
+                );
+                web_coverage.observe(
+                    observed_tool_name,
+                    observed_arguments,
+                    observed_content,
+                    succeeded,
+                );
                 if item.tool_name == "record_finding" {
                     scan_progress.record_finding_arguments(&item.arguments, succeeded);
                 }
                 if succeeded {
                     executed_call_signatures
-                        .insert(tool_call_signature(&item.tool_name, &item.arguments));
+                        .insert(tool_call_signature(observed_tool_name, observed_arguments));
                 }
                 if tool_name == "skill_load" && succeeded {
                     *skill_loaded = true;
+                }
+                if tool_name == "tool_search" && succeeded {
+                    let unlocked = super::tool_catalog::tool_search_result_names(&result.content);
+                    if !unlocked.is_empty() {
+                        self.model_gateway.unlock_tools(unlocked);
+                    }
                 }
                 if plan_action
                     .as_ref()
@@ -665,10 +811,10 @@ impl ConversationRuntime {
                 let effective_observation = processed.effective_observation;
                 runner.record_tool_result(succeeded, effective_observation);
                 if let Some(diagnostic) = scan_progress.record_tool_result(
-                    tool_name,
+                    observed_tool_name,
                     succeeded,
                     effective_observation,
-                    &result.content,
+                    observed_content,
                 ) {
                     loop_diagnostic = Some(diagnostic);
                 }
@@ -676,10 +822,12 @@ impl ConversationRuntime {
                     scan_progress.record_traffic_replay();
                 }
 
-                let evidence_id = processed.evidence_id;
+                let evidence_id = processed
+                    .evidence_id
+                    .or_else(|| detached.as_ref().and_then(|value| value.evidence_id.clone()));
                 if let Some(eid) = evidence_id.as_ref() {
                     evidence_ids.push(eid.clone());
-                    scan_progress.record_evidence_tool(&eid, tool_name);
+                    scan_progress.record_evidence_tool(&eid, observed_tool_name);
                     if plan_action
                         .as_ref()
                         .is_some_and(|(_, action_call_id)| action_call_id == call_id)
@@ -688,9 +836,9 @@ impl ConversationRuntime {
                     }
                     if succeeded && let Some(run_id) = context.run_id.as_deref() {
                         for finding in finding_projection.observe(
-                            tool_name,
-                            &item.arguments,
-                            &result.content,
+                            observed_tool_name,
+                            observed_arguments,
+                            observed_content,
                             eid,
                         ) {
                             match self
@@ -703,7 +851,7 @@ impl ConversationRuntime {
                                         .record_finding_arguments(&finding.to_string(), true);
                                     tracing::info!(
                                         run_id,
-                                        tool = %tool_name,
+                                        tool = %observed_tool_name,
                                         finding = %finding["title"],
                                         duplicate = recorded["duplicate"].as_bool().unwrap_or(false),
                                         "projected deterministic finding from evidence"
@@ -711,7 +859,7 @@ impl ConversationRuntime {
                                 }
                                 Err(error) => tracing::warn!(
                                     run_id,
-                                    tool = %tool_name,
+                                    tool = %observed_tool_name,
                                     %error,
                                     "failed to project deterministic finding"
                                 ),
@@ -722,10 +870,10 @@ impl ConversationRuntime {
                 append_run_summary(
                     run_summary,
                     round + 1,
-                    tool_name,
+                    observed_tool_name,
                     succeeded,
                     evidence_id.as_deref(),
-                    &result.content,
+                    observed_content,
                 );
                 context.recent_messages.push(processed.model_message);
             }
@@ -881,6 +1029,24 @@ impl ConversationRuntime {
                 return Ok(AgentRoundOutcome::Continue);
             }
             AgentDirective::Final(candidate) | AgentDirective::Candidate(candidate) => {
+                if let Some(run_id) = context.run_id.as_deref() {
+                    let pending = self
+                        .repository
+                        .pending_background_tool_executions(run_id)
+                        .await?;
+                    if !pending.is_empty() {
+                        push_gate_rejection(
+                            context,
+                            round,
+                            &output.content,
+                            &format!(
+                                "FINAL 被拒绝：仍有后台工具执行未完成：{}。请调用 wait_tool_execution/get_tool_execution 收集结果，或在确有必要时取消。",
+                                pending.join(", ")
+                            ),
+                        );
+                        return Ok(AgentRoundOutcome::Continue);
+                    }
+                }
                 let orchestration_rejection =
                     if super::agent_pipeline::multi_agent_enabled(&context.policy_snapshot) {
                         self.orchestration_completion_rejection(
@@ -1038,6 +1204,7 @@ impl ConversationRuntime {
             agent_sessions,
             events,
             nats: None,
+            async_tools: super::async_tools::AsyncToolRegistry::global(),
         }
     }
 
@@ -1595,6 +1762,10 @@ impl ConversationRuntime {
                         serde_json::json!({"error":e.to_string(),"retryable":false}).to_string()
                     }),
                 }
+            }
+            name if super::async_tools::is_control_tool(name) => {
+                self.execute_async_control_tool(tc, session_id, context)
+                    .await
             }
             "agent_spawn" => {
                 self.execute_agent_spawn(&tc.id, &tc.arguments, session_id, context, agent_session)
@@ -2365,7 +2536,8 @@ fn compact_runtime_error(error: &str) -> String {
 mod tests {
     use super::{
         AgentDirective, ModelToolCall, compact_runtime_error, deduplicate_tool_calls,
-        parse_agent_directive, skill_gate_rejection, tool_call_signature,
+        detached_tool_observation, parse_agent_directive, skill_gate_rejection,
+        tool_call_signature,
     };
     use kairos_platform_pent_api::ToolExecutionClass;
     use std::collections::HashSet;
@@ -2505,6 +2677,28 @@ mod tests {
             AgentDirective::Replan("改用 POST 请求测试".into())
         );
     }
+
+    #[test]
+    fn completed_detached_result_is_attributed_to_the_underlying_tool() {
+        let observation = detached_tool_observation(
+            "wait_tool_execution",
+            r#"{"status":"completed","tool_name":"nuclei","arguments":{"target":"https://example.test"},"evidence_id":"ev-1","lines":["finding-a","finding-b"]}"#,
+        )
+        .expect("completed execution should project an observation");
+
+        assert_eq!(observation.tool_name, "nuclei");
+        assert!(observation.arguments.contains("example.test"));
+        assert_eq!(observation.content, "finding-a\nfinding-b");
+        assert_eq!(observation.evidence_id.as_deref(), Some("ev-1"));
+        assert!(observation.succeeded);
+        assert!(
+            detached_tool_observation(
+                "get_tool_execution",
+                r#"{"status":"running","tool_name":"nuclei"}"#,
+            )
+            .is_none()
+        );
+    }
 }
 
 fn is_skill_tool(tool_name: &str) -> bool {
@@ -2579,6 +2773,9 @@ fn skill_gate_rejection(skill_loaded: bool, calls: &[ModelToolCall]) -> Option<&
             "skill_list"
                 | "skill_load"
                 | "tool_search"
+                | "get_tool_execution"
+                | "wait_tool_execution"
+                | "cancel_tool_execution"
                 | "knowledge_search"
                 | "plan_create"
                 | "plan_get"
@@ -2595,12 +2792,86 @@ fn skill_gate_rejection(skill_loaded: bool, calls: &[ModelToolCall]) -> Option<&
     )
 }
 
+fn is_runtime_reference_tool(tool_name: &str) -> bool {
+    super::async_tools::is_control_tool(tool_name)
+        || is_evidence_tool(tool_name)
+        || is_traffic_tool(tool_name)
+        || is_finding_tool(tool_name)
+        || matches!(
+            tool_name,
+            "knowledge_search"
+                | "vision_analyze"
+                | "skill_list"
+                | "skill_load"
+                | "tool_search"
+                | "agent_spawn"
+                | "agent_status"
+                | "agent_collect"
+                | "agent_list"
+                | "plan_create"
+                | "plan_get"
+                | "plan_update"
+        )
+}
+
 fn is_reference_tool(tool_name: &str) -> bool {
     tool_name == "knowledge_search"
         || tool_name == "tool_search"
         || is_evidence_tool(tool_name)
         || is_finding_tool(tool_name)
         || is_skill_tool(tool_name)
+}
+
+struct DetachedToolObservation {
+    tool_name: String,
+    arguments: String,
+    content: String,
+    evidence_id: Option<String>,
+    succeeded: bool,
+}
+
+fn detached_tool_observation(
+    control_tool_name: &str,
+    content: &str,
+) -> Option<DetachedToolObservation> {
+    if !matches!(control_tool_name, "get_tool_execution" | "wait_tool_execution") {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let status = value.get("status").and_then(serde_json::Value::as_str)?;
+    if status == "running" {
+        return None;
+    }
+    let tool_name = value
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+        .to_string();
+    let content = value
+        .get("lines")
+        .and_then(serde_json::Value::as_array)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    Some(DetachedToolObservation {
+        tool_name,
+        arguments,
+        content,
+        evidence_id: value
+            .get("evidence_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        succeeded: status == "completed",
+    })
 }
 
 /// Detect "target unreachable" errors in tool output.

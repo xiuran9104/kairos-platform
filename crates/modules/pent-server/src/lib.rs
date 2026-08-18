@@ -1061,12 +1061,12 @@ async fn get_tool_call_result(
 /// Background worker: picks up queued runs, calls AI for analysis, manages lease.
 // ── Host tool auto-install ──────────────────────────────────────────────
 
-async fn ensure_host_tools() {
+async fn ensure_host_tools(pool: PgPool, worker_id: String) {
     use crate::infrastructure::tool_lifecycle;
 
-    if !crate::infrastructure::process::auto_install_enabled() {
+    let auto_install = crate::infrastructure::process::auto_install_enabled();
+    if !auto_install {
         tracing::info!("host tool startup auto-install disabled");
-        return;
     }
 
     let tools = tool_lifecycle::all_host_tools();
@@ -1077,6 +1077,33 @@ async fn ensure_host_tools() {
     for lifecycle in &tools {
         if lifecycle.is_installed().await {
             healthy += 1;
+            record_worker_tool_health(
+                &pool,
+                &worker_id,
+                lifecycle,
+                "healthy",
+                serde_json::json!({
+                    "binary": lifecycle.resolved_binary_path(),
+                    "source": "worker-startup"
+                }),
+            )
+            .await;
+            continue;
+        }
+        if !auto_install {
+            failed.push(lifecycle.tool_name);
+            record_worker_tool_health(
+                &pool,
+                &worker_id,
+                lifecycle,
+                "unhealthy",
+                serde_json::json!({
+                    "binary": lifecycle.binary_path,
+                    "error": "binary missing and auto-install disabled",
+                    "source": "worker-startup"
+                }),
+            )
+            .await;
             continue;
         }
         tracing::warn!(
@@ -1088,6 +1115,17 @@ async fn ensure_host_tools() {
             Ok(()) => {
                 tracing::info!(tool = lifecycle.tool_name, "installed successfully");
                 installed += 1;
+                record_worker_tool_health(
+                    &pool,
+                    &worker_id,
+                    lifecycle,
+                    "healthy",
+                    serde_json::json!({
+                        "binary": lifecycle.resolved_binary_path(),
+                        "source": "worker-auto-install"
+                    }),
+                )
+                .await;
             }
             Err(error) => {
                 tracing::error!(
@@ -1096,6 +1134,18 @@ async fn ensure_host_tools() {
                     "install failed; tool will not be available"
                 );
                 failed.push(lifecycle.tool_name);
+                record_worker_tool_health(
+                    &pool,
+                    &worker_id,
+                    lifecycle,
+                    "unhealthy",
+                    serde_json::json!({
+                        "binary": lifecycle.binary_path,
+                        "error": error,
+                        "source": "worker-auto-install"
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -1107,13 +1157,70 @@ async fn ensure_host_tools() {
         total = tools.len(),
         "host tool startup check complete"
     );
+
+    let refresh_seconds = std::env::var("PENTA_TOOL_HEALTH_REFRESH_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(15, 3_600);
+    let mut refresh = tokio::time::interval(std::time::Duration::from_secs(refresh_seconds));
+    // The startup pass above is the first observation; don't immediately
+    // duplicate it when Tokio's interval produces its eager first tick.
+    refresh.tick().await;
+    loop {
+        refresh.tick().await;
+        for lifecycle in &tools {
+            let installed = lifecycle.is_installed().await;
+            record_worker_tool_health(
+                &pool,
+                &worker_id,
+                lifecycle,
+                if installed { "healthy" } else { "unhealthy" },
+                serde_json::json!({
+                    "binary": lifecycle.resolved_binary_path(),
+                    "configured_binary": lifecycle.binary_path,
+                    "source": "worker-health-refresh"
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+async fn record_worker_tool_health(
+    pool: &PgPool,
+    worker_id: &str,
+    lifecycle: &crate::infrastructure::tool_lifecycle::ToolLifecycle,
+    status: &str,
+    detail: serde_json::Value,
+) {
+    let mut tool_ids = Vec::with_capacity(lifecycle.aliases.len() + 1);
+    tool_ids.push(lifecycle.tool_name.to_string());
+    tool_ids.extend(lifecycle.aliases.iter().map(|alias| (*alias).to_string()));
+    if let Err(error) = sqlx::query(
+        "INSERT INTO pent_tool_health(tool_id,version,worker_id,status,detail,checked_at)
+         SELECT tool_id,version,$2,$3,$4,now()
+         FROM pent_tool_definitions
+         WHERE tool_id = ANY($1)
+         ON CONFLICT(tool_id,version,worker_id) DO UPDATE SET
+             status=EXCLUDED.status,detail=EXCLUDED.detail,checked_at=now()",
+    )
+    .bind(&tool_ids)
+    .bind(worker_id)
+    .bind(status)
+    .bind(detail)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(tool = lifecycle.tool_name, %error, "failed to persist worker tool health");
+    }
 }
 
 pub async fn start_worker(pool: PgPool, worker_id: String, lease_ttl: i64) {
     if let Err(error) = register_worker(&pool, &worker_id).await {
         tracing::warn!(worker=%worker_id, error=%error, "worker registration failed");
     }
-    tokio::spawn(ensure_host_tools());
+    tokio::spawn(ensure_host_tools(pool.clone(), worker_id.clone()));
     // Run recovery before polling for new work. This immediately re-queues
     // expired parent leases, making their unfinished child-agent events
     // eligible for recovery by the normal exactly-once run claim path.

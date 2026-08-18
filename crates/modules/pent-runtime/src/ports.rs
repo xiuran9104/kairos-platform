@@ -303,6 +303,33 @@ pub trait ConversationRepository: Send + Sync {
         content: &str,
         duration_ms: u64,
     ) -> anyhow::Result<String>;
+    /// Create a durable running execution before a long-running tool is
+    /// detached from the model round.
+    async fn begin_background_tool_execution(
+        &self,
+        _run_id: &str,
+        _execution_id: &str,
+        _tool_name: &str,
+        _arguments: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("background tool execution is not supported")
+    }
+    /// Mark a still-running detached execution as cancelled.
+    async fn cancel_background_tool_execution(
+        &self,
+        _run_id: &str,
+        _execution_id: &str,
+        _reason: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Return detached executions that still block finalization.
+    async fn pending_background_tool_executions(
+        &self,
+        _run_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// Restore bounded execution state for duplicate prevention and completion
     /// gates when the same run continues in a later conversation turn.
     async fn load_run_tool_history(&self, run_id: &str) -> anyhow::Result<RunToolHistory>;
@@ -392,6 +419,11 @@ pub trait ConversationModelGateway: Send + Sync {
     /// Temporarily hide tools that have exceeded their consecutive failure
     /// limit. Called by the runtime before each model turn.
     fn set_exhausted_tools(&self, _tools: HashSet<String>) {}
+
+    /// Keep schemas selected by `tool_search` visible for the rest of the
+    /// current run. Implementations may scope this state to their runtime
+    /// instance; the conversation context remains the recovery fallback.
+    fn unlock_tools(&self, _tools: HashSet<String>) {}
 }
 
 #[async_trait]
