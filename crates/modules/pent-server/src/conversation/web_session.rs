@@ -57,7 +57,7 @@ impl WebSessionState {
             | "xss_validate" => {
                 changed |= merge_header_cookie_field(object, "header", &cookie);
             }
-            "http_request" => {
+            "http_request" | "web_crawl" | "web_url_collect" => {
                 let headers = object
                     .entry("headers")
                     .or_insert_with(|| Value::Object(Default::default()));
@@ -335,6 +335,18 @@ mod tests {
         assert!(state.inject(&mut nuclei));
         assert!(nuclei.arguments.contains("PHPSESSID=abc"));
         assert!(nuclei.arguments.contains("security=low"));
+    }
+
+    #[test]
+    fn propagates_login_cookie_to_recursive_crawler() {
+        let mut state = WebSessionState::default();
+        state.observe(
+            r#"{"url":"http://target/login","headers":{"Cookie":"session=abc"}}"#,
+            "{}",
+        );
+        let mut crawler = call("web_crawl", r#"{"url":"http://target/"}"#);
+        assert!(state.inject(&mut crawler));
+        assert!(crawler.arguments.contains("session=abc"));
     }
 
     #[test]

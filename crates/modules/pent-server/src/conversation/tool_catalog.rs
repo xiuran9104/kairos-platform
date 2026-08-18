@@ -41,10 +41,7 @@ async fn tool_fts_search(pool: &PgPool, query: &str, top_k: usize) -> Vec<(Strin
     .fetch_all(pool)
     .await;
     match result {
-        Ok(rows) => rows
-            .into_iter()
-            .filter(|(_, rank)| *rank > 0.0)
-            .collect(),
+        Ok(rows) => rows.into_iter().filter(|(_, rank)| *rank > 0.0).collect(),
         Err(error) => {
             tracing::warn!(%error, "FTS tool search failed; falling back to full catalog");
             Vec::new()
@@ -132,17 +129,15 @@ pub async fn load_conversation_tool_definitions(
             |(name, description, parameters, risk_level, approval_policy, executor)| {
                 let execution_class =
                     descriptor_execution_class(&risk_level, &approval_policy, &executor);
-                tool_definition(
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "description": description,
-                            "parameters": parameters
-                        }
-                    }),
-                    execution_class,
-                )
+                let schema = json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters
+                    }
+                });
+                tool_definition(enhance_tool_schema(schema), execution_class)
             },
         )
         .collect::<Vec<_>>();
@@ -210,6 +205,12 @@ pub async fn load_conversation_tool_definitions(
             definitions.push(inline_definition(definition));
         }
     }
+    if !definitions
+        .iter()
+        .any(|definition| definition.name() == Some("tool_search"))
+    {
+        definitions.push(inline_definition(tool_search_definition()));
+    }
     for definition in agent_tool_definitions() {
         let name = definition.pointer("/function/name").and_then(Value::as_str);
         if !definitions.iter().any(|existing| existing.name() == name) {
@@ -224,6 +225,69 @@ pub async fn load_conversation_tool_definitions(
     }
 
     Ok(definitions)
+}
+
+fn enhance_tool_schema(mut schema: Value) -> Value {
+    let Some(name) = schema
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return schema;
+    };
+    let Some(guidance) = tool_usage_guidance(&name) else {
+        return schema;
+    };
+    let description = schema
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    schema["function"]["description"] = if description.is_empty() {
+        Value::String(guidance.into())
+    } else {
+        Value::String(format!("{description}\n使用说明：{guidance}"))
+    };
+    schema
+}
+
+fn tool_usage_guidance(name: &str) -> Option<&'static str> {
+    match name {
+        "hakrawler" | "katana" => Some(
+            "用于已授权 Web 目标的递归攻击面发现，输入根 URL，产出页面、API、JS 和带参数 URL；先运行它建立端点地图，再把隐藏参数交给 arjun/paramspider，把具体输入点交给专项验证器。它只负责发现，不代表漏洞已验证。",
+        ),
+        "arjun" | "x8" => Some(
+            "针对单个已发现端点探测未公开的 GET/POST 参数；输入必须是具体端点而非站点根域。新参数应回填端点账本，并分别进入 SQLi、XSS、服务端注入等验证。",
+        ),
+        "paramspider" | "gau" => Some(
+            "从公开历史数据补充带参数 URL，适合在主动爬虫后扩大攻击面；输出需要先做同源/Scope 过滤并验证可达性，不能直接当作漏洞证据。",
+        ),
+        "nuclei" | "web_vuln_scan" | "afrog" => Some(
+            "批量检测已知模板、组件暴露和常见错误配置；适合广度扫描，但不能替代端点参数覆盖、登录态扫描、IDOR/越权和业务逻辑差分。命中后还需专项复现并形成 Evidence。",
+        ),
+        "sqlmap" | "sqlmap_scan" | "sqli_validate" => Some(
+            "对具体带输入点的 URL、表单或请求执行 SQL 注入验证；应保留方法、请求体、Cookie 和 CSRF 上下文。站点根 URL 或没有参数的 URL 通常无效。成功结论必须引用可复现结果。",
+        ),
+        "dalfox" | "web_xss_scan" | "xss_validate" | "xsser" => Some(
+            "对具体参数或表单验证反射型/存储型/DOM XSS；应携带登录 Cookie，并区分仅反射字符串与可执行上下文。爬虫发现的每个输入点都应单独入队。",
+        ),
+        "http-framework-test" | "http_request" | "traffic_replay" => Some(
+            "用于精确复现和差分验证：保持同一端点，仅改变身份、对象 ID、方法或关键业务字段并比较状态码、响应结构和副作用。不要用它替代可用的批量专项扫描器。",
+        ),
+        "command_injection_validate" | "commix" => Some(
+            "只对已发现的命令/诊断类参数做无害标记验证；输入必须是具体端点和参数。不要把普通 5xx 或超时当作命令执行证据。",
+        ),
+        "file_inclusion_validate" => Some(
+            "对 file/path/page/template 等具体参数验证路径穿越或文件包含，使用无害、可识别的读取标记；需区分应用自身返回内容与真实文件读取。",
+        ),
+        "file_upload_validate" => Some(
+            "对具体上传表单提交无害标记文件并尝试回读；保留字段名、Cookie、CSRF 和附加表单字段。仅上传成功不等于可执行漏洞。",
+        ),
+        "record_finding" => Some(
+            "仅在漏洞已经由当前 Run 的 Evidence 复现确认后调用；每个不同根因/端点单独记录，evidence_ids 必须指向支持结论的证据。",
+        ),
+        _ => None,
+    }
 }
 
 /// DesRed-style dynamic tool disclosure: keep control/evidence tools visible
@@ -266,6 +330,7 @@ pub async fn load_tools_for_intent(
         .into_iter()
         .map(|(id, _)| id.to_ascii_lowercase())
         .collect();
+    let explicitly_unlocked = explicit_tool_names(intent);
     if retrieved.is_empty() {
         return Ok(all);
     }
@@ -279,6 +344,7 @@ pub async fn load_tools_for_intent(
         "traffic_view",
         "skill_list",
         "skill_load",
+        "tool_search",
         "agent_spawn",
         "agent_status",
         "agent_collect",
@@ -296,6 +362,7 @@ pub async fn load_tools_for_intent(
             ALWAYS.contains(&lower.as_str())
                 || lower.starts_with("mcp_")
                 || retrieved.contains(&lower)
+                || explicitly_unlocked.contains(&lower)
         })
         .collect::<Vec<_>>();
     tracing::debug!(
@@ -304,6 +371,98 @@ pub async fn load_tools_for_intent(
         "dynamic tool disclosure applied"
     );
     Ok(selected)
+}
+
+fn explicit_tool_names(intent: &str) -> std::collections::HashSet<String> {
+    let Ok(pattern) = regex::Regex::new(r#"\\?"name\\?"\s*:\s*\\?"([A-Za-z0-9_.:-]+)\\?""#) else {
+        return std::collections::HashSet::new();
+    };
+    pattern
+        .captures_iter(intent)
+        .filter_map(|captures| captures.get(1))
+        .map(|value| value.as_str().to_ascii_lowercase())
+        .collect()
+}
+
+/// Search the complete active tool registry on demand. This is intentionally
+/// callable from the model loop so a narrowly disclosed catalog can expand
+/// after discovery reveals a new protocol, endpoint shape, or vulnerability.
+pub async fn search_tool_catalog(
+    pool: &PgPool,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<Value> {
+    let query = query.trim();
+    anyhow::ensure!(!query.is_empty(), "tool_search 缺少 query");
+    let limit = limit.clamp(1, 30);
+    let definitions = load_conversation_tool_definitions(pool).await?;
+    let ranked = retrieve_tool_ids(pool, query, limit * 3).await;
+    let ranks = ranked
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.to_ascii_lowercase(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let terms = query
+        .to_ascii_lowercase()
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .filter(|term| !term.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut candidates = definitions
+        .into_iter()
+        .filter(|definition| definition.name() != Some("tool_search"))
+        .filter_map(|definition| {
+            let name = definition.name()?.to_string();
+            let lower_name = name.to_ascii_lowercase();
+            let document = format!(
+                "{} {}",
+                lower_name,
+                definition
+                    .schema
+                    .pointer("/function/description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+            );
+            let lexical_score = terms
+                .iter()
+                .filter(|term| document.contains(term.as_str()))
+                .count();
+            let rank = ranks.get(&lower_name).copied();
+            (rank.is_some() || lexical_score > 0).then_some((
+                rank,
+                lexical_score,
+                name,
+                definition.schema,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.0
+            .unwrap_or(usize::MAX)
+            .cmp(&right.0.unwrap_or(usize::MAX))
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    candidates.truncate(limit);
+    let tools = candidates
+        .into_iter()
+        .map(|(_, _, name, schema)| {
+            json!({
+                "name": name,
+                "description": schema.pointer("/function/description").cloned().unwrap_or(Value::Null),
+                "parameters": schema.pointer("/function/parameters").cloned().unwrap_or_else(|| json!({"type":"object"}))
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "query": query,
+        "count": tools.len(),
+        "tools": tools,
+        "instruction": "下一轮直接按返回的精确 name 调用所需工具；若无结果，改用更具体的协议、漏洞类别或工具名再次搜索。"
+    }))
 }
 
 fn evidence_tool_definitions() -> Vec<Value> {
@@ -520,6 +679,25 @@ fn skill_tool_definitions() -> Vec<Value> {
     ]
 }
 
+fn tool_search_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "tool_search",
+            "description": "按当前新发现的协议、技术栈、漏洞类型或工具名动态检索完整工具注册表。当前可见工具不足时调用，返回下一轮可直接调用的精确工具名和参数结构。",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "description": "具体能力需求，例如 GraphQL introspection、SSRF、JWT、SMB enumeration"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 12}
+                }
+            }
+        }
+    })
+}
+
 fn agent_tool_definitions() -> Vec<Value> {
     let agent_roles = super::agent_profiles::list()
         .map(|profiles| {
@@ -656,8 +834,9 @@ fn file_upload_validator_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_tool_definitions, descriptor_execution_class, evidence_tool_definitions,
-        file_upload_validator_definition, finding_tool_definitions, knowledge_search_definition,
+        agent_tool_definitions, descriptor_execution_class, enhance_tool_schema,
+        evidence_tool_definitions, explicit_tool_names, file_upload_validator_definition,
+        finding_tool_definitions, knowledge_search_definition, tool_search_definition,
     };
     use crate::conversation::tool_executor::has_conversation_handler;
     use kairos_platform_pent_runtime::ports::ToolExecutionClass;
@@ -715,6 +894,35 @@ mod tests {
             definition["function"]["parameters"]["required"],
             serde_json::json!(["query"])
         );
+    }
+
+    #[test]
+    fn tool_search_schema_and_results_unlock_exact_tool_names() {
+        let definition = tool_search_definition();
+        assert_eq!(
+            definition["function"]["parameters"]["required"],
+            serde_json::json!(["query"])
+        );
+        let names =
+            explicit_tool_names(r#"{"tools":[{"name":"sqlmap_scan"},{"name":"web_xss_scan"}]}"#);
+        assert!(names.contains("sqlmap_scan"));
+        assert!(names.contains("web_xss_scan"));
+    }
+
+    #[test]
+    fn critical_tool_descriptions_explain_usage_output_and_boundary() {
+        let definition = enhance_tool_schema(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "hakrawler",
+                "description": "快速 Web 爬虫。",
+                "parameters": {"type": "object"}
+            }
+        }));
+        let description = definition["function"]["description"].as_str().unwrap();
+        assert!(description.contains("端点地图"));
+        assert!(description.contains("arjun/paramspider"));
+        assert!(description.contains("不代表漏洞已验证"));
     }
 
     #[test]
@@ -837,6 +1045,7 @@ mod tests {
             "knowledge_search",
             "skill_list",
             "skill_load",
+            "tool_search",
         ];
         for reference in REFERENCE {
             assert!(names.contains(reference), "缺少参考工具 {reference}");
@@ -1025,14 +1234,14 @@ pub async fn load_routed_tool_definitions(
         else {
             continue;
         };
-        definitions.push(json!({
+        definitions.push(enhance_tool_schema(json!({
             "type": "function",
             "function": {
                 "name": descriptor.tool_id,
                 "description": descriptor.description,
                 "parameters": descriptor.input_schema
             }
-        }));
+        })));
     }
 
     // Reference (fact-layer) tools are always available so the model can read
@@ -1057,6 +1266,7 @@ pub async fn load_routed_tool_definitions(
         .chain(traffic_tool_definitions())
         .chain(finding_tool_definitions())
         .chain(skill_tool_definitions())
+        .chain(std::iter::once(tool_search_definition()))
         .chain(agent_tool_definitions())
     {
         let name = definition.pointer("/function/name").and_then(Value::as_str);

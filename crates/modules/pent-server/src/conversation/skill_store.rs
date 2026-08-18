@@ -16,8 +16,22 @@ impl PgSkillStore {
 impl SkillStore for PgSkillStore {
     async fn execute(&self, tool_name: &str, arguments: &str) -> anyhow::Result<serde_json::Value> {
         let arguments = serde_json::from_str::<serde_json::Value>(arguments)
-            .map_err(|error| anyhow::anyhow!("Skill 工具参数不是有效 JSON: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("内联目录工具参数不是有效 JSON: {error}"))?;
         match tool_name {
+            "tool_search" => {
+                let query = arguments
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("tool_search 缺少 query"))?;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(12) as usize;
+                crate::conversation::tool_catalog::search_tool_catalog(&self.pool, query, limit)
+                    .await
+            }
             "skill_list" => {
                 let category = arguments
                     .get("category")
@@ -46,7 +60,7 @@ impl SkillStore for PgSkillStore {
                     .await
                     .map_err(anyhow::Error::msg)
             }
-            _ => anyhow::bail!("未知 Skill 工具: {tool_name}"),
+            _ => anyhow::bail!("未知内联目录工具: {tool_name}"),
         }
     }
 }

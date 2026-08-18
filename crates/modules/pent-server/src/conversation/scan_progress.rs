@@ -154,7 +154,7 @@ fn is_targeted_dvwa_validation(module: &str, tool_name: &str, arguments: &str) -
     }
 }
 
-fn looks_like_logic_validation(arguments: &str) -> bool {
+pub(super) fn looks_like_logic_validation(arguments: &str) -> bool {
     let identity_or_object = [
         "authorization",
         "cookie",
@@ -187,7 +187,7 @@ fn looks_like_logic_validation(arguments: &str) -> bool {
     identity_or_object && active_request
 }
 
-fn looks_like_server_or_file_validation(arguments: &str) -> bool {
+pub(super) fn looks_like_server_or_file_validation(arguments: &str) -> bool {
     [
         "../",
         "%2e%2e",
@@ -429,7 +429,8 @@ impl ScanProgress {
         }
         self.broad_web_objective.then(|| format!(
             "## 通用 Web 全量覆盖门槛\n本任务要求尽可能发现靶场漏洞，不能在单个扫描器返回后结束。\n\
-             必须覆盖：{}。\n先建立端点/参数地图，再对每个输入点使用专项工具；\
+             必须覆盖：{}。\n先用 hakrawler/katana + arjun/paramspider 建立端点、表单和参数地图；\
+             当前目录没有所需能力时先调用 tool_search 动态检索，再对每个输入点使用专项工具；\
              nuclei 不覆盖鉴权、IDOR 和多数业务逻辑，必须使用不同身份/对象/方法的 HTTP 差分请求验证。\
              每发现一个确认问题立即 record_finding 并引用 Evidence。",
             WebCoverageArea::REQUIRED.iter().map(|area| area.label()).collect::<Vec<_>>().join("；")
@@ -646,6 +647,10 @@ impl ScanProgress {
 
     pub(super) fn stall_exhausted(&self) -> bool {
         self.consecutive_no_progress >= STALL_STOP_THRESHOLD
+    }
+
+    pub(super) fn requires_endpoint_coverage(&self) -> bool {
+        self.broad_web_objective
     }
 
     /// Tools that have failed ≥3 consecutive times and should be temporarily

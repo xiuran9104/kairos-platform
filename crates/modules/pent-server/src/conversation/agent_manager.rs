@@ -459,7 +459,9 @@ async fn execute_sub_agent_inline_tool(
                 .execute_evidence_tool(run_id, tool_name, arguments)
                 .await
         }
-        "skill_list" | "skill_load" => skill_store.execute(tool_name, arguments).await,
+        "skill_list" | "skill_load" | "tool_search" => {
+            skill_store.execute(tool_name, arguments).await
+        }
         "record_finding" => finding_recorder.record(run_id, arguments).await,
         _ => Err(anyhow::anyhow!("未知的子代理内联工具: {tool_name}")),
     };
@@ -496,6 +498,7 @@ impl InlineToolExecutor for SubAgentInlineToolExecutor<'_> {
                 | "query-execution-result"
                 | "skill_list"
                 | "skill_load"
+                | "tool_search"
                 | "record_finding"
                 | "agent_spawn"
                 | "agent_status"

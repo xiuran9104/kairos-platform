@@ -91,9 +91,18 @@ fn routing_intent(context: &ConversationContext) -> String {
         .find(|message| message.role == "user")
         .map(|message| message.content.clone())
         .unwrap_or_default();
+    let recent_tool_results = context
+        .recent_messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "tool")
+        .take(4)
+        .map(|message| message.content.chars().take(4_000).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "{}\n{}\n{}",
-        context.objective_snapshot, context.run_summary, last_user
+        "{}\n{}\n{}\n{}",
+        context.objective_snapshot, context.run_summary, last_user, recent_tool_results
     )
 }
 

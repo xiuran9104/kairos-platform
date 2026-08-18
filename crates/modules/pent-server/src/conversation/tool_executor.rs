@@ -62,6 +62,7 @@ pub(super) fn has_conversation_handler(tool_name: &str) -> bool {
             | "traffic_replay"
             | "skill_list"
             | "skill_load"
+            | "tool_search"
             | "web_crawl"
             | "web_fingerprint"
             | "web_url_collect"
@@ -216,14 +217,8 @@ pub async fn execute_tool(
             .await
         }
         "http_probe" if !direct_network_tools_enabled() => {
-            execute_isolated_http_probe(
-                arguments,
-                scope_snapshot,
-                session_id,
-                run_id,
-                execution_id,
-            )
-            .await
+            execute_isolated_http_probe(arguments, scope_snapshot, session_id, run_id, execution_id)
+                .await
         }
         "http_request" => execute_http_request(arguments).await,
         "http_probe" => execute_http_probe(arguments).await,
@@ -1095,11 +1090,38 @@ async fn execute_web_crawl(arguments: &str) -> ConversationToolResult {
         };
     }
 
-    // Make a GET request and extract URLs from the response
+    let start_url = match reqwest::Url::parse(url) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => url,
+        _ => {
+            return ConversationToolResult {
+                tool_call_id: String::new(),
+                tool_name: "web_url_collect".into(),
+                content: serde_json::json!({"error": "url 必须是有效的 http/https URL"})
+                    .to_string(),
+                success: false,
+            };
+        }
+    };
+    let max_pages = args["max_pages"].as_u64().unwrap_or(25).clamp(1, 100) as usize;
+    let max_depth = args["max_depth"].as_u64().unwrap_or(3).clamp(0, 8) as usize;
+    let cookie = args
+        .get("cookies")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let headers = args
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    // Redirects are handled by the crawler so every follow-up URL can be
+    // checked against the initial origin before a request is sent.
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .danger_accept_invalid_certs(true)
         .user_agent("Kairos-Pent-Agent/1.0")
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -1113,32 +1135,116 @@ async fn execute_web_crawl(arguments: &str) -> ConversationToolResult {
         }
     };
 
-    match client.get(url).send().await {
-        Ok(resp) => {
-            let body = resp.text().await.unwrap_or_default();
-            let urls = extract_urls_from_html(&body);
-            let js_files: Vec<&String> = urls.iter().filter(|u| u.ends_with(".js")).collect();
+    let origin = web_origin(&start_url);
+    let mut queue = std::collections::VecDeque::from([(start_url, 0usize)]);
+    let mut visited = std::collections::HashSet::new();
+    let mut endpoints = std::collections::BTreeSet::new();
+    let mut js_files = std::collections::BTreeSet::new();
+    let mut forms = Vec::new();
+    let mut pages = Vec::new();
 
-            ConversationToolResult {
-                tool_call_id: String::new(),
-                tool_name: "web_url_collect".into(),
-                content: serde_json::json!({
-                    "url": url,
-                    "total_urls_found": urls.len(),
-                    "js_files_found": js_files.len(),
-                    "urls": urls.iter().take(200).collect::<Vec<_>>(),
-                    "js_files": js_files.iter().take(100).collect::<Vec<_>>(),
-                })
-                .to_string(),
-                success: true,
+    while let Some((mut page_url, depth)) = queue.pop_front() {
+        page_url.set_fragment(None);
+        let canonical = page_url.to_string();
+        if pages.len() >= max_pages || !visited.insert(canonical.clone()) {
+            continue;
+        }
+        let mut request = client.get(page_url.clone());
+        if !cookie.is_empty() {
+            request = request.header(reqwest::header::COOKIE, &cookie);
+        }
+        for (name, value) in &headers {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "host" | "content-length" | "transfer-encoding"
+            ) {
+                continue;
+            }
+            if let Some(value) = value.as_str() {
+                request = request.header(name, value);
             }
         }
-        Err(e) => ConversationToolResult {
-            tool_call_id: String::new(),
-            tool_name: "web_url_collect".into(),
-            content: serde_json::json!({"error": format!("请求失败: {}", e)}).to_string(),
-            success: false,
-        },
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                pages.push(serde_json::json!({"url": canonical, "error": error.to_string()}));
+                continue;
+            }
+        };
+        let status = response.status().as_u16();
+        if response.status().is_redirection() {
+            if let Some(location) = response.headers().get(reqwest::header::LOCATION)
+                && let Ok(location) = location.to_str()
+                && let Ok(next) = page_url.join(location)
+                && web_origin(&next) == origin
+                && !is_unsafe_crawl_path(next.path())
+            {
+                endpoints.insert(next.to_string());
+                if depth < max_depth {
+                    queue.push_back((next, depth + 1));
+                }
+            }
+            pages.push(serde_json::json!({"url": canonical, "status": status}));
+            continue;
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !(content_type.contains("html") || content_type.is_empty()) {
+            pages.push(serde_json::json!({"url": canonical, "status": status, "content_type": content_type}));
+            continue;
+        }
+        let body = response.text().await.unwrap_or_default();
+        let page_forms = extract_forms(&body, &page_url);
+        let forms_found = page_forms.len();
+        forms.extend(page_forms);
+        let mut discovered = 0usize;
+        for raw in extract_urls_from_html(&body) {
+            let Ok(mut discovered_url) = page_url.join(raw.trim()) else {
+                continue;
+            };
+            discovered_url.set_fragment(None);
+            if web_origin(&discovered_url) != origin {
+                continue;
+            }
+            let discovered_url_string = discovered_url.to_string();
+            endpoints.insert(discovered_url_string.clone());
+            discovered += 1;
+            if discovered_url.path().to_ascii_lowercase().ends_with(".js") {
+                js_files.insert(discovered_url_string);
+            } else if depth < max_depth && !is_unsafe_crawl_path(discovered_url.path()) {
+                queue.push_back((discovered_url, depth + 1));
+            }
+        }
+        pages.push(serde_json::json!({
+            "url": canonical,
+            "status": status,
+            "links_found": discovered,
+            "forms_found": forms_found
+        }));
+    }
+
+    let success = pages.iter().any(|page| page.get("status").is_some());
+    ConversationToolResult {
+        tool_call_id: String::new(),
+        tool_name: "web_url_collect".into(),
+        content: serde_json::json!({
+            "url": url,
+            "pages_crawled": pages.len(),
+            "max_pages": max_pages,
+            "max_depth": max_depth,
+            "total_urls_found": endpoints.len(),
+            "js_files_found": js_files.len(),
+            "endpoints": endpoints.into_iter().take(500).collect::<Vec<_>>(),
+            "js_files": js_files.into_iter().take(200).collect::<Vec<_>>(),
+            "forms": forms.into_iter().take(200).collect::<Vec<_>>(),
+            "pages": pages,
+        })
+        .to_string(),
+        success,
     }
 }
 
@@ -1205,6 +1311,68 @@ fn extract_urls_from_html(html: &str) -> Vec<String> {
     urls
 }
 
+fn web_origin(url: &reqwest::Url) -> (String, String, Option<u16>) {
+    (
+        url.scheme().to_ascii_lowercase(),
+        url.host_str().unwrap_or_default().to_ascii_lowercase(),
+        url.port_or_known_default(),
+    )
+}
+
+fn is_unsafe_crawl_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    ["logout", "signout", "delete", "remove", "destroy"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn extract_forms(html: &str, page_url: &reqwest::Url) -> Vec<serde_json::Value> {
+    let Ok(form_pattern) = regex::Regex::new(r"(?is)<form\b([^>]*)>(.*?)</form\s*>") else {
+        return Vec::new();
+    };
+    let Ok(name_pattern) = regex::Regex::new(
+        r#"(?i)<(?:input|select|textarea|button)\b[^>]*\bname\s*=\s*["']?([^\s"'<>]+)"#,
+    ) else {
+        return Vec::new();
+    };
+    form_pattern
+        .captures_iter(html)
+        .filter_map(|captures| {
+            let attributes = captures.get(1)?.as_str();
+            let body = captures.get(2)?.as_str();
+            let action = html_attribute(attributes, "action").unwrap_or_default();
+            let url = page_url.join(&action).ok()?;
+            let method = html_attribute(attributes, "method")
+                .unwrap_or_else(|| "GET".into())
+                .to_ascii_uppercase();
+            let parameters = name_pattern
+                .captures_iter(body)
+                .filter_map(|capture| capture.get(1))
+                .map(|value| value.as_str().to_string())
+                .collect::<std::collections::BTreeSet<_>>();
+            Some(serde_json::json!({
+                "url": url.to_string(),
+                "method": method,
+                "parameters": parameters,
+            }))
+        })
+        .collect()
+}
+
+fn html_attribute(attributes: &str, name: &str) -> Option<String> {
+    let pattern = regex::Regex::new(&format!(
+        r#"(?i)\b{}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#,
+        regex::escape(name)
+    ))
+    .ok()?;
+    let captures = pattern.captures(attributes)?;
+    captures
+        .get(1)
+        .or_else(|| captures.get(2))
+        .or_else(|| captures.get(3))
+        .map(|value| value.as_str().to_string())
+}
+
 fn extract_title(html: &str) -> String {
     let lower = html.to_lowercase();
     if let Some(start) = lower.find("<title") {
@@ -1230,8 +1398,8 @@ fn http_probe_urls(target: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_tool_error, extract_csrf_token, http_probe_urls, last_http_status, tool_error,
-        truncate_http_response_body,
+        classify_tool_error, extract_csrf_token, extract_forms, http_probe_urls,
+        is_unsafe_crawl_path, last_http_status, tool_error, truncate_http_response_body,
     };
 
     #[test]
@@ -1297,6 +1465,26 @@ mod tests {
             extract_csrf_token(r#"<input type="hidden" name="_csrf" value="form-token">"#),
             Some("form-token".into())
         );
+    }
+
+    #[test]
+    fn crawler_extracts_form_methods_actions_and_parameters() {
+        let page = reqwest::Url::parse("https://example.test/account/").unwrap();
+        let forms = extract_forms(
+            r#"<form method="post" action="/profile/update">
+                <input name="display_name"><input type="hidden" name="csrf">
+                <textarea name="bio"></textarea></form>"#,
+            &page,
+        );
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0]["url"], "https://example.test/profile/update");
+        assert_eq!(forms[0]["method"], "POST");
+        assert_eq!(
+            forms[0]["parameters"],
+            serde_json::json!(["bio", "csrf", "display_name"])
+        );
+        assert!(is_unsafe_crawl_path("/account/logout"));
+        assert!(!is_unsafe_crawl_path("/account/profile"));
     }
 }
 

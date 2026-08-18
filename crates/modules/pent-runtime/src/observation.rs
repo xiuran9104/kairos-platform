@@ -135,6 +135,7 @@ fn is_reference_tool(tool_name: &str) -> bool {
             | "traffic_diff"
             | "skill_list"
             | "skill_load"
+            | "tool_search"
             | "record_finding"
             | "agent_spawn"
             | "agent_status"
