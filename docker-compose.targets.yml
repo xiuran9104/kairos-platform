@@ -12,7 +12,7 @@ services:
 
   # ── WebGoat — Java Web 靶场 ──
   webgoat:
-    image: webgoat/goatandwolf
+    image: webgoat/webgoat
     container_name: target-webgoat
     ports:
       - "18080:8080"
