@@ -75,46 +75,62 @@ async function loadRoles() {
   }
 }
 
-async function save() {
+async function buildProjectPayload() {
   const name = form.value.name.trim();
   if (!name) {
     message.warning('请输入项目名称');
-    return;
+    return null;
   }
   const assetScope = form.value.assetScopeText
     .split(/[\n,]/)
     .map((item) => item.trim())
     .filter(Boolean);
+  let rulesOfEngagement: Record<string, any> = {};
+  try {
+    rulesOfEngagement = JSON.parse(form.value.rulesOfEngagement || '{}');
+  } catch {
+    message.warning('交战规则必须是合法 JSON');
+    return null;
+  }
+  return {
+    asset_scope: assetScope,
+    description: form.value.description.trim(),
+    default_role_id: form.value.defaultRoleId || null,
+    engagement_mode: form.value.engagementMode,
+    name,
+    rules_of_engagement: rulesOfEngagement,
+    status: form.value.status,
+  };
+}
+
+async function persistSettings(showSuccess = true): Promise<boolean> {
+  const payload = await buildProjectPayload();
+  if (!payload) return false;
   saving.value = true;
   try {
-    let rulesOfEngagement: Record<string, any> = {};
-    try {
-      rulesOfEngagement = JSON.parse(form.value.rulesOfEngagement || '{}');
-    } catch {
-      message.warning('交战规则必须是合法 JSON');
-      return;
-    }
-    await updatePentProject(props.project.id, {
-      asset_scope: assetScope,
-      description: form.value.description.trim(),
-      default_role_id: form.value.defaultRoleId || null,
-      engagement_mode: form.value.engagementMode,
-      name,
-      rules_of_engagement: rulesOfEngagement,
-      status: form.value.status,
-    });
+    await updatePentProject(props.project.id, payload);
     if (
       form.value.modelConfigId &&
       form.value.modelConfigId !== props.project.model_config_id
     ) {
       await updatePentProjectModel(props.project.id, form.value.modelConfigId);
     }
-    message.success('项目设置已保存');
-    emit('saved');
+    if (showSuccess) {
+      message.success('项目设置已保存');
+    }
+    return true;
   } catch (error: any) {
     message.error(error?.message || '保存项目设置失败');
+    return false;
   } finally {
     saving.value = false;
+  }
+}
+
+async function save() {
+  const ok = await persistSettings(true);
+  if (ok) {
+    emit('saved');
   }
 }
 
@@ -124,21 +140,27 @@ async function authorizeRedTeam(confirmed: boolean) {
     message.warning('请设置授权截止时间');
     return;
   }
-  let rulesOfEngagement: Record<string, any> = {};
-  try {
-    rulesOfEngagement = JSON.parse(form.value.rulesOfEngagement || '{}');
-  } catch {
-    message.warning('交战规则必须是合法 JSON');
+  const payload = await buildProjectPayload();
+  if (!payload) return;
+  if (confirmed && payload.asset_scope.length === 0) {
+    message.warning('请配置授权资产范围后再确认红队授权');
     return;
   }
   saving.value = true;
   try {
+    await updatePentProject(props.project.id, payload);
+    if (
+      form.value.modelConfigId &&
+      form.value.modelConfigId !== props.project.model_config_id
+    ) {
+      await updatePentProjectModel(props.project.id, form.value.modelConfigId);
+    }
     await updatePentProjectAuthorization(props.project.id, {
       confirmed,
       expires_at: confirmed
         ? new Date(form.value.authorizationExpiresAt).toISOString()
         : undefined,
-      rules_of_engagement: rulesOfEngagement,
+      rules_of_engagement: payload.rules_of_engagement,
     });
     message.success(confirmed ? '红队 Engagement 已授权' : '红队授权已撤销');
     emit('saved');
