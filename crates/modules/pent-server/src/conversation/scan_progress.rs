@@ -3,12 +3,39 @@ use std::collections::{HashMap, HashSet};
 
 const STALL_WARNING_THRESHOLD: usize = 3;
 const STALL_STOP_THRESHOLD: usize = 8;
-/// Minimum distinct tool categories that must have produced evidence before
-/// a security FINAL is accepted. This prevents single-tool "drive-by" reports.
-/// Minimum distinct tool categories for the evidence diversity gate.
-/// Set to 1 so host tools (nuclei, sqlmap, dalfox, nmap, etc.) alone can
-/// satisfy the gate. The gate still prevents zero-tool "drive-by" reports.
-const MIN_EVIDENCE_CATEGORY_DIVERSITY: usize = 1;
+const MIN_EVIDENCE_CATEGORY_DIVERSITY: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum WebCoverageArea {
+    SurfaceMapping,
+    TemplateScan,
+    SqlInjection,
+    CrossSiteScripting,
+    ServerAndFile,
+    AccessAndBusinessLogic,
+}
+
+impl WebCoverageArea {
+    const REQUIRED: [Self; 6] = [
+        Self::SurfaceMapping,
+        Self::TemplateScan,
+        Self::SqlInjection,
+        Self::CrossSiteScripting,
+        Self::ServerAndFile,
+        Self::AccessAndBusinessLogic,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SurfaceMapping => "攻击面枚举（爬虫/目录/JS/API 参数）",
+            Self::TemplateScan => "通用漏洞模板扫描（nuclei/web_vuln_scan）",
+            Self::SqlInjection => "SQL 注入专项验证（sqlmap/sqli_validate）",
+            Self::CrossSiteScripting => "XSS 专项验证（dalfox/xss_validate）",
+            Self::ServerAndFile => "服务端注入与文件类验证",
+            Self::AccessAndBusinessLogic => "鉴权、越权与业务逻辑的差分请求验证",
+        }
+    }
+}
 
 const DVWA_MODULES: [(&str, &str); 14] = [
     ("brute-force", "/vulnerabilities/brute/"),
@@ -56,9 +83,18 @@ fn is_targeted_dvwa_validation(module: &str, tool_name: &str, arguments: &str) -
         .collect::<String>();
     let is_post = compact.contains(r#""method":"post""#);
     let has = |needles: &[&str]| needles.iter().any(|needle| compact.contains(needle));
-    let xss_scanner = matches!(tool_name, "dalfox" | "web_xss_scan" | "xss_validate" | "xsser");
+    let xss_scanner = matches!(
+        tool_name,
+        "dalfox" | "web_xss_scan" | "xss_validate" | "xsser"
+    );
     let xss_payload = has(&[
-        "%3cscript", "<script", "%3csvg", "<svg", "onerror", "onload", "javascript%3a",
+        "%3cscript",
+        "<script",
+        "%3csvg",
+        "<svg",
+        "onerror",
+        "onload",
+        "javascript%3a",
         "javascript:",
     ]);
 
@@ -95,8 +131,15 @@ fn is_targeted_dvwa_validation(module: &str, tool_name: &str, arguments: &str) -
             matches!(tool_name, "sqlmap" | "sqlmap_scan" | "sqli_validate")
                 || (has(&["id="])
                     && has(&[
-                        "%27", "'", "union", "%20or%20", "+or+", "%20and%20", "+and+",
-                        "sleep", "benchmark",
+                        "%27",
+                        "'",
+                        "union",
+                        "%20or%20",
+                        "+or+",
+                        "%20and%20",
+                        "+and+",
+                        "sleep",
+                        "benchmark",
                     ]))
         }
         "weak-session-id" => is_post || has(&["generate", "new+session", "new%20session"]),
@@ -106,11 +149,68 @@ fn is_targeted_dvwa_validation(module: &str, tool_name: &str, arguments: &str) -
             xss_scanner || (is_post && has(&["message", "txtname", "mtxmessage"]) && xss_payload)
         }
         "csp-bypass" => has(&["include=", "script="]) && has(&["http", "data%3a", "alert"]),
-        "javascript" => {
-            (is_post || has(&["submit"])) && has(&["token", "phrase", "success"])
-        }
+        "javascript" => (is_post || has(&["submit"])) && has(&["token", "phrase", "success"]),
         _ => false,
     }
+}
+
+fn looks_like_logic_validation(arguments: &str) -> bool {
+    let identity_or_object = [
+        "authorization",
+        "cookie",
+        "session",
+        "user_id",
+        "userid",
+        "account",
+        "role",
+        "admin",
+        "/users/",
+        "/user/",
+        "/api/internal",
+        "object_id",
+        "order_id",
+        "tenant",
+    ]
+    .iter()
+    .any(|marker| arguments.contains(marker));
+    let active_request = [
+        r#""method":"post""#,
+        r#""method":"put""#,
+        r#""method":"patch""#,
+        r#""method":"delete""#,
+        "headers",
+        "cookies",
+        "body",
+    ]
+    .iter()
+    .any(|marker| arguments.contains(marker));
+    identity_or_object && active_request
+}
+
+fn looks_like_server_or_file_validation(arguments: &str) -> bool {
+    [
+        "../",
+        "%2e%2e",
+        "%2fetc%2f",
+        "file://",
+        "php://",
+        "127.0.0.1",
+        "localhost",
+        "169.254.169.254",
+        "url=",
+        "redirect=",
+        "next=",
+        "callback=",
+        "multipart",
+        "filename",
+        "%3b",
+        "&&",
+        "%7c",
+        "|id",
+        "|whoami",
+    ]
+    .iter()
+    .any(|marker| arguments.contains(marker))
 }
 
 /// Evidence maturity level required for verified claims in a FINAL.
@@ -207,6 +307,8 @@ impl ToolCategory {
 /// repeating requests/results, and grounding verified claims in Evidence.
 pub(super) struct ScanProgress {
     security_objective: bool,
+    broad_web_objective: bool,
+    web_coverage: HashSet<WebCoverageArea>,
     seen_results: HashSet<String>,
     tool_calls: usize,
     successful_observations: usize,
@@ -257,8 +359,23 @@ impl ScanProgress {
         .iter()
         .any(|p| normalized.contains(p));
         let security_objective = has_target || has_test_command;
-        let dvwa_objective = normalized.contains("dvwa")
-            || normalized.contains("damn vulnerable web application");
+        let focused_only = [
+            "只测xss",
+            "只测试xss",
+            "只测sql",
+            "只测试sql",
+            "only xss",
+            "only sqli",
+            "仅验证",
+            "复测这个",
+            "retest this",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+        let dvwa_objective =
+            normalized.contains("dvwa") || normalized.contains("damn vulnerable web application");
+        let broad_web_objective =
+            has_target && has_test_command && !focused_only && !dvwa_objective;
         let dvwa_require_findings = dvwa_objective
             && (normalized.contains("security=low")
                 || normalized.contains("security = low")
@@ -267,6 +384,8 @@ impl ScanProgress {
                 || normalized.contains("低安全模式"));
         Self {
             security_objective,
+            broad_web_objective,
+            web_coverage: HashSet::new(),
             seen_results: HashSet::new(),
             tool_calls: 0,
             successful_observations: 0,
@@ -288,9 +407,10 @@ impl ScanProgress {
     }
 
     pub(super) fn coverage_instruction(&self) -> Option<String> {
-        self.dvwa_objective.then(|| {
-            format!(
-                "## DVWA 完整覆盖门槛\n本 Run 必须逐项访问并验证以下模块后才能 FINAL：{}。\n\
+        if self.dvwa_objective {
+            return Some({
+                format!(
+                    "## DVWA 完整覆盖门槛\n本 Run 必须逐项访问并验证以下模块后才能 FINAL：{}。\n\
                  登录成功后复用 PHPSESSID/security Cookie；提交任何表单前先 GET 同一路径以获取最新 user_token，\
                  仅 GET 打开模块页面不算覆盖；每个模块必须执行带测试参数/载荷的针对性请求，\
                  弱 Session ID 必须生成至少两次并比较 Cookie。确认漏洞后立即调用 record_finding，\
@@ -299,13 +419,21 @@ impl ScanProgress {
                  csrf/captcha 验证受保护动作；fi 使用遍历标记；upload 上传并回读无害标记文件；\
                  sqli/sqli_blind 使用 sqlmap 或差分载荷；三类 XSS 分别验证反射、持久化和 DOM sink；\
                  csp 验证允许源脚本路径；javascript 复现客户端 token。",
-                DVWA_MODULES
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>()
-                    .join("、")
-            )
-        })
+                    DVWA_MODULES
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )
+            });
+        }
+        self.broad_web_objective.then(|| format!(
+            "## 通用 Web 全量覆盖门槛\n本任务要求尽可能发现靶场漏洞，不能在单个扫描器返回后结束。\n\
+             必须覆盖：{}。\n先建立端点/参数地图，再对每个输入点使用专项工具；\
+             nuclei 不覆盖鉴权、IDOR 和多数业务逻辑，必须使用不同身份/对象/方法的 HTTP 差分请求验证。\
+             每发现一个确认问题立即 record_finding 并引用 Evidence。",
+            WebCoverageArea::REQUIRED.iter().map(|area| area.label()).collect::<Vec<_>>().join("；")
+        ))
     }
 
     pub(super) fn record_tool_arguments(
@@ -314,6 +442,9 @@ impl ScanProgress {
         arguments: &str,
         success: bool,
     ) {
+        if self.broad_web_objective && success {
+            self.record_web_coverage(tool_name, arguments);
+        }
         if !self.dvwa_objective || !success {
             return;
         }
@@ -332,6 +463,40 @@ impl ScanProgress {
                 }
                 self.dvwa_covered.insert(name.to_string());
             }
+        }
+    }
+
+    fn record_web_coverage(&mut self, tool_name: &str, arguments: &str) {
+        let arguments = arguments.to_ascii_lowercase();
+        let area = match tool_name {
+            "web_crawl" | "web_url_collect" | "js_collect" | "js_analyze" | "js_security_audit"
+            | "dir_fuzz" | "ffuf" | "gobuster" | "feroxbuster" | "dirsearch" | "arjun"
+            | "paramspider" | "hakrawler" => Some(WebCoverageArea::SurfaceMapping),
+            "nuclei" | "web_vuln_scan" | "nikto" | "wapiti" | "afrog" | "skipfish" => {
+                Some(WebCoverageArea::TemplateScan)
+            }
+            "sqlmap" | "sqlmap_scan" | "sqli_validate" => Some(WebCoverageArea::SqlInjection),
+            "dalfox" | "web_xss_scan" | "xss_validate" | "xsser" => {
+                Some(WebCoverageArea::CrossSiteScripting)
+            }
+            "command_injection_validate"
+            | "file_inclusion_validate"
+            | "file_upload_validate"
+            | "commix" => Some(WebCoverageArea::ServerAndFile),
+            "http_request" | "http-framework-test" | "traffic_replay"
+                if looks_like_logic_validation(&arguments) =>
+            {
+                Some(WebCoverageArea::AccessAndBusinessLogic)
+            }
+            "http_request" | "http-framework-test" | "traffic_replay"
+                if looks_like_server_or_file_validation(&arguments) =>
+            {
+                Some(WebCoverageArea::ServerAndFile)
+            }
+            _ => None,
+        };
+        if let Some(area) = area {
+            self.web_coverage.insert(area);
         }
     }
 
@@ -570,6 +735,20 @@ impl ScanProgress {
                 }
             }
         }
+        if self.broad_web_objective {
+            let missing = WebCoverageArea::REQUIRED
+                .iter()
+                .filter(|area| !self.web_coverage.contains(area))
+                .map(|area| area.label())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Some(format!(
+                    "通用 Web 覆盖不完整，仍缺少 {} 个验证域：{}。请继续执行专项工具和差分请求；不得以 nuclei 或一次根路径扫描代替。",
+                    missing.len(),
+                    missing.join("、")
+                ));
+            }
+        }
         // Evidence diversity gate: require observations from at least two
         // distinct tool categories before accepting a security FINAL. A
         // single HTTP probe that returned 200 is not a penetration test.
@@ -578,7 +757,7 @@ impl ScanProgress {
             .iter()
             .filter(|c| !matches!(c, ToolCategory::Knowledge | ToolCategory::EvidenceRead))
             .collect();
-        if productive_categories.len() < MIN_EVIDENCE_CATEGORY_DIVERSITY {
+        if !self.dvwa_objective && productive_categories.len() < MIN_EVIDENCE_CATEGORY_DIVERSITY {
             let missing = if productive_categories.is_empty() {
                 "信息收集和漏洞验证均未产生有效证据"
             } else if productive_categories.contains(&ToolCategory::Recon) {
@@ -871,8 +1050,7 @@ mod tests {
     #[test]
     fn weak_session_requires_two_successful_generations() {
         let mut progress = ScanProgress::new("完整测试 DVWA http://dvwa");
-        let arguments =
-            r#"{"url":"http://dvwa/vulnerabilities/weak_id/","method":"POST"}"#;
+        let arguments = r#"{"url":"http://dvwa/vulnerabilities/weak_id/","method":"POST"}"#;
         progress.record_tool_arguments("http_request", arguments, true);
         assert!(!progress.dvwa_covered.contains("weak-session-id"));
         progress.record_tool_arguments("http_request", arguments, true);
@@ -893,10 +1071,8 @@ mod tests {
         assert!(rejection.contains("没有形成已验证 Finding"));
 
         for (_, path) in DVWA_MODULES {
-            progress.record_finding_arguments(
-                &format!(r#"{{"target":"http://dvwa{path}"}}"#),
-                true,
-            );
+            progress
+                .record_finding_arguments(&format!(r#"{{"target":"http://dvwa{path}"}}"#), true);
         }
         assert!(
             progress
@@ -906,22 +1082,18 @@ mod tests {
     }
 
     #[test]
-    fn single_tool_with_valid_observation_passes_gate() {
-        // MIN_EVIDENCE_CATEGORY_DIVERSITY = 1: a single working tool with
-        // a real observation is enough to satisfy the evidence diversity gate.
-        // Host tools (nuclei, sqlmap, dalfox, nmap, etc.) still count via
-        // ToolCategory::Unknown, which is a productive category.
-        let mut progress = ScanProgress::new("扫描 https://example.test");
+    fn single_tool_with_valid_observation_does_not_complete_security_test() {
+        let mut progress = ScanProgress::new("只测试SQL https://example.test");
         progress.record_tool_result("http_request", true, true, r#"{"status":200,"body":"ok"}"#);
         assert!(
             progress
                 .final_rejection("FINAL: 目标可达，未发现明显漏洞", &["ev-1".into()])
-                .is_none()
+                .is_some()
         );
     }
 
     #[test]
-    fn nmap_plus_nuclei_satisfy_diversity_gate() {
+    fn nmap_plus_nuclei_do_not_satisfy_broad_web_coverage() {
         let mut progress = ScanProgress::new("扫描 https://example.test");
         progress.record_tool_result(
             "nmap",
@@ -938,13 +1110,13 @@ mod tests {
         assert!(
             progress
                 .final_rejection("FINAL: 发现开放端口，Nuclei 未命中高危", &[])
-                .is_none()
+                .is_some()
         );
     }
 
     #[test]
     fn verified_claim_requires_known_evidence_reference() {
-        let mut progress = ScanProgress::new("扫描 https://example.test");
+        let mut progress = ScanProgress::new("只测试SQL https://example.test");
         progress.record_tool_result(
             "http_request",
             true,
@@ -1100,7 +1272,7 @@ mod tests {
 
     #[test]
     fn tool_categories_are_tracked_for_diversity() {
-        let mut progress = ScanProgress::new("扫描 https://example.test");
+        let mut progress = ScanProgress::new("只测XSS https://example.test");
         progress.record_tool_result("http_request", true, true, r#"{"status":200}"#);
         progress.record_tool_result("dir_fuzz", true, true, r#"{"findings":[]}"#);
         progress.record_tool_result(
@@ -1112,6 +1284,47 @@ mod tests {
         assert!(
             progress
                 .final_rejection("FINAL: no vulns found", &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn broad_web_scan_rejects_drive_by_nuclei_result() {
+        let mut progress = ScanProgress::new("全面渗透测试 https://example.test");
+        progress.record_tool_arguments("nuclei", r#"{"target":"https://example.test"}"#, true);
+        progress.record_tool_result("nuclei", true, true, r#"{"matched":1}"#);
+        let rejection = progress
+            .final_rejection("FINAL: nuclei found one issue", &[])
+            .expect("single scanner must not complete a broad assessment");
+        assert!(rejection.contains("覆盖不完整"));
+        assert!(rejection.contains("SQL 注入"));
+        assert!(rejection.contains("鉴权"));
+    }
+
+    #[test]
+    fn broad_web_scan_accepts_all_required_validation_domains() {
+        let mut progress = ScanProgress::new("全面渗透测试 https://example.test");
+        let calls = [
+            ("web_crawl", r#"{"target":"https://example.test"}"#),
+            ("nuclei", r#"{"target":"https://example.test"}"#),
+            ("sqlmap_scan", r#"{"url":"https://example.test/?id=1"}"#),
+            ("web_xss_scan", r#"{"url":"https://example.test/?q=x"}"#),
+            (
+                "file_inclusion_validate",
+                r#"{"url":"https://example.test/files?name=../x"}"#,
+            ),
+            (
+                "http_request",
+                r#"{"url":"https://example.test/users/2","method":"POST","headers":{"Cookie":"session=a"}}"#,
+            ),
+        ];
+        for (index, (tool, arguments)) in calls.into_iter().enumerate() {
+            progress.record_tool_arguments(tool, arguments, true);
+            progress.record_tool_result(tool, true, true, &format!(r#"{{"result":{index}}}"#));
+        }
+        assert!(
+            progress
+                .final_rejection("FINAL: assessment complete", &[])
                 .is_none()
         );
     }
