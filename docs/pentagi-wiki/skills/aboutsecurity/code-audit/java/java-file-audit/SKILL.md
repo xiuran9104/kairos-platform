@@ -1,12 +1,12 @@
 ---
 name: java-file-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   Java 源码文件操作类漏洞审计。当在 Java 白盒审计中需要检测文件相关漏洞时触发。
   覆盖 5 类文件风险: 任意文件上传(MultipartFile/Servlet Part/类型绕过)、任意文件读取(NIO/IO流/路径穿越)、
   任意文件写入(覆盖配置/WebShell落地)、归档提取漏洞(ZipInputStream/Zip Slip)、文件删除/重命名竞争。
   需要 java-audit-pipeline 提供的数据流证据。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: file upload, file read, file write, path traversal, zip slip, 文件上传, 任意读取, 任意写入, java nio, multipartfile, 路径穿越
   category: code-audit

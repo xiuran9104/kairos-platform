@@ -1,4 +1,6 @@
 <script lang="ts" setup>
+import type { PentAgentRole } from '#/api/pent/roles';
+
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { message, Modal } from 'ant-design-vue';
@@ -8,6 +10,7 @@ import {
   createPentSession,
   deletePentSession,
   getPentProjects,
+  getPentRoles,
   getPentSessionMessages,
   getPentSessions,
   sendPentSessionMessage,
@@ -15,6 +18,7 @@ import {
   streamPentRunEvents,
   streamPentTurn,
   updatePentSession,
+  updatePentSessionRole,
 } from '#/api/pent';
 
 import { parseTurnStreamEvent } from './turn-stream';
@@ -28,6 +32,7 @@ const sessionsLoading = ref(false);
 const searchText = ref('');
 const projectFilter = ref('');
 const projects = ref<any[]>([]);
+const roles = ref<PentAgentRole[]>([]);
 const currentId = ref<null | string>(null);
 
 async function loadSessions() {
@@ -75,13 +80,21 @@ const projectName = computed(() => {
   return m;
 });
 
+const roleSourceLabel: Record<string, string> = {
+  fallback: '系统兜底',
+  platform_default: '平台预设',
+  project: '项目默认',
+  session: '本对话指定',
+  tenant_default: '平台设置',
+};
+
 // ── new session modal ────────────────────────────────────────────────────────
 const showCreate = ref(false);
 const creating = ref(false);
-const createForm = ref({ objective: '', project_id: undefined as string | undefined, targetsText: '' });
+const createForm = ref({ objective: '', project_id: undefined as string | undefined, role_id: '', targetsText: '' });
 
 function openCreate() {
-  createForm.value = { objective: '', project_id: undefined, targetsText: '' };
+  createForm.value = { objective: '', project_id: undefined, role_id: '', targetsText: '' };
   showCreate.value = true;
 }
 
@@ -126,6 +139,7 @@ async function doCreate() {
       constraints: {},
       objective: createForm.value.objective.trim(),
       project_id: createForm.value.project_id || undefined,
+      role_id: createForm.value.role_id || undefined,
       // 目标为空时交由后端继承项目资产范围
       targets: targets.length ? targets : [],
     });
@@ -356,6 +370,17 @@ function onComposerKeydown(e: KeyboardEvent) {
 const running = ref(false);
 const streamCtrl = ref<AbortController | null>(null);
 
+async function changeCurrentRole(value?: string) {
+  if (!current.value || running.value) return;
+  try {
+    await updatePentSessionRole(current.value.id, value || undefined);
+    await loadSessions();
+    message.success(value ? '对话角色已切换' : '已改为继承默认角色');
+  } catch (error: any) {
+    message.error(error?.message || '切换角色失败');
+  }
+}
+
 // Run 执行期间定期刷新对话消息，确保切页/恢复后消息持续更新
 let messagesTimer: ReturnType<typeof setInterval> | null = null;
 function startMessagesPolling() {
@@ -473,9 +498,15 @@ const sessionStatus: Record<string, { color: string; label: string }> = {
 
 onMounted(async () => {
   try {
-    projects.value = ((await getPentProjects()) as any[]) || [];
+    const [loadedProjects, loadedRoles] = await Promise.all([
+      getPentProjects(),
+      getPentRoles(),
+    ]);
+    projects.value = (loadedProjects as any[]) || [];
+    roles.value = ((loadedRoles as PentAgentRole[]) || []).filter((role) => role.enabled);
   } catch {
     projects.value = [];
+    roles.value = [];
   }
   await loadSessions();
   const routeProjectId = Array.isArray(route.query.project_id)
@@ -607,6 +638,11 @@ onMounted(async () => {
           </a-tag>
           <a-tag v-if="current.project_id" style="font-size: 12px">
             {{ projectName[current.project_id] || current.project_id }}
+          </a-tag>
+          <a-tag color="geekblue" style="font-size: 12px">
+            {{ current.resolved_role_icon || '🎯' }}
+            {{ current.resolved_role_name || current.resolved_role_id }}
+            · {{ roleSourceLabel[current.role_source] || current.role_source }}
           </a-tag>
           <span style="font-size: 12px; color: var(--ant-color-text-tertiary)">
             目标：{{ (current.targets || []).join('、') || '—' }}
@@ -766,6 +802,22 @@ onMounted(async () => {
             align-items: flex-end;
           "
         >
+          <a-select
+            :value="current.constraints?.role_id || ''"
+            :disabled="running"
+            show-search
+            option-filter-prop="label"
+            style="width: 250px"
+            title="选择本对话的主 Agent 角色"
+            :options="[
+              { label: `继承默认（当前：${current.resolved_role_name || '—'}）`, value: '' },
+              ...roles.map((role) => ({
+                label: `${role.icon || '🎯'} ${role.name} · ${role.id}`,
+                value: role.id,
+              })),
+            ]"
+            @change="changeCurrentRole"
+          />
           <a-textarea
             v-model:value="inputText"
             :auto-size="{ maxRows: 6, minRows: 1 }"
@@ -811,6 +863,23 @@ onMounted(async () => {
             placeholder="可选（选择后自动继承项目目标）"
             :options="projects.map((p) => ({ label: p.name || p.id, value: p.id }))"
             @change="onProjectChange"
+          />
+        </a-form-item>
+        <a-form-item
+          label="主 Agent 角色"
+          extra="不选择时按 项目默认 → 平台设置 → 系统预设 的顺序继承"
+        >
+          <a-select
+            v-model:value="createForm.role_id"
+            show-search
+            option-filter-prop="label"
+            :options="[
+              { label: '继承默认角色', value: '' },
+              ...roles.map((role) => ({
+                label: `${role.icon || '🎯'} ${role.name} · ${role.id}`,
+                value: role.id,
+              })),
+            ]"
           />
         </a-form-item>
         <a-form-item label="授权目标" required>

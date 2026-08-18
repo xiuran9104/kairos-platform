@@ -45,10 +45,12 @@ const filtered = computed(() => {
     list = list.filter(
       (r) =>
         (r.name || '').toLowerCase().includes(q) ||
+        (r.id || '').toLowerCase().includes(q) ||
         (r.description || '').toLowerCase().includes(q),
     );
   }
   return [...list].sort((a, b) => {
+    if (a.is_configured_default !== b.is_configured_default) return a.is_configured_default ? -1 : 1;
     if (a.is_default !== b.is_default) return a.is_default ? -1 : 1;
     if (a.tenant_id !== b.tenant_id) return a.tenant_id - b.tenant_id;
     return (a.name || '').localeCompare(b.name || '', 'zh-CN');
@@ -179,6 +181,13 @@ onMounted(async () => {
       </template>
     </a-page-header>
 
+    <a-alert
+      type="info"
+      show-icon
+      message="这里管理主对话角色；多 Agent 执行中的专家智能体请到“智能体管理”查看。带“当前平台默认”的角色会在项目和对话未单独指定时生效。"
+      style="margin-top: 16px"
+    />
+
     <a-input
       v-model:value="searchText"
       placeholder="搜索角色..."
@@ -198,7 +207,9 @@ onMounted(async () => {
                 </span>
               </div>
               <div style="display: flex; gap: 4px; flex-shrink: 0; align-items: center">
-                <a-tag v-if="r.is_default" color="blue">默认</a-tag>
+                <a-tag>主对话角色</a-tag>
+                <a-tag v-if="r.is_configured_default" color="blue">当前平台默认</a-tag>
+                <a-tag v-else-if="r.is_default" color="cyan">系统兜底</a-tag>
                 <a-tag v-else-if="r.tenant_id === 0" color="purple">预设</a-tag>
                 <a-tag :color="r.enabled ? 'green' : 'default'">{{ r.enabled ? '已启用' : '已禁用' }}</a-tag>
               </div>
@@ -218,8 +229,15 @@ onMounted(async () => {
               {{ r.description || '无描述' }}
             </div>
             <div style="margin-top: 8px; font-size: 12px">
+              <span style="color: var(--ant-color-text-tertiary)">角色 ID：</span>
+              <code>{{ r.id }}</code>
+            </div>
+            <div style="margin-top: 8px; font-size: 12px">
               <span style="color: var(--ant-color-text-tertiary)">工具：</span>
               <span>{{ toolCount(r) }}</span>
+            </div>
+            <div style="margin-top: 4px; font-size: 12px; color: var(--ant-color-text-secondary)">
+              显式对话 {{ r.explicit_session_count || 0 }} · 项目 {{ r.project_count || 0 }} · 历史运行 {{ r.historical_run_count || 0 }}
             </div>
             <div style="margin-top: 8px; border-top: 1px solid var(--ant-color-border-secondary); padding-top: 8px">
               <a-button size="small" type="link" @click="openEdit(r)">编辑</a-button>

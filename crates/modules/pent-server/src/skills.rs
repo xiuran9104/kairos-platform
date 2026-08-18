@@ -339,42 +339,82 @@ async fn reset_skill_stats(
 }
 
 /// Agent-facing: index of published skills (no content bodies).
+#[derive(sqlx::FromRow)]
+struct PublishedSkillRow {
+    name: String,
+    title: String,
+    category: String,
+    risk_level: String,
+    description: String,
+    version: String,
+    manifest: Value,
+    seeded: bool,
+}
+
+fn skill_relevance(row: &PublishedSkillRow, search: &crate::search_rank::SearchQuery) -> f32 {
+    let manifest = row.manifest.to_string();
+    search.score(&[
+        (&row.name, 10.0),
+        (&row.title, 8.0),
+        (&manifest, 5.0),
+        (&row.description, 4.0),
+        (&row.category, 10.0),
+    ])
+}
+
 pub(crate) async fn list_published_skills(
     pool: &kairos_platform_framework_database::PgPool,
     category: Option<&str>,
     query: Option<&str>,
     limit: i64,
 ) -> Result<Value, String> {
-    let rows = sqlx::query_as::<_, (String, String, String, String, String, String)>(
-        "SELECT name, title, category, risk_level, description, version
+    let rows = sqlx::query_as::<_, PublishedSkillRow>(
+        "SELECT name, title, category, risk_level, description, version, manifest,
+                id LIKE 'skill-seed-%' AS seeded
          FROM pent_skills
          WHERE status='published'
            AND ($1::text IS NULL OR category=$1)
-           AND ($2::text IS NULL OR EXISTS (
-               SELECT 1
-               FROM unnest(regexp_split_to_array(trim($2), '\\s+')) AS term
-               WHERE length(term) >= 2
-                 AND concat_ws(' ', name, title, category, description)
-                     ILIKE '%' || term || '%'
-           ))
-         ORDER BY CASE WHEN id LIKE 'skill-seed-%' THEN 0 ELSE 1 END,
-                  category, name
-         LIMIT $3",
+         ORDER BY category, name",
     )
     .bind(category)
-    .bind(query)
-    .bind(limit.clamp(1, 50))
     .fetch_all(pool)
     .await
     .map_err(|error| error.to_string())?;
+    let search = query.map(crate::search_rank::SearchQuery::new);
+    let mut ranked = rows
+        .into_iter()
+        .filter_map(|row| {
+            let score = search
+                .as_ref()
+                .map(|search| skill_relevance(&row, search))
+                .unwrap_or(0.0);
+            (search.is_none() || score > 0.0).then_some((row, score))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        let seed_order = search
+            .is_none()
+            .then(|| right.0.seeded.cmp(&left.0.seeded))
+            .unwrap_or(std::cmp::Ordering::Equal);
+        seed_order
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.0.category.cmp(&right.0.category))
+            .then_with(|| left.0.name.cmp(&right.0.name))
+    });
+    ranked.truncate(limit.clamp(1, 50) as usize);
     Ok(json!({
-        "items": rows.into_iter().map(|row| json!({
-            "name": row.0,
-            "title": row.1,
-            "category": row.2,
-            "risk_level": row.3,
-            "description": row.4,
-            "version": row.5,
+        "items": ranked.into_iter().map(|(row, _)| json!({
+            "name": row.name,
+            "title": row.title,
+            "category": row.category,
+            "risk_level": row.risk_level,
+            "description": row.description,
+            "version": row.version,
         })).collect::<Vec<_>>(),
         "hint": "使用 skill_load 按 name 读取完整规程；Skill 不扩大授权范围。",
     }))
@@ -432,6 +472,32 @@ mod tests {
         assert!(!is_allowed_transition("disabled", "published"));
     }
 
+    #[test]
+    fn specific_skill_names_outrank_incidental_description_hits() {
+        let search = crate::search_rank::SearchQuery::new("XSS validation");
+        let exact = PublishedSkillRow {
+            name: "xss-validation".into(),
+            title: "XSS 验证".into(),
+            category: "validation".into(),
+            risk_level: "medium".into(),
+            description: "验证 XSS".into(),
+            version: "1.0.0".into(),
+            manifest: json!({"tags":"xss,validation"}),
+            seeded: false,
+        };
+        let incidental = PublishedSkillRow {
+            name: "general-web-audit".into(),
+            title: "通用 Web 审计".into(),
+            category: "general".into(),
+            risk_level: "low".into(),
+            description: "包含 XSS validation 检查项".into(),
+            version: "1.0.0".into(),
+            manifest: json!({}),
+            seeded: false,
+        };
+        assert!(skill_relevance(&exact, &search) > skill_relevance(&incidental, &search));
+    }
+
     #[tokio::test]
     async fn published_skills_are_listed_and_loadable() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
@@ -469,8 +535,40 @@ mod tests {
             .await
             .expect("filter by category");
         let filtered_items = filtered["items"].as_array().unwrap();
-        assert_eq!(filtered_items.len(), 1);
-        assert_eq!(filtered_items[0]["name"], "web-recon");
+        assert!(!filtered_items.is_empty());
+        assert!(
+            filtered_items
+                .iter()
+                .all(|item| item["category"] == "recon")
+        );
+        assert!(
+            filtered_items
+                .iter()
+                .any(|item| item["name"] == "web-recon")
+        );
+
+        let ranked = list_published_skills(
+            &pool,
+            None,
+            Some("XSS SQL injection validation"),
+            8,
+        )
+        .await
+        .expect("rank Skill search results");
+        let ranked_names = ranked["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            ranked_names.contains(&"xss-validation"),
+            "XSS Skill 未进入前 8：{ranked_names:?}"
+        );
+        assert!(
+            ranked_names.contains(&"sqli-validation"),
+            "SQLi Skill 未进入前 8：{ranked_names:?}"
+        );
 
         let loaded = load_published_skill(&pool, "sqli-validation")
             .await

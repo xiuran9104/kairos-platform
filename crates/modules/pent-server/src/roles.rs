@@ -31,13 +31,34 @@ async fn list_roles(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
+    let configured_default = crate::role_resolution::configured_default_role_id(&s.pool, tenant_id)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?
+        .unwrap_or_else(|| crate::role_resolution::PLATFORM_DEFAULT_ROLE_ID.to_string());
     let rows = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(r) || jsonb_build_object('inherited', r.tenant_id = 0 AND r.tenant_id <> $1)
+        "SELECT to_jsonb(r) || jsonb_build_object(
+             'inherited', r.tenant_id = 0 AND r.tenant_id <> $1,
+             'is_configured_default', r.id = $2,
+             'explicit_session_count', (
+                 SELECT count(*) FROM pent_agent_sessions s
+                 WHERE s.tenant_id=$1 AND s.constraints->>'role_id'=r.id
+             ),
+             'project_count', (
+                 SELECT count(*) FROM pent_projects p
+                 WHERE p.tenant_id=$1 AND p.default_role_id=r.id AND p.deleted=0
+             ),
+             'historical_run_count', (
+                 SELECT count(*) FROM pent_runs pr
+                 WHERE pr.tenant_id=$1
+                   AND pr.policy_snapshot #>> '{role,resolved_role_id}'=r.id
+             )
+         )
          FROM pent_agent_roles r
          WHERE (r.tenant_id = $1 OR r.tenant_id = 0)
-         ORDER BY r.is_default DESC, r.tenant_id ASC, r.name",
+         ORDER BY (r.id=$2) DESC, r.is_default DESC, r.tenant_id ASC, r.name",
     )
     .bind(tenant_id)
+    .bind(configured_default)
     .fetch_all(&s.pool)
     .await
     .map_err(|error| AppError::internal(error.to_string()))?;
@@ -214,18 +235,71 @@ async fn delete_role(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
+    let mut tx = s.pool.begin().await.map_err(|error| AppError::internal(error.to_string()))?;
+    let deletable: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM pent_agent_roles
+             WHERE id=$1 AND tenant_id=$2 AND is_default=false
+         )",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    if !deletable {
+        return Err(AppError::bad_request("角色不存在、为平台预设或默认角色，无法删除"));
+    }
+    sqlx::query(
+        "UPDATE pent_agent_sessions
+         SET constraints=constraints-'role_id',updated_at=now()
+         WHERE tenant_id=$2 AND constraints->>'role_id'=$1",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    sqlx::query(
+        "UPDATE pent_projects SET default_role_id=NULL,updated_at=now()
+         WHERE tenant_id=$2 AND default_role_id=$1 AND deleted=0",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    sqlx::query(
+        "UPDATE pent_runtime_policies SET
+             agent_config=jsonb_set(
+                 agent_config,
+                 '{platform_settings,robots,default_role_id}',
+                 to_jsonb($3::text),
+                 true
+             ),
+             updated_at=now()
+         WHERE tenant_id=$2
+           AND agent_config #>> '{platform_settings,robots,default_role_id}'=$1",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(crate::role_resolution::PLATFORM_DEFAULT_ROLE_ID)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
     let affected = sqlx::query(
         "DELETE FROM pent_agent_roles
          WHERE id=$1 AND tenant_id=$2 AND is_default=false",
     )
     .bind(&id)
     .bind(tenant_id)
-    .execute(&s.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|error| AppError::internal(error.to_string()))?
     .rows_affected();
     if affected == 0 {
-        return Err(AppError::bad_request("角色不存在、为平台预设或默认角色，无法删除"));
+        return Err(AppError::bad_request("角色删除失败，请刷新后重试"));
     }
+    tx.commit().await.map_err(|error| AppError::internal(error.to_string()))?;
     Ok(Json(ApiResponse::new(json!({"deleted": id}))))
 }

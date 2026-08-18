@@ -8,8 +8,12 @@ export interface PentAgentRole {
   icon: string;
   id: string;
   inherited?: boolean;
+  explicit_session_count?: number;
+  historical_run_count?: number;
+  is_configured_default?: boolean;
   is_default: boolean;
   name: string;
+  project_count?: number;
   tenant_id: number;
   tool_whitelist: string[];
   updated_at: string;

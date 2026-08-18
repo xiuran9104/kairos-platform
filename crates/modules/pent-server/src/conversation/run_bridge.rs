@@ -6,6 +6,8 @@ use kairos_platform_pent_runtime::ports::FindingRecorder;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::model_gateway::AiModelGateway;
+
 #[derive(Clone)]
 pub struct PgFindingRecorder {
     pool: PgPool,
@@ -494,13 +496,11 @@ pub(crate) async fn extract_and_persist_findings(
         return Ok(0);
     }
 
-    let model_id: i64 = sqlx::query_scalar(
-        "SELECT id FROM ai.model_configs WHERE type='chat' AND status=0 ORDER BY id LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "未配置可用的聊天模型".to_string())?;
+    let model_id = AiModelGateway::new(pool.clone())
+        .resolve_model(session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .0;
 
     let factory = AiModelFactory::new(pool.clone());
     let response = factory

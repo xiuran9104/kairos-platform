@@ -5,6 +5,7 @@ use kairos_platform_pent_tooling::manifest::{ToolManifestRecord, descriptor_exec
 use serde_json::{Value, json};
 
 use super::tool_executor::has_conversation_handler;
+use super::tool_retrieval::retrieve_tool_ids;
 
 fn tool_definition(schema: Value, execution_class: ToolExecutionClass) -> ToolDefinition {
     ToolDefinition::new(schema, execution_class)
@@ -12,92 +13,6 @@ fn tool_definition(schema: Value, execution_class: ToolExecutionClass) -> ToolDe
 
 fn inline_definition(schema: Value) -> ToolDefinition {
     tool_definition(schema, ToolExecutionClass::Inline)
-}
-
-/// FTS search on tool `embedding_document` using PostgreSQL full-text search.
-/// Falls back to an empty result set on any error — callers must degrade
-/// gracefully to loading the full catalog.
-async fn tool_fts_search(pool: &PgPool, query: &str, top_k: usize) -> Vec<(String, f32)> {
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
-    // PostgreSQL ts_rank returns REAL (float4), which maps to Rust f32.
-    // Decoding it as f64 makes every retrieval fail and silently expands the
-    // model catalog to all tools.
-    let result = sqlx::query_as::<_, (String, f32)>(
-        "SELECT tool_id, ts_rank(
-            to_tsvector('simple', coalesce(embedding_document, description)),
-            plainto_tsquery('simple', $1)
-        ) AS rank
-         FROM pent_tool_definitions
-         WHERE lifecycle_status = 'active'
-           AND embedding_document IS NOT NULL
-           AND embedding_document != ''
-         ORDER BY rank DESC
-         LIMIT $2",
-    )
-    .bind(query.chars().take(1000).collect::<String>())
-    .bind(top_k as i64)
-    .fetch_all(pool)
-    .await;
-    match result {
-        Ok(rows) => rows.into_iter().filter(|(_, rank)| *rank > 0.0).collect(),
-        Err(error) => {
-            tracing::warn!(%error, "FTS tool search failed; falling back to full catalog");
-            Vec::new()
-        }
-    }
-}
-
-/// Hybrid retrieval: FTS → vector (if embedding available) → merge.
-/// Returns ranked tool IDs with retrieval scores. On any failure, returns
-/// an empty list — the caller degrades to the full catalog.
-async fn retrieve_tool_ids(pool: &PgPool, intent: &str, top_k: usize) -> Vec<(String, f32)> {
-    let fts = tool_fts_search(pool, intent, top_k * 3).await;
-    if fts.is_empty() {
-        return Vec::new();
-    }
-    // Optional vector search: if embedding provider is configured, augment
-    // with semantic similarity results.
-    let vector_results = {
-        let mut embedder = crate::infrastructure::embedding::EmbeddingProvider::new(pool.clone());
-        if embedder.try_configure().await.unwrap_or(false) {
-            if let Some(embedding) = embedder.embed(intent).await {
-                let index = crate::infrastructure::vector::PgVectorIndex::new(pool.clone());
-                match index.search(&embedding, None, top_k * 2).await {
-                    Ok(results) => results
-                        .into_iter()
-                        .map(|r| (r.tool_id, r.score))
-                        .collect::<Vec<_>>(),
-                    Err(error) => {
-                        tracing::warn!(%error, "vector search failed; using FTS only");
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
-    };
-
-    // Merge: deduplicate, sort by score desc, truncate.
-    let mut seen = std::collections::HashSet::new();
-    let mut merged = Vec::with_capacity(fts.len() + vector_results.len());
-    for (id, score) in fts.into_iter().chain(vector_results) {
-        if seen.insert(id.clone()) {
-            merged.push((id, score));
-        }
-    }
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    merged.truncate(top_k);
-    tracing::debug!(
-        count = merged.len(),
-        intent = %intent.chars().take(50).collect::<String>(),
-        "hybrid tool retrieval complete"
-    );
-    merged
 }
 
 /// Load tool schemas from the maintained registry instead of duplicating them
@@ -278,8 +193,8 @@ pub async fn load_tools_for_intent(
                 .and_then(Value::as_u64)
                 .map(|v| v as usize)
         })
-        .unwrap_or(24)
-        .clamp(8, 80);
+        .unwrap_or(12)
+        .clamp(6, 16);
     let retrieved: std::collections::HashSet<String> = retrieve_tool_ids(pool, intent, top_k)
         .await
         .into_iter()
@@ -287,9 +202,6 @@ pub async fn load_tools_for_intent(
         .collect();
     let mut explicitly_unlocked = explicit_tool_names(intent);
     explicitly_unlocked.extend(unlocked.iter().map(|name| name.to_ascii_lowercase()));
-    if retrieved.is_empty() {
-        return Ok(all);
-    }
     const ALWAYS: &[&str] = &[
         "knowledge_search",
         "evidence_list",
@@ -298,6 +210,8 @@ pub async fn load_tools_for_intent(
         "query_execution_result",
         "traffic_list",
         "traffic_view",
+        "traffic_diff",
+        "traffic_replay",
         "skill_list",
         "skill_load",
         "tool_search",
@@ -310,17 +224,34 @@ pub async fn load_tools_for_intent(
         "agent_collect",
         "agent_list",
         "record_finding",
+        "plan_create",
+        "plan_get",
+        "plan_update",
         "read_file",
         "glob",
         "grep",
     ];
+    // A retrieval miss must stay bounded. These generic discovery tools let
+    // the model establish enough context for a more specific `tool_search`
+    // without dumping the complete registry into the prompt.
+    const FALLBACK: &[&str] = &[
+        "http_probe",
+        "http_request",
+        "dns_lookup",
+        "tcp_scan",
+        "nmap",
+        "web_crawl",
+        "web_fingerprint",
+        "nuclei",
+    ];
+    let retrieval_missed = retrieved.is_empty();
     let selected = all
         .into_iter()
         .filter(|definition| {
             let name = definition.name().unwrap_or("");
             let lower = name.to_ascii_lowercase();
             ALWAYS.contains(&lower.as_str())
-                || lower.starts_with("mcp_")
+                || (retrieval_missed && FALLBACK.contains(&lower.as_str()))
                 || retrieved.contains(&lower)
                 || explicitly_unlocked.contains(&lower)
         })
@@ -625,13 +556,13 @@ fn skill_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "skill_list",
-                "description": "列出平台已发布的 Skill 索引（名称/分类/风险/用途），不含规程正文。不确定某类验证该怎么做时先调用。",
+                "description": "按相关度列出平台已发布的 Skill 索引（名称/分类/风险/用途），不含规程正文。必须提供 query 或 category；任务阶段或漏洞类型变化时重新检索。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "category": {"type": "string", "description": "按分类过滤，如 recon/validation"},
                         "query": {"type": "string", "description": "按名称/标题/描述关键词过滤"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 8}
                     }
                 }
             }
@@ -810,7 +741,8 @@ mod tests {
     use super::{
         agent_tool_definitions, descriptor_execution_class, evidence_tool_definitions,
         explicit_tool_names, file_upload_validator_definition, finding_tool_definitions,
-        knowledge_search_definition, tool_search_definition, tool_search_result_names,
+        knowledge_search_definition, load_tools_for_intent, tool_search_definition,
+        tool_search_result_names,
     };
     use crate::conversation::tool_guidance::enhance_tool_schema;
     use crate::conversation::tool_executor::has_conversation_handler;
@@ -886,6 +818,45 @@ mod tests {
             r#"{"tools":[{"name":"sqlmap_scan"},{"name":"web_xss_scan"}]}"#,
         );
         assert!(names.contains("sqlmap_scan"));
+    }
+
+    #[tokio::test]
+    async fn retrieval_miss_never_discloses_the_full_catalog() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let config = kairos_platform_framework_database::DatabaseConfig::new(
+            url,
+            1,
+            2,
+            std::time::Duration::from_secs(10),
+        )
+        .expect("valid test database config");
+        let pool = kairos_platform_framework_database::connect(&config)
+            .await
+            .expect("connect test database");
+        let all = super::load_conversation_tool_definitions(&pool)
+            .await
+            .expect("load complete catalog");
+        let selected = load_tools_for_intent(
+            &pool,
+            "完全不存在的检索词甲乙丙丁",
+            &serde_json::json!({
+                "tool_search_enabled": true,
+                "tool_search_min_tools": 20,
+                "tool_search_top_k": 12
+            }),
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("load bounded catalog");
+        assert!(selected.len() < all.len());
+        assert!(selected.len() <= 40, "候选仍过多：{}", selected.len());
+        assert!(
+            selected
+                .iter()
+                .any(|tool| tool.name() == Some("tool_search"))
+        );
     }
 
     #[test]

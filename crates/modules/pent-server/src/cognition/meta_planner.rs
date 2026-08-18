@@ -7,6 +7,8 @@ use kairos_platform_framework_database::PgPool;
 use kairos_platform_pent_api::cognition::*;
 use serde_json::{Value, json};
 
+use crate::conversation::model_gateway::resolve_default_chat_model;
+
 /// System prompt for the LLM meta-planner. Describes the TCG format, available
 /// capabilities, and the planning rules the model must follow.
 const META_PLANNER_SYSTEM_PROMPT: &str = r#"你是渗透测试任务规划专家。根据目标信息和授权范围，生成一个任务协调图（TCG）。
@@ -408,17 +410,9 @@ impl MetaPlanner {
     /// Resolve the default enabled chat model configured in the AI console.
     async fn resolve_planner_model(
         pool: &PgPool,
-        _tenant_id: i64,
+        tenant_id: i64,
     ) -> anyhow::Result<(i64, f64, u32)> {
-        let id: i64 = sqlx::query_scalar(
-            "SELECT id FROM ai.model_configs
-             WHERE type = 'chat' AND status = 0
-             ORDER BY id LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?;
-        Ok((id, 0.7, 4096))
+        resolve_default_chat_model(pool, tenant_id).await
     }
 }
 

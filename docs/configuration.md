@@ -25,6 +25,10 @@
 | `PENTA_SANDBOX_ROOT` | 否 | `/tmp/kairos-pent-sandbox` | run 级 workspace/artifact 宿主机根目录 |
 | `PENTA_SANDBOX_ALLOWED_ROOTS` | 否 | 无 | 额外允许读写挂载到沙箱的绝对目录，逗号分隔 |
 | `PENTA_TOOL_DIR` | 否 | `~/.kairos/tools/bin` | 受控工具目录，pent-agent 启动时把 PATH 上发现的工具软链至此，并只读挂载进沙箱、前置到沙箱 PATH |
+| `PENTA_TRAFFIC_CAPTURE` | 否 | `true` | 启用任务 HTTP/HTTPS MITM 流量记录；仅显式设为 `false`/`0`/`no`/`off` 时关闭 |
+| `PENTA_TRAFFIC_PROXY` | 否 | `http://127.0.0.1:8085` | pent-agent 内置 MITM 的本地 IPv4 代理地址 |
+| `PENTA_FORCE_WEB_PROXY` | 否 | `true` | 为 Web 工具启用 ProxyChains 连接拦截；启用时缺少运行库会使 pent-agent 拒绝启动 |
+| `PENTA_PROXYCHAINS_LIBRARY` | 否 | 自动探测 | 自定义 `libproxychains.so.4` 绝对路径 |
 
 ## Pent 本地工具执行
 
@@ -33,13 +37,13 @@ Run 与对话中的 recipe 工具均由 pent-agent 执行；Gateway 不安装或
 Docker Compose 仍只用于 PostgreSQL、Redis、NATS、MinIO、Neo4j、Graphiti、
 headless Chrome 和 mitmproxy 等本地基础设施。
 
-pent-agent 启动时强制检查 bubblewrap，缺失时拒绝启动；安全工具仍可按现有生命周期策略安装。
+pent-agent 启动时强制检查 bubblewrap；流量采集开启时还会检查 ProxyChains-ng，缺失时拒绝启动。安全工具仍可按现有生命周期策略安装。
 生产环境建议通过 `script/install-pent-tools.sh` 提前安装并锁定版本。
 
 常用宿主机工具：
 
 ```bash
-for tool in bwrap nmap nuclei sqlmap ffuf gobuster whatweb nikto subfinder amass wfuzz dirsearch feroxbuster dalfox; do
+for tool in bwrap proxychains4 nmap nuclei sqlmap ffuf gobuster whatweb nikto subfinder amass wfuzz dirsearch feroxbuster dalfox; do
   command -v "$tool" >/dev/null && echo "ok $tool" || echo "missing $tool"
 done
 ```
@@ -50,6 +54,8 @@ done
 - bubblewrap 构造最小只读文件系统，仅将 run 级目录读写挂载为 `/workspace`、`/artifacts`。
 - PID/user/IPC/UTS/cgroup namespace、capabilities drop、seccomp-bpf 与 cgroup/prlimit 同时生效。
 - 按当前部署决策不启用 network namespace；工具复用宿主机网络栈，`TargetOnly` 继续做应用层授权范围校验。
+- Web 工具同时注入标准代理变量和 ProxyChains 连接拦截；动态程序直接 `connect(2)` 也会被送入 MITM。Go 等静态程序通过标准代理变量进入同一链路。
+- Nmap、TLS 专项检查和其他非 HTTP 工具不启用连接拦截，避免改变端口扫描及真实证书检查语义。
 - 仍拒绝空目标、`-` 开头目标、控制字符、link-local、广播和部分基础设施地址。
 - `http_request` 的 Cookie 状态目录由 `PENTA_TOOL_STATE_ROOT` 管理，并显式挂载为沙箱内 `/state`。
 

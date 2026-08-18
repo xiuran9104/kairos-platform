@@ -1,13 +1,13 @@
 ---
 name: php-framework-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   PHP 框架特定安全审计。当在 PHP 白盒审计中已识别目标使用特定框架、
   需要检查框架特有安全机制和常见配置缺陷时触发。
   覆盖 6 大框架: Laravel(Mass Assignment/Blade XSS/CSRF 例外)、
   ThinkPHP(RCE 历史漏洞/路由注入/缓存写入)、WordPress(插件漏洞/权限钩子/nonce 验证)、
   Symfony(Debug Bar/YAML 解析/安全投票器)、Yii2(RBAC/ActiveRecord 注入)、CodeIgniter(全局 XSS/CSRF Token)。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: laravel, thinkphp, wordpress, symfony, yii, codeigniter, 框架审计, mass assignment, blade xss, wp plugin, think rce
   category: code-audit

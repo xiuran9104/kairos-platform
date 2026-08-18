@@ -1,12 +1,12 @@
 ---
 name: php-injection-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   PHP 源码注入类漏洞审计。当在 PHP 白盒审计中需要检测注入类漏洞时触发。
   覆盖 6 种注入: SQL 注入(PDO/MySQLi/ORM)、NoSQL 注入(MongoDB)、
   命令注入(system/exec/passthru)、LDAP 注入、表达式注入(eval/preg_replace /e)、SSRF。
   需要 php-audit-pipeline 提供的数据流证据(EVID_*)作为审计输入。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: php injection, sql injection, command injection, nosql, ldap injection, ssrf, eval, preg_replace, 注入审计, 代码注入, php source audit
   category: code-audit

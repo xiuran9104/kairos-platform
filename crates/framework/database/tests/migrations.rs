@@ -18,6 +18,95 @@ async fn applies_all_migrations_to_empty_postgres() {
         .expect("read migration history");
     assert_eq!(applied, 1);
 
+    let kimi_models: Vec<String> = sqlx::query_scalar(
+        "SELECT model FROM ai.model_catalog
+         WHERE platform='Moonshot' AND source='preset' AND active
+         ORDER BY model",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read bootstrapped Kimi model catalog");
+    assert_eq!(
+        kimi_models,
+        vec![
+            "kimi-k2.7-code".to_string(),
+            "kimi-k2.7-code-highspeed".to_string(),
+            "kimi-k3".to_string(),
+        ]
+    );
+    let retired_kimi_models: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ai.model_catalog
+         WHERE platform='Moonshot' AND model IN ('kimi-k2.5','kimi-k2-0711-preview')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("check retired Kimi models");
+    assert_eq!(retired_kimi_models, 0);
+
+    let current_model_presets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ai.model_catalog
+         WHERE active AND (platform,model,type) IN (
+             ('Anthropic','claude-opus-5','chat'),
+             ('Gemini','gemini-3.7-flash','chat'),
+             ('Gemini','gemini-embedding-2-preview','embedding'),
+             ('Gemini','veo-3.1-generate-preview','video'),
+             ('DouBao','doubao-seedance-2-0-260128','video'),
+             ('DouBao','doubao-seedream-5-0-pro-260628','image'),
+             ('OpenAI','gpt-5.6-sol','chat'),
+             ('Grok','grok-4.5','chat'),
+             ('DeepSeek','deepseek-v4-pro','chat')
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read current model presets");
+    assert_eq!(current_model_presets, 9);
+
+    let retired_or_invalid_presets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ai.model_catalog
+         WHERE source='preset' AND (
+             (platform='Anthropic' AND model='claude-opus-4-8') OR
+             (platform='Gemini' AND model IN (
+                 'gemini-3.5-flash','gemini-embedding-2','veo-3.1-preview'
+             ))
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("check retired or invalid model presets");
+    assert_eq!(retired_or_invalid_presets, 0);
+
+    let upgraded_model_configs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ai.model_configs WHERE
+            (platform='TongYi' AND model='text-embedding-v4') OR
+            (platform='DouBao' AND model='doubao-seedance-2-0-260128') OR
+            (platform='DouBao' AND model='doubao-seedream-5-0-pro-260628') OR
+            (platform='Moonshot' AND model='kimi-k3')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read upgraded model configurations");
+    assert_eq!(upgraded_model_configs, 4);
+
+    let model_soft_delete_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema='ai' AND table_name='model_configs'
+               AND column_name='deleted' AND is_nullable='NO'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect AI model soft-delete column");
+    assert!(model_soft_delete_column);
+
+    let deleted_baseline_models: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ai.model_configs WHERE deleted")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect deleted baseline AI models");
+    assert_eq!(deleted_baseline_models, 0);
+
     for table in [
         "ai.model_configs",
         "ai.chat_roles",
@@ -67,6 +156,7 @@ async fn applies_all_migrations_to_empty_postgres() {
         assert!(exists, "expected table {table}");
     }
     for (table, column) in [
+        ("pent_projects", "default_role_id"),
         ("pent_mcp_servers", "config_revision"),
         ("pent_workers", "sandbox_backend"),
         ("pent_workers", "sandbox_ready"),
@@ -104,6 +194,25 @@ async fn applies_all_migrations_to_empty_postgres() {
         .expect("inspect expected column");
         assert!(exists, "expected column {table}.{column}");
     }
+
+    let default_agent_role: Option<String> = sqlx::query_scalar(
+        "SELECT agent_config #>> '{platform_settings,robots,default_role_id}'
+         FROM pent_runtime_policies WHERE tenant_id=1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("inspect default Agent role");
+    assert_eq!(default_agent_role.as_deref(), Some("role-pentest"));
+
+    let legacy_agent_role: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pent_runtime_policies
+         WHERE tenant_id=1
+           AND agent_config #>> '{platform_settings,robots,default_role}' IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect retired Agent role setting");
+    assert_eq!(legacy_agent_role, 0);
 
     let scan_risk_rule_index: bool =
         sqlx::query_scalar("SELECT to_regclass('public.scan_risks_active_rule_key') IS NOT NULL")
@@ -287,6 +396,29 @@ async fn applies_all_migrations_to_empty_postgres() {
     .await
     .expect("inspect Pent run state columns");
     assert_eq!(pent_runtime_columns, 6);
+
+    let skills_without_descriptions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pent_skills WHERE btrim(coalesce(description, '')) = ''",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect bootstrapped Skill descriptions");
+    assert_eq!(
+        skills_without_descriptions, 0,
+        "every bootstrapped Skill must have a description"
+    );
+
+    let oversized_tool_catalog_policies: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pent_runtime_policies
+         WHERE COALESCE((agent_config->>'tool_search_top_k')::integer, 0) <> 12",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect model-facing tool candidate limits");
+    assert_eq!(
+        oversized_tool_catalog_policies, 0,
+        "bootstrapped runtime policies must expose 12 dynamic tool candidates"
+    );
 
     let cloud_hierarchy_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns

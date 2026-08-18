@@ -1,12 +1,12 @@
 ---
 name: cross-domain-attack-chain
 description: |
-risk: safe
-requires-explicit-authorization: false
   Web 与 AI 跨域攻击链方法论。当目标系统同时包含传统 Web 应用和 AI/LLM 组件、
   需要评估 Web 漏洞对 AI 系统的影响或 AI 漏洞对 Web 系统的影响时触发。
   覆盖双向攻击链: Web→AI(XSS 窃取对话/SSRF 调用模型 API/SQLi 污染 RAG/文件上传 RAG 投毒)
   和 AI→Web(注入生成存储型 XSS/Agent 执行 SQL 命令/工具读取敏感文件/沙箱逃逸 RCE)。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: cross domain, web to ai, ai to web, 跨域攻击, attack chain, rag poisoning, xss ai, ssrf model api, agent sql injection, sandbox escape, 攻击链
   category: ai-security

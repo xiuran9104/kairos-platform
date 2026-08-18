@@ -18,8 +18,10 @@ pub async fn resolve_vision_model(pool: &PgPool) -> Option<i64> {
         }
     }
     sqlx::query_scalar::<_, i64>(
-        "SELECT model_config_id FROM pent_model_role_bindings
-         WHERE model_role='conversation' AND enabled=true
+        "SELECT b.model_config_id FROM pent_model_role_bindings b
+         JOIN ai.model_configs m ON m.id=b.model_config_id
+         WHERE b.model_role='conversation' AND b.enabled=true
+           AND m.type='chat' AND m.status=0 AND m.deleted=false
          ORDER BY (tenant_id=0) DESC LIMIT 1",
     )
     .fetch_optional(pool)

@@ -1,12 +1,12 @@
 ---
 name: ai-data-security
 description: |
-risk: safe
-requires-explicit-authorization: false
   AI 系统数据安全测试方法论。当需要评估 LLM/AI 系统的数据泄露风险、训练数据安全、
   或 RAG/向量库数据完整性时触发。覆盖: System Prompt 泄露(元 Prompt/角色扮演/关键字定位)、
   训练数据推导与提取、成员推断攻击、模型反演攻击、RAG 数据投毒、API 信息泄露、
   级联幻觉攻击、外部数据源信息泄露。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: ai data security, data leakage, prompt leakage, training data extraction, membership inference, model inversion, rag poisoning, 数据泄露, 训练数据, 成员推断, 模型反演, 数据投毒, api 泄露
   category: ai-security

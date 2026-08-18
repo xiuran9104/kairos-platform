@@ -1,13 +1,13 @@
 ---
 name: java-auth-config-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   Java 源码认证与配置安全审计。当在 Java 白盒审计中需要检测认证绕过、权限缺陷或安全配置问题时触发。
   覆盖 6 类风险: 认证绕过(Spring Security/Shiro Filter 链 URI 解析差异)、
   越权(IDOR/水平越权/垂直越权)、JWT 安全(算法混淆/密钥泄露/Claims 验证)、
   加密配置(弱算法/硬编码密钥/不安全随机数)、信息泄露(错误堆栈/Actuator/Debug 模式)、
   业务逻辑漏洞(竞争条件/金额篡改/流程绕过)。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: authentication bypass, authorization, idor, jwt, shiro, spring security, 认证绕过, 越权, 加密配置, 信息泄露, actuator, 业务逻辑, java source audit
   category: code-audit

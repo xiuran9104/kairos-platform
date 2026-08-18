@@ -1,14 +1,17 @@
 <script lang="ts" setup>
+import type { PentAgentRole } from '#/api/pent/roles';
+
 import { computed, ref, watch } from 'vue';
 import { message } from 'ant-design-vue';
 
-import { getPentPlatformSection, updatePentPlatformSection } from '#/api/pent';
+import { getPentPlatformSection, getPentRoles, updatePentPlatformSection } from '#/api/pent';
 
 type Field = { extra?: string; key: string; label: string; max?: number; min?: number; options?: Array<{ label: string; value: string }>; suffix?: string; type: 'boolean' | 'number' | 'select' | 'text' | 'textarea' };
 const props = defineProps<{ description: string; sectionKey: string; title: string }>();
 const loading = ref(false);
 const saving = ref(false);
 const values = ref<Record<string, any>>({});
+const roles = ref<PentAgentRole[]>([]);
 
 const schemas: Record<string, Field[]> = {
   assets: [
@@ -42,7 +45,7 @@ const schemas: Record<string, Field[]> = {
   ],
   robots: [
     { key: 'enabled', label: '启用机器人协作', type: 'boolean' }, { key: 'max_active_agents', label: '最大活跃 Agent', type: 'number', min: 1, max: 100 },
-    { key: 'default_role', label: '默认角色', type: 'select', options: [{ label: '渗透测试员', value: 'penetration_tester' }, { label: '安全分析师', value: 'security_analyst' }, { label: '任务协调员', value: 'coordinator' }] },
+    { key: 'default_role_id', label: '默认主对话角色', type: 'select', extra: '新项目和新会话未显式选择角色时使用；使用稳定角色 ID。' },
     { key: 'auto_assign_tasks', label: '自动分配任务', type: 'boolean' }, { key: 'idle_timeout_minutes', label: '空闲回收时间', type: 'number', min: 1, max: 1440, suffix: '分钟' },
     { key: 'memory_enabled', label: '启用长期记忆', type: 'boolean' }, { key: 'collaboration_enabled', label: '允许 Agent 间协作', type: 'boolean' },
   ],
@@ -53,9 +56,21 @@ const schemas: Record<string, Field[]> = {
     { key: 'default_shell', label: '默认 Shell', type: 'select', options: [{ label: 'Bash', value: 'bash' }, { label: 'PowerShell', value: 'powershell' }, { label: 'Zsh', value: 'zsh' }] },
   ],
 };
-const fields = computed(() => schemas[props.sectionKey] || []);
+const fields = computed(() => (schemas[props.sectionKey] || []).map((field) =>
+  field.key === 'default_role_id'
+    ? {
+        ...field,
+        options: roles.value
+          .filter((role) => role.enabled)
+          .map((role) => ({
+            label: `${role.icon || '🎯'} ${role.name} · ${role.id}`,
+            value: role.id,
+          })),
+      }
+    : field,
+));
 
-async function load() { loading.value = true; try { values.value = await getPentPlatformSection(props.sectionKey); } catch (error: any) { message.error(error?.message || '加载设置失败'); } finally { loading.value = false; } }
+async function load() { loading.value = true; try { const [section, loadedRoles] = await Promise.all([getPentPlatformSection(props.sectionKey), props.sectionKey === 'robots' ? getPentRoles() : Promise.resolve([])]); values.value = section; roles.value = loadedRoles as PentAgentRole[]; } catch (error: any) { message.error(error?.message || '加载设置失败'); } finally { loading.value = false; } }
 async function save() { saving.value = true; try { values.value = await updatePentPlatformSection(props.sectionKey, values.value); message.success(`${props.title}已保存`); } catch (error: any) { message.error(error?.message || '保存失败'); } finally { saving.value = false; } }
 watch(() => props.sectionKey, load, { immediate: true });
 </script>

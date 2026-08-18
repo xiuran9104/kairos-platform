@@ -22,6 +22,7 @@ const loading = ref(false);
 const saving = ref(false);
 const testing = ref(false);
 const models = ref<AiModelModelApi.Model[]>([]);
+const defaultModelMissing = ref(false);
 const runtimePolicy = ref<Record<string, any>>({});
 const agentSettings = ref<Record<string, any>>({});
 const binding = ref<PentModelBinding>({
@@ -83,12 +84,17 @@ async function load() {
     ]);
     models.value = modelList || [];
     const current = (bindings || []).find(
-      (item) => item.model_role === 'conversation' && !item.project_id,
+      (item) =>
+        item.model_role === 'conversation' &&
+        (!item.project_id || item.project_id === '0'),
     );
+    defaultModelMissing.value = !current;
     if (current) binding.value = { ...current, project_id: '' };
-    else if (models.value[0]) binding.value.model_config_id = models.value[0].id;
+    else binding.value.model_config_id = 0;
     const currentVision = (bindings || []).find(
-      (item) => item.model_role === 'vision' && !item.project_id,
+      (item) =>
+        item.model_role === 'vision' &&
+        (!item.project_id || item.project_id === '0'),
     );
     if (currentVision) visionBinding.value = { ...currentVision, project_id: '' };
     runtimePolicy.value = policy || {};
@@ -170,6 +176,13 @@ onMounted(load);
         </a-space>
       </div>
       <a-form layout="vertical">
+        <a-alert
+          v-if="defaultModelMissing"
+          class="mb-4"
+          message="默认对话模型已删除或未配置，请重新选择并保存"
+          show-icon
+          type="warning"
+        />
         <a-form-item label="默认对话模型" required>
           <a-select
             v-model:value="binding.model_config_id"
@@ -236,7 +249,7 @@ onMounted(load);
           <a-col :xs="24" :md="8"><a-form-item label="最大迭代"><a-input-number v-model:value="agentSettings.max_iterations" :min="1" :max="10000" /></a-form-item></a-col>
           <a-col :xs="24" :md="8"><a-form-item label="上下文预算 Tokens"><a-input-number v-model:value="agentSettings.context_budget_tokens" :min="2000" :max="256000" /></a-form-item></a-col>
           <a-col :xs="24" :md="8"><a-form-item label="动态工具检索"><a-switch v-model:checked="agentSettings.tool_search_enabled" /></a-form-item></a-col>
-          <a-col :xs="24" :md="8"><a-form-item label="动态工具数量"><a-input-number v-model:value="agentSettings.tool_search_top_k" :min="1" :max="200" /></a-form-item></a-col>
+          <a-col :xs="24" :md="8"><a-form-item label="动态工具数量"><a-input-number v-model:value="agentSettings.tool_search_top_k" :min="6" :max="16" /></a-form-item></a-col>
           <a-col :xs="24" :md="8"><a-form-item label="模型重试次数"><a-input-number v-model:value="agentSettings.run_retry_max_attempts" :min="0" :max="20" /></a-form-item></a-col>
           <a-col :xs="24" :md="8"><a-form-item label="工具等待超时（秒）"><a-input-number v-model:value="agentSettings.tool_wait_timeout_seconds" :min="0" :max="7200" /></a-form-item></a-col>
           <a-col :xs="24" :md="8"><a-form-item label="单 MCP 最大并发"><a-input-number v-model:value="agentSettings.external_mcp_max_concurrent_per_server" :min="-1" :max="1000" /></a-form-item></a-col>

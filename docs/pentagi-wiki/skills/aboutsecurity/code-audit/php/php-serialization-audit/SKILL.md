@@ -1,12 +1,12 @@
 ---
 name: php-serialization-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   PHP 源码序列化与模板类漏洞审计。当在 PHP 白盒审计中需要检测反序列化、XML 解析或模板注入漏洞时触发。
   覆盖 3 类风险: PHP 反序列化(unserialize/phar 反序列化/POP 链构造)、
   XXE(XML 外部实体注入/libxml 配置)、SSTI(模板注入/Twig/Blade/Smarty 引擎)。
   需要 php-audit-pipeline 提供的数据流证据。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: deserialization, unserialize, phar, pop chain, xxe, xml, libxml, ssti, template injection, twig, smarty, blade, 反序列化, 模板注入, xml外部实体
   category: code-audit

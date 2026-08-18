@@ -75,7 +75,7 @@ async fn generate_stream(
     let model_id = match v.model_id {
         Some(id) => id,
         None => sqlx::query_scalar(
-            "SELECT id FROM ai.model_configs WHERE type='chat' AND status=0 ORDER BY id LIMIT 1",
+            "SELECT id FROM ai.model_configs WHERE type='chat' AND status=0 AND deleted=false ORDER BY id LIMIT 1",
         )
         .fetch_optional(&s.pool)
         .await

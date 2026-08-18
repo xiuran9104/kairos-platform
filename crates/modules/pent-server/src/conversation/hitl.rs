@@ -10,6 +10,8 @@ use kairos_platform_pent_runtime::ports::{ToolApprovalGate, ToolApprovalRequest}
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::model_gateway::AiModelGateway;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HitlMode {
@@ -218,8 +220,12 @@ impl HitlGate {
     ) -> anyhow::Result<AuditDecision> {
         let model_id = match policy.audit_model_id {
             Some(id) => id,
-            None => sqlx::query_scalar("SELECT COALESCE(NULLIF(s.constraints->>'model_id','')::bigint,(SELECT id FROM ai.model_configs WHERE type='chat' AND status=0 ORDER BY id LIMIT 1)) FROM pent_agent_sessions s WHERE s.id=$1")
-                .bind(session_id).fetch_one(&self.pool).await?,
+            None => {
+                AiModelGateway::new(self.pool.clone())
+                    .resolve_model(session_id)
+                    .await?
+                    .0
+            }
         };
         let custom_prompt = match policy.mode {
             HitlMode::Approval => policy.audit_system_prompt.trim(),

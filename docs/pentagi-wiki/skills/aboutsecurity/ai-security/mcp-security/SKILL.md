@@ -1,12 +1,12 @@
 ---
 name: mcp-security
 description: |
-risk: safe
-requires-explicit-authorization: false
   MCP (Model Context Protocol) 协议安全测试方法论。当目标环境使用 MCP Server 集成外部工具、
   需要评估 MCP 工具描述安全性、或测试 Agent 通过 MCP 调用工具时的安全边界时触发。
   覆盖: 工具描述投毒、地毯式骗局(动态篡改)、指令覆盖(Shadow Tool)、隐藏指令(ANSI/Unicode)、
   跨 Server 攻击、Token 窃取、Schema 操纵、上下文溢出。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: mcp, model context protocol, tool poisoning, mcp server, mcp tool, agent tool, 工具投毒, 指令覆盖, shadow tool, rug pull, 隐藏指令, ansi escape, zero-width, unicode steganography, mcp security, tool description injection
   category: ai-security

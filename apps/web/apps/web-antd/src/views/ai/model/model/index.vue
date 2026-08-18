@@ -11,6 +11,7 @@ import { message } from 'ant-design-vue';
 import { ACTION_ICON, TableAction, useVbenVxeGrid } from '#/adapter/vxe-table';
 import {
   deleteModel,
+  discoverModels,
   getModelPage,
   getModelPlatformCapabilities,
   testModel,
@@ -86,6 +87,20 @@ async function handleTest(row: AiModelModelApi.Model) {
   }
 }
 
+async function handleDiscover(row: AiModelModelApi.Model) {
+  const hideLoading = message.loading({
+    content: `正在同步 ${row.name} 的模型目录`,
+    duration: 0,
+  });
+  try {
+    const result = await discoverModels({ configId: row.id });
+    await loadCapabilities();
+    message.success(`已同步 ${result.models.length} 个可用模型`);
+  } finally {
+    hideLoading();
+  }
+}
+
 const [Grid, gridApi] = useVbenVxeGrid({
   formOptions: {
     schema: useGridFormSchema(),
@@ -146,6 +161,13 @@ const [Grid, gridApi] = useVbenVxeGrid({
               icon: 'lucide:circle-play',
               auth: ['ai:model:update'],
               onClick: handleTest.bind(null, row),
+            },
+            {
+              label: '同步目录',
+              type: 'link',
+              icon: 'lucide:refresh-cw',
+              auth: ['ai:model:update'],
+              onClick: handleDiscover.bind(null, row),
             },
             {
               label: $t('common.edit'),

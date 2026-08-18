@@ -1,12 +1,12 @@
 ---
 name: cot-injection
 description: |
-risk: safe
-requires-explicit-authorization: false
   思维链 (Chain-of-Thought) 注入攻击方法论。当目标系统使用 ReAct/CoT 框架进行多步推理、
   Agent 依赖中间推理结果做决策、或需要测试思维链完整性时触发。
   覆盖: 思维链干扰注入(伪造中间 Agent 结果)、思维链操纵注入(跳过验证步骤直接调度敏感操作)、
   查询注入(在数据查询 Agent 中注入恶意查询语句)。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: cot injection, chain of thought, 思维链注入, react framework, agent reasoning, 推理劫持, thought manipulation, reasoning bypass, 查询注入, cot hijack
   category: ai-security

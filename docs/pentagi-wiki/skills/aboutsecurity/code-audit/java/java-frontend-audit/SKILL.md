@@ -1,12 +1,12 @@
 ---
 name: java-frontend-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   Java 源码前端安全类漏洞审计。当在 Java 白盒审计中需要检测前端安全漏洞时触发。
   覆盖 5 类风险: XSS(JSP/Thymeleaf/FreeMarker 输出转义)、CSRF(Spring Security/自定义 Token)、
   开放重定向(sendRedirect/forward)、CRLF 注入(Header/Cookie)、Session 管理(固定/超时/并发)。
   需要 java-audit-pipeline 提供的数据流证据。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: xss, csrf, open redirect, crlf injection, session, jsp, thymeleaf, freemarker, spring security, 前端安全, java source audit
   category: code-audit

@@ -43,10 +43,13 @@ impl SkillStore for PgSkillStore {
                     .and_then(serde_json::Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
+                if category.is_none() && query.is_none() {
+                    anyhow::bail!("skill_list 必须提供 query 或 category，以免返回无关 Skill");
+                }
                 let limit = arguments
                     .get("limit")
                     .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(20);
+                    .unwrap_or(8);
                 crate::skills::list_published_skills(&self.pool, category, query, limit)
                     .await
                     .map_err(anyhow::Error::msg)

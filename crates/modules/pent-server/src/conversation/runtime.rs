@@ -47,6 +47,10 @@ const MAX_TOOL_ROUNDS: usize = 50;
 const MAX_TURN_RUNTIME_SECS: u64 = 2 * 60 * 60;
 const MAX_RUN_SUMMARY_CHARS: usize = 12_000;
 const DEFAULT_MAX_CONSECUTIVE_MODEL_ERRORS: usize = 3;
+/// Liveness guard, not a resource budget: repeated results, failed calls, and
+/// evidence-only lookups must eventually converge even when budgets are
+/// explicitly unlimited.
+const MAX_CONSECUTIVE_NO_PROGRESS_RESULTS: usize = 12;
 
 /// Autonomous loop injection message sent to the model at the start of every
 /// tool loop. This reminds the model it is operating in autonomous mode and
@@ -63,6 +67,8 @@ const AUTONOMOUS_LOOP_PROMPT: &str = r#"## 自主工具循环已启动
 ## ⚠ 工具选择规则（严格遵守）
 在首次执行侦察、扫描或验证工具前，必须先调用 `skill_list` 查找与当前任务匹配的规程，
 再调用 `skill_load` 加载至少一个 Skill。不得跳过 Skill 直接开始操作。
+当任务从侦察进入专项验证，或漏洞类型发生变化（例如 XSS 转 SQL 注入）时，必须再次用具体关键词
+调用 `skill_list`，并加载对应专项 Skill；不要让一个通用 Skill 覆盖整个 Run。
 不要用 curl/http_request 手工做所有事！每个任务有专用工具：
 - 端口扫描 → nmap（不要 curl 逐个端口试）
 - 漏洞扫描 → nuclei / web_vuln_scan（不要 curl 手工测）
@@ -90,10 +96,7 @@ struct TurnBudget {
 
 impl TurnBudget {
     fn from_snapshot(value: &serde_json::Value) -> Self {
-        if std::env::var("PENTA_UNLIMITED_BUDGETS")
-            .map(|value| value != "false")
-            .unwrap_or(false)
-        {
+        if !kairos_platform_pent_runtime::budget_policy::budget_limits_enabled(value) {
             return Self {
                 max_tool_rounds: usize::MAX,
                 max_duration_seconds: u64::MAX,
@@ -119,12 +122,11 @@ impl TurnBudget {
             max_tokens: budget_u64(value, &["max_tokens", "maxTokens"], 200_000)
                 .clamp(1, 2_000_000),
         };
-        if std::env::var("PENTA_ENV").as_deref() == Ok("development") {
-            budget.max_tokens = std::env::var("PENTA_DEV_MAX_TOKENS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(2_000_000)
-                .clamp(1, 10_000_000);
+        if std::env::var("PENTA_ENV").as_deref() == Ok("development")
+            && let Ok(max_tokens) = std::env::var("PENTA_DEV_MAX_TOKENS")
+            && let Ok(max_tokens) = max_tokens.parse::<u64>()
+        {
+            budget.max_tokens = max_tokens.clamp(1, 10_000_000);
         }
         budget
     }
@@ -135,7 +137,7 @@ impl TurnBudget {
             max_duration_seconds: self.max_duration_seconds,
             max_requests: self.max_requests,
             max_tokens: self.max_tokens,
-            stall_limit: None,
+            stall_limit: Some(MAX_CONSECUTIVE_NO_PROGRESS_RESULTS),
         }
     }
 }
@@ -206,7 +208,7 @@ struct MainAgentRunHooks<'a> {
     evidence_ids: &'a mut Vec<String>,
     run_summary: &'a mut String,
     stall_terminal_prompted: &'a mut bool,
-    skill_loaded: &'a mut bool,
+    loaded_skills: &'a mut HashSet<String>,
     executed_call_signatures: &'a mut HashSet<String>,
     web_session: &'a mut super::web_session::WebSessionState,
     finding_projection: &'a mut super::finding_projection::FindingProjectionState,
@@ -368,7 +370,7 @@ impl MainAgentRunHooks<'_> {
                 self.evidence_ids,
                 self.run_summary,
                 self.stall_terminal_prompted,
-                self.skill_loaded,
+                self.loaded_skills,
                 self.executed_call_signatures,
                 self.web_session,
                 self.finding_projection,
@@ -508,7 +510,7 @@ impl ConversationRuntime {
         evidence_ids: &mut Vec<String>,
         run_summary: &mut String,
         stall_terminal_prompted: &mut bool,
-        skill_loaded: &mut bool,
+        loaded_skills: &mut HashSet<String>,
         executed_call_signatures: &mut HashSet<String>,
         web_session: &mut super::web_session::WebSessionState,
         finding_projection: &mut super::finding_projection::FindingProjectionState,
@@ -516,7 +518,7 @@ impl ConversationRuntime {
         directive: Option<AgentDirective>,
     ) -> anyhow::Result<AgentRoundOutcome<ModelTurnOutput>> {
         if !output.tool_calls.is_empty() {
-            if let Some(rejection) = skill_gate_rejection(*skill_loaded, &output.tool_calls) {
+            if let Some(rejection) = skill_gate_rejection(loaded_skills, &output.tool_calls) {
                 context.recent_messages.push(AgentMessage {
                     message_id: format!("runtime_skill_gate:{round}"),
                     role: "user".into(),
@@ -782,7 +784,9 @@ impl ConversationRuntime {
                         .insert(tool_call_signature(observed_tool_name, observed_arguments));
                 }
                 if tool_name == "skill_load" && succeeded {
-                    *skill_loaded = true;
+                    if let Some(name) = skill_name_from_arguments(&item.arguments) {
+                        loaded_skills.insert(name);
+                    }
                 }
                 if tool_name == "tool_search" && succeeded {
                     let unlocked = super::tool_catalog::tool_search_result_names(&result.content);
@@ -1481,7 +1485,7 @@ impl ConversationRuntime {
         let mut evidence_ids = Vec::new();
         let mut run_summary = context.run_summary.clone();
         let mut stall_terminal_prompted = false;
-        let mut skill_loaded = false;
+        let mut loaded_skills = HashSet::new();
         let mut executed_call_signatures = HashSet::new();
         let mut web_session = super::web_session::WebSessionState::default();
         let mut finding_projection = super::finding_projection::FindingProjectionState::default();
@@ -1538,7 +1542,9 @@ impl ConversationRuntime {
                     historical.success,
                 );
                 if historical.tool_name == "skill_load" && historical.success {
-                    skill_loaded = true;
+                    if let Some(name) = skill_name_from_arguments(&historical.arguments.to_string()) {
+                        loaded_skills.insert(name);
+                    }
                 }
                 if historical.success {
                     executed_call_signatures.insert(tool_call_signature(
@@ -1626,7 +1632,7 @@ impl ConversationRuntime {
             evidence_ids: &mut evidence_ids,
             run_summary: &mut run_summary,
             stall_terminal_prompted: &mut stall_terminal_prompted,
-            skill_loaded: &mut skill_loaded,
+            loaded_skills: &mut loaded_skills,
             executed_call_signatures: &mut executed_call_signatures,
             web_session: &mut web_session,
             finding_projection: &mut finding_projection,
@@ -1649,9 +1655,9 @@ impl ConversationRuntime {
                 .unwrap_or("rounds");
             let loop_checkpoint = runner.checkpoint();
             context.recent_messages.push(AgentMessage {
-                message_id: "runtime_budget_finalization".into(),
+                message_id: "runtime_finalization".into(),
                 role: "user".into(),
-                content: budget_finalization_prompt(
+                content: runtime_finalization_prompt(
                     stop_reason,
                     runner.rounds_used(),
                     loop_checkpoint.request_count,
@@ -1664,7 +1670,7 @@ impl ConversationRuntime {
             match self.model_gateway.generate(&context, intent).await {
                 Ok(output) if !output.content.trim().is_empty() => {
                     final_output = Some(ModelTurnOutput {
-                        content: normalize_budget_finalization(&output.content, stop_reason),
+                        content: normalize_runtime_finalization(&output.content, stop_reason),
                         ..output
                     });
                 }
@@ -1681,7 +1687,7 @@ impl ConversationRuntime {
             }
             if final_output.is_none() {
                 final_output = Some(ModelTurnOutput {
-                    content: fallback_budget_summary(stop_reason, &run_summary, &evidence_ids),
+                    content: fallback_runtime_summary(stop_reason, &run_summary, &evidence_ids),
                     reasoning_summary: None,
                     plan_update: None,
                     citations: vec![],
@@ -2454,7 +2460,7 @@ fn push_gate_rejection(
     });
 }
 
-fn budget_finalization_prompt(
+fn runtime_finalization_prompt(
     stop_reason: &str,
     rounds: usize,
     requests: usize,
@@ -2463,8 +2469,8 @@ fn budget_finalization_prompt(
     evidence_ids: &[String],
 ) -> String {
     format!(
-        "## 运行时预算收尾\n\n\
-         已触发 `{stop_reason}` 预算边界（轮次 {rounds}、请求 {requests}、累计 Token {tokens}）。\
+        "## 运行时收尾\n\n\
+         已触发 `{stop_reason}` 运行边界（轮次 {rounds}、请求 {requests}、累计 Token {tokens}）。\
          本次调用不再提供工具。请根据已有摘要和 Evidence 输出一次最终判断：\n\
          - 已有足够证据：输出 `FINAL:`，明确区分已验证事实与未验证线索，并引用 Evidence ID；\n\
          - 证据不足或路径耗尽：输出 `NO_PATH:`，说明阻塞和建议的后续动作；\n\
@@ -2480,7 +2486,7 @@ fn budget_finalization_prompt(
     )
 }
 
-fn normalize_budget_finalization(content: &str, stop_reason: &str) -> String {
+fn normalize_runtime_finalization(content: &str, stop_reason: &str) -> String {
     let conclusion = match parse_agent_directive(content) {
         AgentDirective::Final(value)
         | AgentDirective::NoPath(value)
@@ -2489,18 +2495,18 @@ fn normalize_budget_finalization(content: &str, stop_reason: &str) -> String {
         | AgentDirective::Replan(value) => value,
     };
     format!(
-        "本次运行因 `{stop_reason}` 预算边界停止，以下为基于当前 Evidence 的阶段性结论：\n\n{}",
+        "本次运行因 `{stop_reason}` 运行边界停止，以下为基于当前 Evidence 的阶段性结论：\n\n{}",
         nonempty_or(&conclusion, "模型未生成可用的阶段性结论")
     )
 }
 
-fn fallback_budget_summary(
+fn fallback_runtime_summary(
     stop_reason: &str,
     run_summary: &str,
     evidence_ids: &[String],
 ) -> String {
     format!(
-        "本次运行因 `{stop_reason}` 预算边界停止，终局模型调用未返回可用内容。\
+        "本次运行因 `{stop_reason}` 运行边界停止，终局模型调用未返回可用内容。\
          以下内容仅代表已保存的阶段性进展，不表示测试完整完成。\n\n{}\n\nEvidence：{}",
         nonempty_or(run_summary, "尚无可用运行摘要。"),
         if evidence_ids.is_empty() {
@@ -2535,8 +2541,9 @@ fn compact_runtime_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentDirective, ModelToolCall, compact_runtime_error, deduplicate_tool_calls,
-        detached_tool_observation, parse_agent_directive, skill_gate_rejection,
+        AgentDirective, MAX_CONSECUTIVE_NO_PROGRESS_RESULTS, ModelToolCall, TurnBudget,
+        compact_runtime_error, deduplicate_tool_calls, detached_tool_observation,
+        parse_agent_directive, skill_gate_rejection, skill_name_from_arguments,
         tool_call_signature,
     };
     use kairos_platform_pent_api::ToolExecutionClass;
@@ -2561,11 +2568,43 @@ mod tests {
     }
 
     #[test]
+    fn unlimited_resource_budget_keeps_the_no_progress_liveness_guard() {
+        let limits = TurnBudget::from_snapshot(&serde_json::json!({})).loop_limits();
+        assert_eq!(limits.max_rounds, usize::MAX);
+        assert_eq!(limits.max_duration_seconds, u64::MAX);
+        assert_eq!(limits.max_requests, usize::MAX);
+        assert_eq!(limits.max_tokens, u64::MAX);
+        assert_eq!(
+            limits.stall_limit,
+            Some(MAX_CONSECUTIVE_NO_PROGRESS_RESULTS)
+        );
+    }
+
+    #[test]
     fn operational_tools_require_a_successfully_loaded_skill() {
-        assert!(skill_gate_rejection(false, &[tool_call("nmap_scan")]).is_some());
-        assert!(skill_gate_rejection(false, &[tool_call("skill_list")]).is_none());
-        assert!(skill_gate_rejection(false, &[tool_call("skill_load")]).is_none());
-        assert!(skill_gate_rejection(true, &[tool_call("nmap_scan")]).is_none());
+        let empty = HashSet::new();
+        let generic = HashSet::from(["web-recon".to_string()]);
+        assert!(skill_gate_rejection(&empty, &[tool_call("nmap_scan")]).is_some());
+        assert!(skill_gate_rejection(&empty, &[tool_call("skill_list")]).is_none());
+        assert!(skill_gate_rejection(&empty, &[tool_call("skill_load")]).is_none());
+        assert!(skill_gate_rejection(&generic, &[tool_call("nmap_scan")]).is_none());
+    }
+
+    #[test]
+    fn specialized_validation_requires_a_matching_skill_family() {
+        let generic = HashSet::from(["web-recon".to_string()]);
+        let xss = HashSet::from(["web-recon".to_string(), "xss-validation".to_string()]);
+        assert!(skill_gate_rejection(&generic, &[tool_call("dalfox")]).is_some());
+        assert!(skill_gate_rejection(&xss, &[tool_call("dalfox")]).is_none());
+        assert!(skill_gate_rejection(&xss, &[tool_call("sqlmap")]).is_some());
+    }
+
+    #[test]
+    fn skill_name_is_read_from_tool_arguments() {
+        assert_eq!(
+            skill_name_from_arguments(r#"{"name":"XSS-Validation"}"#).as_deref(),
+            Some("xss-validation")
+        );
     }
 
     #[test]
@@ -2763,10 +2802,42 @@ fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn skill_gate_rejection(skill_loaded: bool, calls: &[ModelToolCall]) -> Option<&'static str> {
-    if skill_loaded {
-        return None;
+fn skill_name_from_arguments(arguments: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get("name")?
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_ascii_lowercase())
+}
+
+fn required_skill_family(tool_name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match tool_name {
+        "sqlmap" | "sqlmap_scan" | "sqli_validate" => {
+            Some(("SQL 注入", &["sql", "injection"]))
+        }
+        "xss_validate" | "xsser" | "web_xss_scan" | "dalfox" => Some(("XSS", &["xss"])),
+        "csrf_validate" => Some(("CSRF", &["csrf"])),
+        "command_injection_validate" | "commix" => {
+            Some(("命令注入", &["command-injection", "command_injection"]))
+        }
+        "file_inclusion_validate" => Some((
+            "文件包含",
+            &["file-inclusion", "file_inclusion", "lfi"],
+        )),
+        "file_upload_validate" => Some((
+            "文件上传",
+            &["file-upload", "file_upload", "webshell"],
+        )),
+        _ => None,
     }
+}
+
+fn skill_gate_rejection(
+    loaded_skills: &HashSet<String>,
+    calls: &[ModelToolCall],
+) -> Option<String> {
     let has_operational_call = calls.iter().any(|call| {
         !matches!(
             call.name.as_str(),
@@ -2786,10 +2857,31 @@ fn skill_gate_rejection(skill_loaded: bool, calls: &[ModelToolCall]) -> Option<&
                 | "agent_list"
         )
     });
-    has_operational_call.then_some(
-        "执行门槛：本 Run 尚未成功加载 Skill。请先单独调用 skill_list 查找匹配规程，\
-         再单独调用 skill_load 加载至少一个 Skill；加载成功后才能执行侦察、扫描或验证工具。",
-    )
+    if loaded_skills.is_empty() && has_operational_call {
+        return Some(
+            "执行门槛：本 Run 尚未成功加载 Skill。请先单独调用 skill_list 查找匹配规程，\
+             再单独调用 skill_load 加载至少一个 Skill；加载成功后才能执行侦察、扫描或验证工具。"
+                .into(),
+        );
+    }
+    for call in calls {
+        let Some((family, keywords)) = required_skill_family(&call.name) else {
+            continue;
+        };
+        let covered = loaded_skills.iter().any(|skill| {
+            keywords
+                .iter()
+                .any(|keyword| skill.contains(keyword))
+        });
+        if !covered {
+            return Some(format!(
+                "专项 Skill 门槛：调用 {} 前必须加载匹配的 {family} Skill。\
+                 请用具体关键词调用 skill_list，再单独调用 skill_load；不要沿用不相关的通用 Skill。",
+                call.name
+            ));
+        }
+    }
+    None
 }
 
 fn is_runtime_reference_tool(tool_name: &str) -> bool {

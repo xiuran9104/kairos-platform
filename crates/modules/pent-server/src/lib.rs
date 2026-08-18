@@ -14,7 +14,9 @@ mod mcp_servers;
 mod monitor;
 mod runtime_policy;
 mod roles;
+mod role_resolution;
 mod scan_verification;
+mod search_rank;
 mod terminal;
 mod security;
 mod session;
@@ -218,7 +220,15 @@ async fn list_projects(
          ORDER BY t.created_at DESC LIMIT 100")
         .bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
         .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(ApiResponse::new(rows)))
+    let mut resolved = Vec::with_capacity(rows.len());
+    for row in rows {
+        resolved.push(
+            role_resolution::decorate_project(&s.pool, tenant_id, row)
+                .await
+                .map_err(|error| AppError::internal(error.to_string()))?,
+        );
+    }
+    Ok(Json(ApiResponse::new(resolved)))
 }
 async fn get_project(
     State(s): State<PentState>,
@@ -245,6 +255,9 @@ async fn get_project(
     .await
     .map_err(|e| AppError::internal(e.to_string()))?
     .ok_or_else(|| AppError::not_found("not found"))?;
+    let v = role_resolution::decorate_project(&s.pool, tenant_id, v)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
     Ok(Json(ApiResponse::new(v)))
 }
 async fn create_project(
@@ -257,8 +270,20 @@ async fn create_project(
     let name = body["name"].as_str().unwrap_or("untitled");
     let desc = body.get("description").and_then(|v| v.as_str());
     let scope = body.get("asset_scope").cloned().unwrap_or_default();
-    sqlx::query("INSERT INTO pent_projects(id,tenant_id,name,description,asset_scope,created_by) VALUES($1,$2,$3,$4,$5,$6)")
-        .bind(&id).bind(tenant_id).bind(name).bind(desc).bind(&scope).bind(&user.user_id)
+    let default_role_id = body
+        .get("default_role_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(role_id) = default_role_id
+        && !role_resolution::ensure_visible_role(&s.pool, tenant_id, role_id)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+    {
+        return Err(AppError::bad_request("角色不存在或未启用"));
+    }
+    sqlx::query("INSERT INTO pent_projects(id,tenant_id,name,description,asset_scope,default_role_id,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)")
+        .bind(&id).bind(tenant_id).bind(name).bind(desc).bind(&scope).bind(default_role_id).bind(&user.user_id)
         .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(
         json!({"id":id,"message":"项目创建成功"}),
@@ -274,6 +299,7 @@ async fn update_project_model(
     let tenant_id = security::tenant_id(&user)?;
     let model_config_id = body["model_config_id"].as_i64().filter(|&v| v > 0)
         .ok_or_else(|| AppError::bad_request("请选择有效的模型"))?;
+    ensure_active_chat_model(&s.pool, model_config_id).await?;
     sqlx::query(
         "INSERT INTO pent_model_role_bindings(tenant_id,project_id,model_role,model_config_id,temperature,max_output_tokens,timeout_seconds,enabled,revision,updated_at)
          VALUES($1,$2,'conversation',$3,0.7,4096,120,true,1,now())
@@ -312,16 +338,33 @@ async fn update_project(
             return Err(AppError::bad_request("项目状态无效"));
         }
     }
+    let role_was_supplied = body.get("default_role_id").is_some();
+    let default_role_id = body
+        .get("default_role_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(role_id) = default_role_id
+        && !role_resolution::ensure_visible_role(&s.pool, tenant_id, role_id)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+    {
+        return Err(AppError::bad_request("角色不存在或未启用"));
+    }
     let affected = sqlx::query(
         "UPDATE pent_projects
-         SET name=$2, description=$3, asset_scope=$4, status=COALESCE($5,status), updated_at=now()
-         WHERE id=$1 AND tenant_id=$6 AND ($7 OR created_by=$8) AND deleted=0",
+         SET name=$2, description=$3, asset_scope=$4, status=COALESCE($5,status),
+             default_role_id=CASE WHEN $6 THEN $7 ELSE default_role_id END,
+             updated_at=now()
+         WHERE id=$1 AND tenant_id=$8 AND ($9 OR created_by=$10) AND deleted=0",
     )
     .bind(&id)
     .bind(name)
     .bind(description)
     .bind(&asset_scope)
     .bind(status)
+    .bind(role_was_supplied)
+    .bind(default_role_id)
     .bind(tenant_id)
     .bind(security::tenant_wide(&user))
     .bind(&user.user_id)
@@ -2309,7 +2352,7 @@ fn platform_section_defaults(section: &str) -> Option<Value> {
         "assets" => json!({"auto_discovery":true,"discovery_interval_minutes":60,"alive_check_enabled":true,"asset_retention_days":365,"duplicate_strategy":"merge","risk_sync_enabled":true}),
         "knowledge" => json!({"enabled":true,"base_path":"knowledge_base","embedding_model_config_id":0,"retrieval_top_k":5,"similarity_threshold":0.65,"sub_index_filter":"","multi_query_max_queries":4,"rerank_model_config_id":0,"prefetch_top_k":20,"max_context_chars":0,"max_context_tokens":0,"chunk_strategy":"markdown_then_recursive","request_timeout_seconds":120,"batch_size":64,"prefer_source_file":false,"sub_indexes":"","chunk_size":768,"chunk_overlap":50,"max_chunks_per_item":20,"max_rpm":100,"rate_limit_delay_ms":600,"max_retries":3,"retry_delay_ms":1000}),
         "c2" => json!({"enabled":true,"heartbeat_seconds":30,"offline_timeout_seconds":120,"max_concurrent_jobs":10,"tls_required":true,"allow_unregistered_nodes":false,"command_timeout_seconds":600}),
-        "robots" => json!({"enabled":true,"max_active_agents":8,"default_role":"penetration_tester","auto_assign_tasks":true,"idle_timeout_minutes":30,"memory_enabled":true,"collaboration_enabled":true}),
+        "robots" => json!({"enabled":true,"max_active_agents":8,"default_role_id":role_resolution::PLATFORM_DEFAULT_ROLE_ID,"auto_assign_tasks":true,"idle_timeout_minutes":30,"memory_enabled":true,"collaboration_enabled":true}),
         "terminal" => json!({"session_timeout_minutes":60,"max_sessions_per_user":5,"command_audit_enabled":true,"dangerous_command_confirmation":true,"file_transfer_enabled":true,"max_upload_mb":100,"default_shell":"bash"}),
         _ => return None,
     })
@@ -2386,6 +2429,20 @@ async fn update_platform_section(
         return Err(AppError::bad_request("设置包含未知字段"));
     }
     let tenant_id = security::tenant_id(&user)?;
+    if section == "robots" {
+        let role_id = body
+            .get("default_role_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::bad_request("请选择默认角色"))?;
+        if !role_resolution::ensure_visible_role(&s.pool, tenant_id, role_id)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+        {
+            return Err(AppError::bad_request("默认角色不存在或未启用"));
+        }
+    }
     sqlx::query(
         "INSERT INTO pent_runtime_policies(tenant_id,agent_config,updated_by)
          VALUES($1,jsonb_build_object('platform_settings',jsonb_build_object($2,$3)), $4)
@@ -2414,6 +2471,7 @@ async fn get_model_bindings(
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT to_jsonb(t) || jsonb_build_object('inherited', t.tenant_id <> $1)
          FROM pent_model_role_bindings t
+         JOIN ai.model_configs m ON m.id=t.model_config_id AND m.deleted=false
          WHERE t.tenant_id=$1 OR (
              t.tenant_id=0 AND NOT EXISTS (
                  SELECT 1 FROM pent_model_role_bindings own
@@ -2450,6 +2508,7 @@ async fn update_model_bindings(
             .as_i64()
             .filter(|value| *value > 0)
             .ok_or_else(|| AppError::bad_request("模型配置 ID 必须大于 0"))?;
+        ensure_active_chat_model(&s.pool, model_config_id).await?;
         let temperature = binding["temperature"].as_f64().unwrap_or(0.7);
         let max_tokens = binding["max_output_tokens"].as_i64().unwrap_or(4096);
         let timeout = binding["timeout_seconds"].as_i64().unwrap_or(120);
@@ -2487,6 +2546,26 @@ async fn update_model_bindings(
     }
     tx.commit().await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(json!({"message":"已保存"}))))
+}
+
+async fn ensure_active_chat_model(pool: &PgPool, model_id: i64) -> Result<(), AppError> {
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM ai.model_configs
+             WHERE id=$1 AND type='chat' AND status=0 AND deleted=false
+         )",
+    )
+    .bind(model_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::bad_request(
+            "模型已删除、未启用或不是对话模型，请重新选择",
+        ))
+    }
 }
 
 async fn get_runtime_policy(
@@ -2565,57 +2644,22 @@ async fn update_runtime_policy(
 
 // ── SSE streaming for run events ──────────────────────────────────────────
 
-use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::stream::Stream;
-use std::convert::Infallible;
-
 async fn run_events_sse(
     State(s): State<PentState>,
     Path(id): Path<String>,
     user: CurrentUser,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures_util::stream::Stream<
+            Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+        >,
+    >,
+    AppError,
+> {
     security::ensure_run_access(&s.pool, &id, &user).await?;
-    let mut listener = sqlx::postgres::PgListener::connect_with(&s.pool)
+    conversation::stream::run_sse(s.pool.clone(), id)
         .await
-        .map_err(|error| AppError::internal(error.to_string()))?;
-    listener
-        .listen("pent_run_events")
-        .await
-        .map_err(|error| AppError::internal(error.to_string()))?;
-    let stream = futures_util::stream::unfold(
-        (listener, s.pool.clone(), id, -1_i64),
-        |(mut listener, pool, run_id, mut last_seq)| async move {
-            loop {
-                let row = sqlx::query_as::<_, (String, i64, String, Value)>(
-                    "SELECT event_id,sequence,event_type,payload
-                     FROM pent_run_events
-                     WHERE run_id=$1 AND sequence>$2
-                     ORDER BY sequence LIMIT 1",
-                )
-                .bind(&run_id)
-                .bind(last_seq)
-                .fetch_optional(&pool)
-                .await
-                .ok()
-                .flatten();
-                if let Some((event_id, sequence, event_type, payload)) = row {
-                    last_seq = sequence;
-                    let data = json!({
-                        "event_id": event_id,
-                        "sequence": sequence,
-                        "event_type": event_type,
-                        "payload": payload
-                    });
-                    let event = Event::default().event(event_type).data(data.to_string());
-                    return Some((Ok(event), (listener, pool, run_id, last_seq)));
-                }
-                if listener.recv().await.is_err() {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-        },
-    );
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+        .map_err(|error| AppError::internal(error.to_string()))
 }
 
 // ── Evidence, Findings & Artifacts ─────────────────────────────────────

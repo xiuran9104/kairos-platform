@@ -1,12 +1,12 @@
 ---
 name: java-audit-pipeline
 description: |
-risk: safe
-requires-explicit-authorization: false
   Java 白盒源码安全审计总方法论。当需要对 Java 项目进行完整的源码安全审计、
   或需要系统化的白盒漏洞挖掘流程时触发。
   覆盖 5 阶段审计流水线: 路由映射→权限建模→数据流追踪→分类漏洞审计→利用链组装。
   核心机制: 证据合约系统(EVID_*)防止 AI 幻觉误报，所有漏洞结论必须有数据流证据支撑。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: java audit, code audit, 代码审计, white box, 白盒, source code, 源码审计, pipeline, evidence contract, 证据合约, route mapping, data flow, sink, source, java security, spring, servlet, deserialization
   category: code-audit

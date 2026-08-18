@@ -1,12 +1,12 @@
 ---
 name: ai-identity-security
 description: |
-risk: safe
-requires-explicit-authorization: false
   AI 系统身份与权限安全测试方法论。当目标系统涉及 Agent 身份认证、多 Agent 权限管理、
   角色设定安全、会话管理、或 MCP/API 凭据管控时触发。
   覆盖: 角色逃逸(假定场景/假定角色/遗忘法/目标劫持)、权限失控(Action 越权/MCP 未授权资源获取)、
   多 Agent 身份伪造、会话劫持、凭据泄露与滥用。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: ai identity, role escape, 角色逃逸, agent impersonation, 身份伪造, action permission, 权限失控, session hijack, 会话劫持, credential abuse, mcp unauthorized, 凭据泄露, multi-agent identity, 越权访问
   category: ai-security

@@ -32,6 +32,7 @@ pub fn drafts_from_tool_result(
             let Some(url) = result
                 .get("url")
                 .and_then(Value::as_str)
+                .or_else(|| arguments.get("url").and_then(Value::as_str))
                 .filter(|url| !url.is_empty())
             else {
                 return Vec::new();
@@ -39,12 +40,22 @@ pub fn drafts_from_tool_result(
             let raw = result
                 .get("raw_response")
                 .and_then(Value::as_str)
-                .unwrap_or("");
-            let (response_headers, response_body) = parse_raw_response(raw);
+                .filter(|raw| !raw.is_empty());
+            let (response_headers, response_body) = raw.map(parse_raw_response).unwrap_or_else(|| {
+                (
+                    structured_headers(result.get("headers")),
+                    result
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .filter(|body| !body.is_empty())
+                        .map(str::to_owned),
+                )
+            });
             vec![TrafficDraft {
                 method: result
                     .get("method")
                     .and_then(Value::as_str)
+                    .or_else(|| arguments.get("method").and_then(Value::as_str))
                     .unwrap_or("GET")
                     .to_ascii_uppercase(),
                 url: url.to_string(),
@@ -149,6 +160,39 @@ pub fn drafts_from_tool_result(
         }
         _ => Vec::new(),
     }
+}
+
+/// Normalize the structured header array returned by the remote
+/// `http_request` implementation into the object form used by traffic rows.
+fn structured_headers(value: Option<&Value>) -> Value {
+    let Some(value) = value else {
+        return json!({});
+    };
+    if value.is_object() {
+        return value.clone();
+    }
+    let mut headers = serde_json::Map::new();
+    for pair in value.as_array().into_iter().flatten() {
+        let Some(pair) = pair.as_array() else {
+            continue;
+        };
+        let (Some(name), Some(value)) = (
+            pair.first().and_then(Value::as_str),
+            pair.get(1).and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
+        headers
+            .entry(name)
+            .and_modify(|existing: &mut Value| {
+                if let Some(previous) = existing.as_str() {
+                    *existing = Value::String(format!("{previous}, {value}"));
+                }
+            })
+            .or_insert_with(|| Value::String(value.to_string()));
+    }
+    Value::Object(headers)
 }
 
 fn response_status(raw: &str) -> Option<i32> {
@@ -292,6 +336,39 @@ mod tests {
         assert_eq!(draft.request_body.as_deref(), Some("u=a"));
         assert_eq!(draft.response_body.as_deref(), Some("body"));
         assert_eq!(draft.duration_ms, Some(42));
+    }
+
+    #[test]
+    fn drafts_remote_structured_http_request_using_argument_url() {
+        let content = json!({
+            "status": 200,
+            "headers": [
+                ["content-type", "application/json"],
+                ["set-cookie", "a=1"],
+                ["set-cookie", "b=2"]
+            ],
+            "body": "{\"ok\":true}",
+            "elapsed_ms": 17
+        })
+        .to_string();
+        let args = json!({
+            "url": "http://target.test/api/login",
+            "method": "POST",
+            "headers": {"Content-Type": "application/json"},
+            "body": "{\"username\":\"admin\"}"
+        });
+
+        let drafts = drafts_from_tool_result("http_request", &args, &content);
+
+        assert_eq!(drafts.len(), 1);
+        let draft = &drafts[0];
+        assert_eq!(draft.url, "http://target.test/api/login");
+        assert_eq!(draft.method, "POST");
+        assert_eq!(draft.response_status, Some(200));
+        assert_eq!(draft.response_headers["content-type"], "application/json");
+        assert_eq!(draft.response_headers["set-cookie"], "a=1, b=2");
+        assert_eq!(draft.response_body.as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(draft.duration_ms, Some(17));
     }
 
     #[test]

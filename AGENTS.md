@@ -121,6 +121,7 @@ Install prerequisites:
 - Rust stable with Rust 2024 edition support.
 - Docker and Docker Compose.
 - Bubblewrap (`bwrap`) on every host that runs `kairos-platform-pent-agent`.
+- ProxyChains-ng (`proxychains4` / `libproxychains.so.4`) on every pent-agent host so Web tools cannot bypass HTTP(S) traffic capture by ignoring proxy environment variables.
 - Node.js `22.18+` or `24.x`.
 - pnpm `11+` through Corepack.
 - Nginx or another reverse proxy for production frontend/API routing.

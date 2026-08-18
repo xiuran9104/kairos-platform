@@ -53,8 +53,25 @@ async fn main() -> anyhow::Result<()> {
     let pent_state =
         kairos_platform_pent_server::PentState::new(database.clone()).with_nats(nats_bus.handle());
     system_state.bootstrap().await?;
-    // Recover orphaned conversation turns left from previous shutdown
-    recover_orphaned_turns(&database).await;
+    // Reconcile conversation projections without stealing live worker Runs.
+    match kairos_platform_pent_server::conversation::recovery::recover_conversation_state(&database)
+        .await
+    {
+        Ok(stats)
+            if stats.repaired_live_turns > 0
+                || stats.failed_orphaned_turns > 0
+                || stats.reconciled_sessions > 0 =>
+        {
+            tracing::info!(
+                repaired_live_turns = stats.repaired_live_turns,
+                failed_orphaned_turns = stats.failed_orphaned_turns,
+                reconciled_sessions = stats.reconciled_sessions,
+                "reconciled conversation state"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to reconcile conversation state"),
+    }
     let database_auth = system_state.database_auth_state();
 
     let mut app = Router::new()
@@ -98,30 +115,6 @@ async fn connect_redis() -> Option<RedisClient> {
             None
         }
     }
-}
-
-/// Recover any conversation turns orphaned by a previous shutdown.
-async fn recover_orphaned_turns(pool: &kairos_platform_framework_database::PgPool) {
-    let result = sqlx::query(
-        "UPDATE pent_conversation_turns SET status='failed', error_message='网关重启自动恢复', retryable=true WHERE status IN ('thinking','queued') AND created_at < now() - interval '30 seconds'"
-    )
-    .execute(pool)
-    .await;
-    match result {
-        Ok(r) if r.rows_affected() > 0 => {
-            tracing::info!(
-                count = r.rows_affected(),
-                "recovered orphaned conversation turns"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "failed to recover orphaned turns"),
-    }
-    let _ = sqlx::query(
-        "UPDATE pent_agent_sessions SET status='ready' WHERE status='running' AND NOT EXISTS (SELECT 1 FROM pent_conversation_turns WHERE pent_conversation_turns.session_id = pent_agent_sessions.id AND status IN ('thinking','queued'))"
-    )
-    .execute(pool)
-    .await;
 }
 
 async fn not_found() -> AppError {

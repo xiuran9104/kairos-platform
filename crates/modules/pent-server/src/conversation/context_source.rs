@@ -24,6 +24,8 @@ impl ConversationContextSource for PgContextSource {
             Option<String>,
             serde_json::Value,
             serde_json::Value,
+            i64,
+            Option<String>,
         ) = sqlx::query_as(
             "SELECT objective, scope_proposal, COALESCE(confirmed_scope_snapshot, '{}'::jsonb),
                         constraints, active_run_id,
@@ -34,7 +36,8 @@ impl ConversationContextSource for PgContextSource {
                         ),
                         COALESCE((SELECT agent_config FROM pent_runtime_policies p
                                   WHERE p.tenant_id IN (pent_agent_sessions.tenant_id,0)
-                                  ORDER BY (p.tenant_id=pent_agent_sessions.tenant_id) DESC LIMIT 1),'{}'::jsonb)
+                                  ORDER BY (p.tenant_id=pent_agent_sessions.tenant_id) DESC LIMIT 1),'{}'::jsonb),
+                        tenant_id, project_id
                  FROM pent_agent_sessions WHERE id = $1",
         )
         .bind(&req.session_id)
@@ -135,37 +138,22 @@ impl ConversationContextSource for PgContextSource {
         let authorization_context =
             authorization_context_instruction(&scope_snapshot, scope_confirmed);
 
-        // Bound agent role: prompt preset + tool whitelist. The tool whitelist
-        // is surfaced to the model gateway; the prompt preset becomes a role
-        // section in the system instruction.
-        let role: Option<(String, String, serde_json::Value)> =
-            match session.3.get("role_id").and_then(serde_json::Value::as_str) {
-                Some(role_id) => {
-                    sqlx::query_as(
-                        "SELECT r.name, r.user_prompt, r.tool_whitelist
-                     FROM pent_agent_roles r
-                     JOIN pent_agent_sessions s ON s.id = $2
-                       AND (r.tenant_id = s.tenant_id OR r.tenant_id = 0)
-                     WHERE r.id = $1 AND r.enabled = true",
-                    )
-                    .bind(role_id)
-                    .bind(&req.session_id)
-                    .fetch_optional(&self.pool)
-                    .await?
-                }
-                None => None,
-            };
-        if let Some((role_name, _role_prompt, role_tools)) = &role {
-            policy_snapshot["_role"] = serde_json::json!({
-                "name": role_name,
-                "tool_whitelist": role_tools,
-            });
-        }
-        let role_context = match &role {
-            Some((role_name, role_prompt, _)) if !role_prompt.trim().is_empty() => {
-                format!("\n\n## 当前角色：{role_name}\n{role_prompt}")
-            }
-            _ => String::new(),
+        // Resolve the same effective role shown in the UI. The resolved value
+        // and its source are snapshotted so a later default change cannot make
+        // an old run ambiguous.
+        let requested_role_id = session.3.get("role_id").and_then(serde_json::Value::as_str);
+        let role = crate::role_resolution::resolve_role(
+            &self.pool,
+            session.7,
+            requested_role_id,
+            session.8.as_deref(),
+        )
+        .await?;
+        policy_snapshot["_role"] = role.audit_snapshot(requested_role_id);
+        let role_context = if role.user_prompt.trim().is_empty() {
+            format!("\n\n## 当前角色：{}", role.name)
+        } else {
+            format!("\n\n## 当前角色：{}\n{}", role.name, role.user_prompt)
         };
 
         Ok(ConversationContext {

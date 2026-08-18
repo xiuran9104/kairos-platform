@@ -8,6 +8,7 @@
 pub mod agent_loop;
 pub mod agent_runner;
 pub mod agent_scheduler;
+pub mod budget_policy;
 pub mod context_compaction;
 pub mod context_guard;
 pub mod context_lifecycle;

@@ -1,9 +1,9 @@
 //! MITM traffic sink — persists captured exchanges into `pent_http_traffic`.
 //!
-//! Runs the in-process MITM proxy when `PENTA_TRAFFIC_CAPTURE=true` and
-//! forwards every captured HTTP exchange to the sink. Metadata and (bounded)
-//! bodies are stored directly in Postgres; the body bound is controlled by
-//! `PENTA_MITM_BODY_LIMIT`.
+//! Runs the in-process MITM proxy unless `PENTA_TRAFFIC_CAPTURE=false` and
+//! forwards every Run-attributed HTTP exchange to the sink. Metadata and
+//! (bounded) bodies are stored directly in Postgres; the body bound is
+//! controlled by `PENTA_MITM_BODY_LIMIT`.
 
 use std::sync::Arc;
 
@@ -13,7 +13,6 @@ use kairos_platform_mitm_proxy::{MitmConfig, MitmProxy, TrafficRecord, TrafficSi
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-const DEFAULT_RUN_ID: &str = "mitm-proxy";
 const DEFAULT_INLINE_BODY_LIMIT: usize = 256 * 1024;
 
 pub struct MitmTrafficSink {
@@ -29,11 +28,11 @@ impl MitmTrafficSink {
 #[async_trait]
 impl TrafficSink for MitmTrafficSink {
     async fn record(&self, record: TrafficRecord) -> anyhow::Result<()> {
+        let Some(run_id) = record.run_id.clone() else {
+            tracing::debug!(url = %record.url, "skipping unattributed MITM traffic");
+            return Ok(());
+        };
         let id = uuid::Uuid::new_v4().to_string();
-        let run_id = record
-            .run_id
-            .clone()
-            .unwrap_or_else(|| DEFAULT_RUN_ID.to_string());
         let request_sha256 = record
             .request_body
             .as_ref()
@@ -137,17 +136,30 @@ async fn persist_large_body(
     }
 }
 
+/// Whether process-level traffic capture is enabled. Capture is on by default
+/// and can be explicitly disabled for constrained deployments.
+pub(crate) fn traffic_capture_enabled() -> bool {
+    let configured = std::env::var("PENTA_TRAFFIC_CAPTURE").ok();
+    traffic_capture_enabled_from(configured.as_deref())
+}
+
+fn traffic_capture_enabled_from(configured: Option<&str>) -> bool {
+    !configured.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
 /// Start the MITM proxy in the background when traffic capture is enabled.
 ///
-/// Returns `None` when `PENTA_TRAFFIC_CAPTURE` is not set to `true`, so
+/// Returns `None` when `PENTA_TRAFFIC_CAPTURE` is explicitly disabled, so
 /// callers can simply ignore the result. The CA is persisted under
 /// `PENTA_MITM_CA_DIR` (default `storage/mitm`), which the tool runner reads
 /// back to inject trust into tool processes.
 pub fn spawn_mitm_proxy(pool: PgPool) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
-    let enabled = std::env::var("PENTA_TRAFFIC_CAPTURE")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    if !enabled {
+    if !traffic_capture_enabled() {
         return None;
     }
     let config = MitmConfig::from_env();
@@ -161,4 +173,17 @@ pub fn spawn_mitm_proxy(pool: PgPool) -> Option<tokio::task::JoinHandle<Result<(
     let sink = Arc::new(MitmTrafficSink::new(pool));
     info!(addr = %config.bind_addr, "mitm traffic capture enabled");
     Some(proxy.spawn(sink))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::traffic_capture_enabled_from;
+
+    #[test]
+    fn traffic_capture_defaults_to_enabled() {
+        assert!(traffic_capture_enabled_from(None));
+        assert!(traffic_capture_enabled_from(Some("true")));
+        assert!(!traffic_capture_enabled_from(Some("false")));
+        assert!(!traffic_capture_enabled_from(Some("0")));
+    }
 }

@@ -1,12 +1,12 @@
 ---
 name: php-auth-config-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   PHP 源码认证、配置与逻辑类漏洞审计。当在 PHP 白盒审计中需要检测认证绕过、
   权限控制、安全配置、密码学误用或业务逻辑漏洞时触发。
   覆盖 5 类风险: 认证绕过(硬编码凭据/弱比较/JWT 缺陷)、授权失控(IDOR/水平越权)、
   安全配置(CORS/错误暴露/调试模式)、密码学误用(弱哈希/ECB/硬编码密钥)、业务逻辑(竞争条件/支付篡改)。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: authentication, authorization, idor, config, cors, debug mode, cryptography, weak hash, business logic, 认证绕过, 授权, 越权, 配置审计, 密码学, 业务逻辑
   category: code-audit

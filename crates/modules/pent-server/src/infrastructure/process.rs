@@ -338,9 +338,7 @@ async fn execute_prepared_tool(
         "executing allow-listed security tool"
     );
 
-    let capture = std::env::var("PENTA_TRAFFIC_CAPTURE")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let capture = super::mitm_sink::traffic_capture_enabled();
     let proxy_addr =
         std::env::var("PENTA_TRAFFIC_PROXY").unwrap_or_else(|_| "http://127.0.0.1:8085".into());
     let mut sandbox_env = vec![("LANG".to_string(), "C.UTF-8".to_string())];
@@ -349,13 +347,20 @@ async fn execute_prepared_tool(
         sandbox_env.push((name.to_string(), value.to_string()));
     }
     let mut readonly_paths = Vec::new();
-    // ── M2-F13: mitmproxy traffic capture ──────────────────────────
-    if capture {
+    let mut forced_proxy = None;
+    // Curl-backed tools already emit a structured exchange that is persisted
+    // by the conversation traffic sink. Remaining Web tools receive both
+    // conventional proxy variables and transparent connect interception so a
+    // client cannot silently bypass capture by ignoring HTTP_PROXY.
+    if capture && !resolved_program.contains("curl") {
+        let attributed_proxy = proxy_url_for_run(&proxy_addr, limits.run_id.as_deref());
         for name in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
-            sandbox_env.push((name.to_string(), proxy_addr.clone()));
+            sandbox_env.push((name.to_string(), attributed_proxy.clone()));
         }
         for name in ["no_proxy", "NO_PROXY"] {
-            sandbox_env.push((name.to_string(), "127.0.0.1,localhost,.local".into()));
+            // Authorized localhost/private-range targets are common in local
+            // labs and must pass through the capture proxy as well.
+            sandbox_env.push((name.to_string(), String::new()));
         }
         // Inject the platform CA so tools trust the proxy's impersonated certs.
         let ca_path = kairos_platform_mitm_proxy::ca::ca_cert_path(
@@ -373,6 +378,17 @@ async fn execute_prepared_tool(
             ] {
                 sandbox_env.push((name.to_string(), ca_value.clone()));
             }
+        }
+        forced_proxy = super::traffic_capture::prepare(
+            tool_name,
+            &resolved_program,
+            &prepared.args,
+            limits.run_id.as_deref(),
+            &proxy_addr,
+        )?;
+        if let Some(injection) = forced_proxy.as_ref() {
+            sandbox_env.extend(injection.environment());
+            readonly_paths.extend(injection.readonly_paths());
         }
     }
     let sandbox = build_bubblewrap_command(
@@ -457,6 +473,7 @@ async fn execute_prepared_tool(
     let (mut stderr, stderr_truncated) = stderr_task
         .await
         .map_err(|error| format!("读取错误输出失败: {error}"))??;
+    drop(forced_proxy);
     if stdout_truncated || stderr_truncated {
         stderr.push_str("\n[输出已按平台上限截断]");
     }
@@ -468,6 +485,24 @@ async fn execute_prepared_tool(
         duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         audit,
     })
+}
+
+fn proxy_url_for_run(proxy_addr: &str, run_id: Option<&str>) -> String {
+    let Some(run_id) = run_id.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 96
+            && value
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    }) else {
+        return proxy_addr.to_string();
+    };
+    for scheme in ["http://", "https://"] {
+        if let Some(authority) = proxy_addr.strip_prefix(scheme) {
+            return format!("{scheme}{run_id}:@{authority}");
+        }
+    }
+    proxy_addr.to_string()
 }
 
 const CLOUD_SECRET_ENV_ALLOWLIST: &[&str] = &[
@@ -1160,6 +1195,22 @@ mod tests {
         };
         inject_run_id_header(&mut nmap, Some("run-123"));
         assert!(!nmap.args.iter().any(|arg| arg.contains("x-kairos-run-id")));
+    }
+
+    #[test]
+    fn proxy_url_carries_a_safe_run_id_as_basic_username() {
+        assert_eq!(
+            proxy_url_for_run("http://127.0.0.1:8085", Some("run-123")),
+            "http://run-123:@127.0.0.1:8085"
+        );
+        assert_eq!(
+            proxy_url_for_run("http://127.0.0.1:8085", Some("../escape")),
+            "http://127.0.0.1:8085"
+        );
+        assert_eq!(
+            proxy_url_for_run("127.0.0.1:8085", Some("run-123")),
+            "127.0.0.1:8085"
+        );
     }
 
     #[tokio::test]

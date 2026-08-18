@@ -4,22 +4,21 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http::header;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
-use hyper::upgrade::Upgraded;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
@@ -111,6 +110,7 @@ impl ProxyHandler {
         self: Arc<Self>,
         req: Request<Incoming>,
     ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let run_id = extract_run_id(&req);
         let Some(authority) = req.uri().authority().cloned() else {
             return Ok(bad_request());
         };
@@ -123,11 +123,8 @@ impl ProxyHandler {
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
                     let io = TokioIo::new(upgraded);
-                    if terminate_tls {
-                        this.tunnel_tls(io, host, port).await;
-                    } else {
-                        this.tunnel_plain(io, host, port).await;
-                    }
+                    this.tunnel_detected(io, host, port, run_id, terminate_tls)
+                        .await;
                 }
                 Err(error) => warn!(%error, "connect upgrade failed"),
             }
@@ -139,7 +136,40 @@ impl ProxyHandler {
             .unwrap())
     }
 
-    async fn tunnel_tls(self: Arc<Self>, io: TokioIo<Upgraded>, host: String, port: u16) {
+    async fn tunnel_detected<S>(
+        self: Arc<Self>,
+        io: S,
+        host: String,
+        port: u16,
+        run_id: Option<String>,
+        tls_port_hint: bool,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut io = BufReader::new(io);
+        let protocol = if tls_port_hint {
+            TunnelProtocol::Tls
+        } else if port == 80 {
+            TunnelProtocol::Http
+        } else {
+            tokio::time::timeout(std::time::Duration::from_millis(500), io.fill_buf())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(classify_tunnel_protocol)
+                .unwrap_or(TunnelProtocol::Raw)
+        };
+        match protocol {
+            TunnelProtocol::Tls => self.tunnel_tls(io, host, port, run_id).await,
+            TunnelProtocol::Http => self.tunnel_http(io, host, port, run_id).await,
+            TunnelProtocol::Raw => self.tunnel_plain(io, host, port).await,
+        }
+    }
+
+    async fn tunnel_tls<S>(self: Arc<Self>, io: S, host: String, port: u16, run_id: Option<String>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let tls_stream = match self.acceptor.accept(io).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -152,9 +182,10 @@ impl ProxyHandler {
         let service = service_fn(move |req| {
             let this = this.clone();
             let host = host_for_svc.clone();
+            let run_id = run_id.clone();
             async move {
                 let req = rewrite_origin(req, "https", &host, port);
-                match this.forward(req).await {
+                match this.forward_with_run_id(req, run_id).await {
                     Ok(resp) => Ok::<_, Infallible>(resp),
                     Err(error) => {
                         warn!(%error, "mitm tls forward failed");
@@ -171,13 +202,42 @@ impl ProxyHandler {
         }
     }
 
-    async fn tunnel_plain(self: Arc<Self>, io: TokioIo<Upgraded>, host: String, port: u16) {
+    async fn tunnel_http<S>(self: Arc<Self>, io: S, host: String, port: u16, run_id: Option<String>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let this = self.clone();
+        let host_for_svc = host.clone();
+        let service = service_fn(move |req| {
+            let this = this.clone();
+            let host = host_for_svc.clone();
+            let run_id = run_id.clone();
+            async move {
+                let req = rewrite_origin(req, "http", &host, port);
+                match this.forward_with_run_id(req, run_id).await {
+                    Ok(resp) => Ok::<_, Infallible>(resp),
+                    Err(error) => {
+                        warn!(%error, "mitm HTTP tunnel forward failed");
+                        Ok(bad_gateway())
+                    }
+                }
+            }
+        });
+        if let Err(error) = auto::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(io), service)
+            .await
+        {
+            debug!(%error, host, "mitm HTTP tunnel closed");
+        }
+    }
+
+    async fn tunnel_plain<S>(self: Arc<Self>, mut io: S, host: String, port: u16)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         match TcpStream::connect((host.as_str(), port)).await {
             Ok(mut upstream) => {
-                let mut client_io = io;
-                if let Err(error) =
-                    tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await
-                {
+                if let Err(error) = tokio::io::copy_bidirectional(&mut io, &mut upstream).await {
                     debug!(%error, host, port, "mitm plain tunnel closed");
                 }
             }
@@ -186,10 +246,22 @@ impl ProxyHandler {
     }
 
     async fn forward(&self, req: Request<Incoming>) -> anyhow::Result<Response<Full<Bytes>>> {
-        let run_id = extract_run_id(&req);
+        self.forward_with_run_id(req, None).await
+    }
+
+    async fn forward_with_run_id(
+        &self,
+        req: Request<Incoming>,
+        inherited_run_id: Option<String>,
+    ) -> anyhow::Result<Response<Full<Bytes>>> {
+        let run_id = inherited_run_id.or_else(|| extract_run_id(&req));
         let (parts, body) = req.into_parts();
         let url = parts.uri.to_string();
-        let request_headers = headers_to_json(&parts.headers);
+        let mut request_headers = headers_to_json(&parts.headers);
+        if let Some(headers) = request_headers.as_object_mut() {
+            headers.remove("x-kairos-run-id");
+            headers.remove("proxy-authorization");
+        }
 
         let body_bytes = http_body_util::Limited::new(body, self.body_limit)
             .collect()
@@ -247,7 +319,40 @@ impl ProxyHandler {
             warn!(%error, "traffic sink failed");
         }
 
-        Ok(Response::from_parts(resp_parts, Full::new(response_body_bytes)))
+        Ok(Response::from_parts(
+            resp_parts,
+            Full::new(response_body_bytes),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelProtocol {
+    Http,
+    Tls,
+    Raw,
+}
+
+fn classify_tunnel_protocol(bytes: &[u8]) -> TunnelProtocol {
+    if bytes.len() >= 3 && matches!(bytes[0], 0x14..=0x17) && bytes[1] == 0x03 && bytes[2] <= 0x04 {
+        return TunnelProtocol::Tls;
+    }
+    const HTTP_PREFIXES: &[&[u8]] = &[
+        b"GET ",
+        b"HEAD ",
+        b"POST ",
+        b"PUT ",
+        b"PATCH ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"TRACE ",
+        b"CONNECT ",
+        b"PRI * HTTP/2.0",
+    ];
+    if HTTP_PREFIXES.iter().any(|prefix| bytes.starts_with(prefix)) {
+        TunnelProtocol::Http
+    } else {
+        TunnelProtocol::Raw
     }
 }
 
@@ -308,7 +413,12 @@ impl ServerCertVerifier for AcceptAnyVerifier {
     }
 }
 
-fn rewrite_origin(req: Request<Incoming>, scheme: &str, host: &str, port: u16) -> Request<Incoming> {
+fn rewrite_origin(
+    req: Request<Incoming>,
+    scheme: &str,
+    host: &str,
+    port: u16,
+) -> Request<Incoming> {
     let (mut parts, body) = req.into_parts();
     let path = parts
         .uri
@@ -331,13 +441,26 @@ fn rewrite_origin(req: Request<Incoming>, scheme: &str, host: &str, port: u16) -
     Request::from_parts(parts, body)
 }
 
-fn extract_run_id(req: &Request<Incoming>) -> Option<String> {
-    req.headers()
+fn extract_run_id<B>(req: &Request<B>) -> Option<String> {
+    let header_run_id = req
+        .headers()
         .get("x-kairos-run-id")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| valid_run_id(value))
-        .map(str::to_string)
+        .map(str::to_string);
+    header_run_id.or_else(|| {
+        let encoded = req
+            .headers()
+            .get("proxy-authorization")?
+            .to_str()
+            .ok()?
+            .strip_prefix("Basic ")?;
+        let decoded = STANDARD.decode(encoded).ok()?;
+        let credentials = std::str::from_utf8(&decoded).ok()?;
+        let run_id = credentials.split_once(':')?.0.trim();
+        valid_run_id(run_id).then(|| run_id.to_string())
+    })
 }
 
 fn valid_run_id(value: &str) -> bool {
@@ -419,5 +542,31 @@ mod tests {
         // It is removed explicitly while rebuilding the outbound request; do
         // not silently classify arbitrary x-* headers as hop-by-hop.
         assert!(!is_hop_by_hop("x-kairos-run-id"));
+    }
+
+    #[test]
+    fn proxy_basic_username_propagates_the_run_id() {
+        let marker = STANDARD.encode("run-123:");
+        let request = Request::builder()
+            .header("proxy-authorization", format!("Basic {marker}"))
+            .body(())
+            .unwrap();
+        assert_eq!(extract_run_id(&request).as_deref(), Some("run-123"));
+    }
+
+    #[test]
+    fn connect_payload_protocol_is_detected_independently_of_port() {
+        assert_eq!(
+            classify_tunnel_protocol(b"GET /health HTTP/1.1\r\n"),
+            TunnelProtocol::Http
+        );
+        assert_eq!(
+            classify_tunnel_protocol(&[0x16, 0x03, 0x03, 0x00, 0x20]),
+            TunnelProtocol::Tls
+        );
+        assert_eq!(
+            classify_tunnel_protocol(b"SSH-2.0-OpenSSH_9.0\r\n"),
+            TunnelProtocol::Raw
+        );
     }
 }

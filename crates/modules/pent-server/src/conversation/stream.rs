@@ -2,6 +2,7 @@
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::{Stream, stream};
 use kairos_platform_framework_database::PgPool;
+use serde_json::json;
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -130,4 +131,83 @@ pub fn turn_sse(
         Some((Ok(Event::default().comment("heartbeat")), state))
     });
     Sse::new(events).keep_alive(KeepAlive::default())
+}
+
+/// Stream persisted Run events and close promptly after the Run reaches a
+/// terminal state. The periodic status poll also covers terminal updates that
+/// did not emit a PostgreSQL notification.
+pub async fn run_sse(
+    pool: PgPool,
+    run_id: String,
+) -> anyhow::Result<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
+    listener.listen("pent_run_events").await?;
+    let events = stream::unfold(
+        (listener, pool, run_id, -1_i64),
+        |(mut listener, pool, run_id, mut last_sequence)| async move {
+            loop {
+                let row = sqlx::query_as::<_, (String, i64, String, serde_json::Value)>(
+                    "SELECT event_id,sequence,event_type,payload
+                     FROM pent_run_events
+                     WHERE run_id=$1 AND sequence>$2
+                     ORDER BY sequence LIMIT 1",
+                )
+                .bind(&run_id)
+                .bind(last_sequence)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+                if let Some((event_id, sequence, event_type, payload)) = row {
+                    last_sequence = sequence;
+                    let data = json!({
+                        "event_id": event_id,
+                        "sequence": sequence,
+                        "event_type": event_type,
+                        "payload": payload
+                    });
+                    let event = Event::default().event(event_type).data(data.to_string());
+                    return Some((Ok(event), (listener, pool, run_id, last_sequence)));
+                }
+
+                let status =
+                    sqlx::query_scalar::<_, String>("SELECT status FROM pent_runs WHERE id=$1")
+                        .bind(&run_id)
+                        .fetch_optional(&pool)
+                        .await
+                        .ok()
+                        .flatten();
+                if !status.as_deref().is_some_and(run_status_is_active) {
+                    return None;
+                }
+
+                // LISTEN keeps event latency low; the timeout guarantees that
+                // terminal status is observed even if no event was published.
+                let _ = tokio::time::timeout(Duration::from_secs(1), listener.recv()).await;
+            }
+        },
+    );
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+}
+
+fn run_status_is_active(status: &str) -> bool {
+    matches!(
+        status,
+        "queued" | "running" | "cancelling" | "waiting_approval"
+    )
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::run_status_is_active;
+
+    #[test]
+    fn run_stream_closes_for_every_terminal_status() {
+        for status in ["completed", "failed", "blocked", "cancelled"] {
+            assert!(!run_status_is_active(status), "{status}");
+        }
+        for status in ["queued", "running", "cancelling", "waiting_approval"] {
+            assert!(run_status_is_active(status), "{status}");
+        }
+    }
 }

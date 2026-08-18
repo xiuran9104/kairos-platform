@@ -56,7 +56,7 @@ fn validate(value: &Value) -> Result<(), AppError> {
     for (key, min, max) in [
         ("max_iterations", 1, 10000),
         ("tool_search_min_tools", 1, 1000),
-        ("tool_search_top_k", 1, 200),
+        ("tool_search_top_k", 6, 16),
         ("context_budget_tokens", 2000, 256000),
         ("run_retry_max_attempts", 0, 20),
         ("run_retry_max_backoff_seconds", 1, 300),
@@ -72,7 +72,7 @@ fn validate(value: &Value) -> Result<(), AppError> {
 }
 
 fn defaults() -> Value {
-    json!({"orchestration":"deep","max_iterations":3000,"sub_agent_user_context_max_chars":24000,"tool_search_enabled":true,"tool_search_min_tools":20,"tool_search_top_k":24,"context_budget_tokens":32000,"summarization_trigger_ratio":0.8,"run_retry_max_attempts":4,"run_retry_max_backoff_seconds":30,"max_tool_arguments_bytes":262144,"max_shell_command_bytes":65536,"inherited":true})
+    json!({"orchestration":"deep","max_iterations":3000,"sub_agent_user_context_max_chars":24000,"tool_search_enabled":true,"tool_search_min_tools":20,"tool_search_top_k":12,"context_budget_tokens":32000,"summarization_trigger_ratio":0.8,"run_retry_max_attempts":4,"run_retry_max_backoff_seconds":30,"max_tool_arguments_bytes":262144,"max_shell_command_bytes":65536,"inherited":true})
 }
 fn internal(error: sqlx::Error) -> AppError {
     AppError::internal(error.to_string())

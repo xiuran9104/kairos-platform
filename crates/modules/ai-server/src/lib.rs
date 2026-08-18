@@ -4,6 +4,8 @@ mod factory;
 mod knowledge;
 mod media;
 mod midjourney;
+mod model_catalog;
+mod model_config;
 mod provider;
 mod tools;
 mod vector;
@@ -115,8 +117,8 @@ async fn page(
     let page = query.page_no.unwrap_or(1).max(1);
     let size = query.page_size.unwrap_or(10).clamp(1, 200);
     let type_filter = query.type_.as_deref().and_then(normalize_type);
-    let rows=sqlx::query("SELECT id,name,key,platform,type,model,api_key,url,status,config FROM ai.model_configs WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%') AND ($2::text IS NULL OR model ILIKE '%'||$2||'%') AND ($3::text IS NULL OR platform=$3) AND ($4::text IS NULL OR type=$4) AND ($5::integer IS NULL OR status=$5) ORDER BY id DESC LIMIT $6 OFFSET $7").bind(&query.name).bind(&query.model).bind(&query.platform).bind(type_filter).bind(query.status).bind(size).bind((page-1)*size).fetch_all(&state.pool).await.map_err(|_|AppError::internal("failed to list AI models"))?;
-    let total:i64=sqlx::query_scalar("SELECT count(*) FROM ai.model_configs WHERE ($1::text IS NULL OR name ILIKE '%'||$1||'%') AND ($2::text IS NULL OR model ILIKE '%'||$2||'%') AND ($3::text IS NULL OR platform=$3) AND ($4::text IS NULL OR type=$4) AND ($5::integer IS NULL OR status=$5)").bind(&query.name).bind(&query.model).bind(&query.platform).bind(type_filter).bind(query.status).fetch_one(&state.pool).await.map_err(|_|AppError::internal("failed to count AI models"))?;
+    let rows=sqlx::query("SELECT id,name,key,platform,type,model,api_key,url,status,config FROM ai.model_configs WHERE deleted=false AND ($1::text IS NULL OR name ILIKE '%'||$1||'%') AND ($2::text IS NULL OR model ILIKE '%'||$2||'%') AND ($3::text IS NULL OR platform=$3) AND ($4::text IS NULL OR type=$4) AND ($5::integer IS NULL OR status=$5) ORDER BY id DESC LIMIT $6 OFFSET $7").bind(&query.name).bind(&query.model).bind(&query.platform).bind(type_filter).bind(query.status).bind(size).bind((page-1)*size).fetch_all(&state.pool).await.map_err(|_|AppError::internal("failed to list AI models"))?;
+    let total:i64=sqlx::query_scalar("SELECT count(*) FROM ai.model_configs WHERE deleted=false AND ($1::text IS NULL OR name ILIKE '%'||$1||'%') AND ($2::text IS NULL OR model ILIKE '%'||$2||'%') AND ($3::text IS NULL OR platform=$3) AND ($4::text IS NULL OR type=$4) AND ($5::integer IS NULL OR status=$5)").bind(&query.name).bind(&query.model).bind(&query.platform).bind(type_filter).bind(query.status).fetch_one(&state.pool).await.map_err(|_|AppError::internal("failed to count AI models"))?;
     let list = rows.into_iter().map(row_model).collect::<Vec<_>>();
     Ok(Json(ApiResponse::new(json!({"list":list,"total":total}))))
 }
@@ -132,7 +134,7 @@ async fn simple_list(
 ) -> Result<Json<ApiResponse<Vec<ModelConfig>>>, AppError> {
     require(&user, "ai:model:query")?;
     let type_filter = query.type_.as_deref().and_then(normalize_type);
-    let rows = sqlx::query("SELECT id,name,key,platform,type,model,api_key,url,status,config FROM ai.model_configs WHERE status=0 AND ($1::text IS NULL OR type=$1) ORDER BY name,id")
+    let rows = sqlx::query("SELECT id,name,key,platform,type,model,api_key,url,status,config FROM ai.model_configs WHERE deleted=false AND status=0 AND ($1::text IS NULL OR type=$1) ORDER BY name,id")
         .bind(type_filter)
         .fetch_all(&state.pool)
         .await
@@ -226,7 +228,7 @@ async fn resolve_api_key(
     }
     let api_key: Option<String> = sqlx::query_scalar(
         "SELECT api_key FROM ai.model_configs
-         WHERE platform=$1 AND api_key<>''
+         WHERE platform=$1 AND api_key<>'' AND deleted=false
            AND ($2='' OR url=$2)
          ORDER BY CASE WHEN id=$3 THEN 0 ELSE 1 END, update_time DESC
          LIMIT 1",
@@ -262,7 +264,7 @@ async fn update(
         .id
         .ok_or_else(|| AppError::bad_request("id is required"))?;
     let api_key = resolve_api_key(&state, &request, Some(id)).await?;
-    let result=sqlx::query("UPDATE ai.model_configs SET name=$2,key=$3,platform=$4,type=$5,model=$6,api_key=$7,url=$8,status=$9,config=$10,update_time=$11 WHERE id=$1").bind(id).bind(request.name).bind(request.key).bind(request.platform).bind(request.type_).bind(request.model).bind(api_key).bind(request.url).bind(request.status).bind(request.config).bind(chrono::Utc::now().timestamp_millis()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to update AI model"))?;
+    let result=sqlx::query("UPDATE ai.model_configs SET name=$2,key=$3,platform=$4,type=$5,model=$6,api_key=$7,url=$8,status=$9,config=$10,update_time=$11 WHERE id=$1 AND deleted=false").bind(id).bind(request.name).bind(request.key).bind(request.platform).bind(request.type_).bind(request.model).bind(api_key).bind(request.url).bind(request.status).bind(request.config).bind(chrono::Utc::now().timestamp_millis()).execute(&state.pool).await.map_err(|_|AppError::internal("failed to update AI model"))?;
     if result.rows_affected() == 0 {
         return Err(AppError::not_found("AI model not found"));
     }
@@ -274,14 +276,7 @@ async fn remove(
     Query(query): Query<IdQuery>,
 ) -> Result<Json<ApiResponse<bool>>, AppError> {
     require(&user, "ai:model:delete")?;
-    let result = sqlx::query("DELETE FROM ai.model_configs WHERE id=$1")
-        .bind(query.id)
-        .execute(&state.pool)
-        .await
-        .map_err(|_| AppError::internal("failed to delete AI model"))?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::not_found("AI model not found"));
-    }
+    model_config::delete(&state.pool, query.id).await?;
     Ok(Json(ApiResponse::new(true)))
 }
 #[derive(Deserialize)]
@@ -291,143 +286,15 @@ struct TestModel {
     prompt: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscoverModels {
-    platform: String,
-    url: String,
-    #[serde(default)]
-    api_key: String,
-}
-
-fn discovered_model_type(model: &str) -> &'static str {
-    let id = model.to_ascii_lowercase();
-    if id.contains("embedding") || id.contains("embed") {
-        "embedding"
-    } else if id.contains("rerank") {
-        "rerank"
-    } else if id.contains("transcrib") || id.contains("whisper") {
-        "transcription"
-    } else if id.contains("tts") || id.contains("audio") {
-        "speech"
-    } else if id.contains("sora") || id.contains("video") || id.contains("seedance") {
-        "video"
-    } else if id.contains("image")
-        || id.contains("seedream")
-        || id.contains("dall-e")
-        || id.contains("flux")
-        || id.contains("cogview")
-    {
-        "image"
-    } else {
-        "chat"
-    }
-}
-
 async fn discover_models(
     user: CurrentUser,
     State(state): State<AiState>,
-    Json(request): Json<DiscoverModels>,
+    Json(request): Json<model_catalog::DiscoverModels>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     require(&user, "ai:model:query")?;
-    let platform = AiPlatform::parse(&request.platform)
-        .ok_or_else(|| AppError::bad_request("unsupported platform"))?;
-    if request.url.trim().is_empty() {
-        return Err(AppError::bad_request("API 地址不能为空"));
-    }
-    let client = reqwest::Client::new();
-    let response = if platform == AiPlatform::Gemini {
-        client
-            .get(format!("{}/models", request.url.trim_end_matches('/')))
-            .query(&[("key", request.api_key.as_str())])
-            .send()
-            .await
-    } else {
-        let mut builder = client.get(format!("{}/models", request.url.trim_end_matches('/')));
-        if !request.api_key.is_empty() {
-            builder = builder.bearer_auth(request.api_key.trim_start_matches("Bearer "));
-        }
-        builder.send().await
-    }
-    .map_err(|error| AppError::bad_request(format!("获取模型列表失败：{error}")))?;
-    let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|error| AppError::bad_request(format!("模型列表响应无效：{error}")))?;
-    if !status.is_success() {
-        let message = value
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("供应商拒绝获取模型列表");
-        return Err(AppError::bad_request(message));
-    }
-    let items = value
-        .get("data")
-        .or_else(|| value.get("models"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let models = items
-        .into_iter()
-        .filter_map(|item| {
-            item.get("id")
-                .or_else(|| item.get("name"))
-                .and_then(Value::as_str)
-                .map(|id| id.trim_start_matches("models/").to_string())
-        })
-        .filter_map(|id| {
-            let model_type = AiModelType::parse(discovered_model_type(&id))?;
-            platform
-                .supports(model_type)
-                .then(|| json!({"id":id,"type":model_type.code()}))
-        })
-        .collect::<Vec<_>>();
-    let source = format!("{}/models", request.url.trim_end_matches('/'));
-    let synced_at = chrono::Utc::now().timestamp_millis();
-    let mut transaction = state
-        .pool
-        .begin()
-        .await
-        .map_err(|_| AppError::internal("failed to start model catalog sync"))?;
-    sqlx::query(
-        "UPDATE ai.model_catalog
-         SET missing_count=missing_count+1
-         WHERE platform=$1 AND source='discover'",
-    )
-    .bind(platform.code())
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| AppError::internal("failed to clear old model catalog"))?;
-    for model in &models {
-        sqlx::query(
-            "INSERT INTO ai.model_catalog(
-                platform,model,type,source,source_url,active,synced_at,missing_count
-             ) VALUES($1,$2,$3,'discover',$4,TRUE,$5,0)
-             ON CONFLICT(platform,model) DO UPDATE
-             SET type=EXCLUDED.type,source='discover',source_url=EXCLUDED.source_url,
-                 active=TRUE,synced_at=EXCLUDED.synced_at,missing_count=0",
-        )
-        .bind(platform.code())
-        .bind(model["id"].as_str().unwrap_or_default())
-        .bind(model["type"].as_str().unwrap_or("chat"))
-        .bind(&source)
-        .bind(synced_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| AppError::internal("failed to persist model catalog"))?;
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|_| AppError::internal("failed to commit model catalog sync"))?;
-    Ok(Json(ApiResponse::new(json!({
-        "models": models,
-        "platform": platform.code(),
-        "source": source,
-        "syncedAt": synced_at,
-        "persisted": true,
-    }))))
+    Ok(Json(ApiResponse::new(
+        model_catalog::discover(&state.pool, request).await?,
+    )))
 }
 async fn test(
     user: CurrentUser,
@@ -588,22 +455,4 @@ async fn platforms(
         "cachedModels": cached_models,
         "types": ["chat","image","video","speech","transcription","music","embedding","rerank"]
     }))))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::discovered_model_type;
-
-    #[test]
-    fn discovered_models_are_classified_before_merging_with_presets() {
-        assert_eq!(discovered_model_type("qwen3-rerank"), "rerank");
-        assert_eq!(discovered_model_type("qwen3-vl-rerank"), "rerank");
-        assert_eq!(discovered_model_type("text-embedding-v4"), "embedding");
-        assert_eq!(
-            discovered_model_type("doubao-seedance-1-5-pro-251215"),
-            "video"
-        );
-        assert_eq!(discovered_model_type("doubao-seedream-4-5-251128"), "image");
-        assert_eq!(discovered_model_type("qwen-max"), "chat");
-    }
 }

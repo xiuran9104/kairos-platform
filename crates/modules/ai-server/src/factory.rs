@@ -37,7 +37,7 @@ impl AiModelFactory {
         Self { pool }
     }
     pub async fn config(&self, id: i64) -> Result<ModelConfig, AppError> {
-        let row=sqlx::query("SELECT id,name,key,platform,type,model,api_key,url,status,config FROM ai.model_configs WHERE id=$1").bind(id).fetch_optional(&self.pool).await.map_err(|_|AppError::internal("failed to load AI model"))?.ok_or_else(||AppError::not_found("AI model not found"))?;
+        let row=sqlx::query("SELECT id,name,key,platform,type,model,api_key,url,status,config FROM ai.model_configs WHERE id=$1 AND deleted=false").bind(id).fetch_optional(&self.pool).await.map_err(|_|AppError::internal("failed to load AI model"))?.ok_or_else(||AppError::not_found("AI model not found"))?;
         Ok(ModelConfig {
             id: row.get("id"),
             name: row.get("name"),

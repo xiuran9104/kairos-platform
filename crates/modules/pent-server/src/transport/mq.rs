@@ -1441,4 +1441,40 @@ mod tests {
         let error = bus.request_tool_execution(&request).await.unwrap_err();
         assert!(error.contains("NATS 未连接"));
     }
+
+    #[tokio::test]
+    async fn connected_bus_executes_http_probe_on_the_pent_agent() {
+        let Ok(nats_url) = std::env::var("TEST_NATS_URL") else {
+            return;
+        };
+        let target = std::env::var("TEST_PENTA_HTTP_TARGET")
+            .unwrap_or_else(|_| "http://127.0.0.1:13000".into());
+        let bus = NatsEventBus::connect(&nats_url).await.handle();
+        let request = RemoteToolExecutionRequest {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            tool_name: "http_probe".into(),
+            arguments: serde_json::json!({"target": target.clone()}),
+            scope_snapshot: serde_json::json!({
+                "targets": [target],
+                "confirmed": true
+            }),
+            session_id: format!("transport-test-{}", uuid::Uuid::new_v4()),
+            run_id: None,
+            traffic_run_id: None,
+            timeout_seconds: 30,
+        };
+
+        let response = bus.request_tool_execution(&request).await.unwrap();
+
+        assert!(
+            response.error.is_none(),
+            "worker error: {:?}",
+            response.error
+        );
+        let output = response
+            .output
+            .expect("pent-agent should return tool output");
+        assert_eq!(output.exit_code, 0, "stderr: {}", output.stderr);
+        assert!(output.stdout.contains("HTTP/"));
+    }
 }

@@ -1,12 +1,12 @@
 ---
 name: php-file-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   PHP 源码文件操作类漏洞审计。当在 PHP 白盒审计中需要检测文件相关漏洞时触发。
   覆盖 5 类文件风险: 任意文件上传(类型绕过/路径穿越/二次渲染)、任意文件读取(include/fread/路径穿越)、
   任意文件写入(日志注入/配置覆盖)、文件系统竞争(TOCTOU/符号链接)、归档提取漏洞(Zip Slip)。
   需要 php-audit-pipeline 提供的数据流证据。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: file upload, file read, file write, path traversal, zip slip, lfi, rfi, include, 文件上传, 任意读取, 任意写入, toctou, symlink, 路径穿越
   category: code-audit

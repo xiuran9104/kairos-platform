@@ -61,7 +61,15 @@ async fn list_sessions(
     .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
-    Ok(Json(ApiResponse::new(rows)))
+    let mut resolved = Vec::with_capacity(rows.len());
+    for row in rows {
+        resolved.push(
+            crate::role_resolution::decorate_session(&state.pool, tenant_id, row)
+                .await
+                .map_err(|error| AppError::internal(error.to_string()))?,
+        );
+    }
+    Ok(Json(ApiResponse::new(resolved)))
 }
 
 async fn get_session(
@@ -93,6 +101,9 @@ async fn get_session(
     .await
     .map_err(internal)?
     .ok_or_else(|| AppError::not_found("Agent Session 不存在"))?;
+    let session = crate::role_resolution::decorate_session(&state.pool, tenant_id, session)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
     Ok(Json(ApiResponse::new(session)))
 }
 
@@ -263,7 +274,7 @@ async fn update_session_model(
         .and_then(Value::as_i64)
         .ok_or_else(|| AppError::bad_request("请选择模型"))?;
     let valid: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM ai.model_configs WHERE id=$1 AND type='chat' AND status=0)",
+        "SELECT EXISTS(SELECT 1 FROM ai.model_configs WHERE id=$1 AND type='chat' AND status=0 AND deleted=false)",
     )
     .bind(model_id)
     .fetch_one(&state.pool)
@@ -297,31 +308,27 @@ async fn update_session_role(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     crate::security::ensure_session_access(&state.pool, &id, &user).await?;
     let tenant_id = security::tenant_id(&user)?;
+    if !request.is_object() || request.get("role_id").is_none() {
+        return Err(AppError::bad_request("role_id 字段不能为空"));
+    }
     let role_id = request
         .get("role_id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::bad_request("请选择角色"))?;
-    let visible: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM pent_agent_roles
-             WHERE id=$1 AND (tenant_id=$2 OR tenant_id=0) AND enabled=true
-         )",
-    )
-    .bind(role_id)
-    .bind(tenant_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(internal)?;
-    if !visible {
+        .filter(|value| !value.is_empty());
+    if let Some(role_id) = role_id
+        && !crate::role_resolution::ensure_visible_role(&state.pool, tenant_id, role_id)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+    {
         return Err(AppError::bad_request("角色不存在或未启用"));
     }
     let affected = sqlx::query(
         "UPDATE pent_agent_sessions
-         SET constraints=jsonb_set(
-             constraints, '{role_id}', to_jsonb($2::text), true
-         ), updated_at=now()
+         SET constraints=CASE
+             WHEN $2::text IS NULL THEN constraints - 'role_id'
+             ELSE jsonb_set(constraints, '{role_id}', to_jsonb($2::text), true)
+         END, updated_at=now()
          WHERE id=$1 AND active_run_id IS NULL",
     )
     .bind(&id)
@@ -333,7 +340,18 @@ async fn update_session_role(
     if affected == 0 {
         return Err(AppError::bad_request("会话运行中，暂时不能切换角色"));
     }
-    Ok(Json(ApiResponse::new(json!({"role_id": role_id}))))
+    let session = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(s) FROM pent_agent_sessions s WHERE id=$1 AND tenant_id=$2",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(internal)?;
+    let session = crate::role_resolution::decorate_session(&state.pool, tenant_id, session)
+        .await
+        .map_err(|error| AppError::internal(error.to_string()))?;
+    Ok(Json(ApiResponse::new(session)))
 }
 
 /// Extract the target list from a project `asset_scope` value (JSON array or
@@ -432,18 +450,10 @@ async fn create_session(
     });
     let mut constraints = request.constraints.clone();
     if let Some(role_id) = request.role_id.as_deref().filter(|value| !value.trim().is_empty()) {
-        let visible: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pent_agent_roles
-                 WHERE id=$1 AND (tenant_id=$2 OR tenant_id=0) AND enabled=true
-             )",
-        )
-        .bind(role_id)
-        .bind(tenant_id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(internal)?;
-        if !visible {
+        if !crate::role_resolution::ensure_visible_role(&state.pool, tenant_id, role_id)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+        {
             return Err(AppError::bad_request("角色不存在或未启用"));
         }
         if let Some(object) = constraints.as_object_mut() {
@@ -472,7 +482,7 @@ async fn create_session(
     .bind(&user.user_id)
     .execute(&mut *tx)
     .await
-    .map_err(internal)?;
+    .map_err(|error| AppError::internal(error.to_string()))?;
 
     sqlx::query(
         "INSERT INTO pent_conversation_messages(
@@ -692,6 +702,15 @@ async fn create_session_run(
     .map_err(internal)?;
     let (project_id, objective, scope, constraints, budget) =
         row.ok_or_else(|| AppError::bad_request("会话不存在或状态不可用"))?;
+    let requested_role_id = constraints.get("role_id").and_then(Value::as_str);
+    let resolved_role = crate::role_resolution::resolve_role(
+        &state.pool,
+        tenant_id,
+        requested_role_id,
+        project_id.as_deref(),
+    )
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
 
     let task_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
@@ -735,7 +754,10 @@ async fn create_session_run(
     .bind(&id)
     .bind(&objective)
     .bind(&scope)
-    .bind(json!({"constraints": constraints}))
+    .bind(json!({
+        "constraints": constraints,
+        "role": resolved_role.audit_snapshot(requested_role_id),
+    }))
     .bind(&budget)
     .execute(&mut *tx)
     .await

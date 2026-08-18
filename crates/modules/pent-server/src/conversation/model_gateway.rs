@@ -21,6 +21,89 @@ pub struct AiModelGateway {
     unlocked_tools: Mutex<HashSet<String>>,
 }
 
+#[derive(Debug)]
+struct ModelBindingCandidate {
+    model_config_id: i64,
+    temperature: f64,
+    max_output_tokens: i32,
+    tenant_id: i64,
+    project_id: String,
+}
+
+fn is_default_binding_project(project_id: &str) -> bool {
+    project_id.is_empty() || project_id == "0"
+}
+
+fn model_binding_rank(
+    session_tenant_id: i64,
+    session_project_id: Option<&str>,
+    binding: &ModelBindingCandidate,
+) -> Option<u8> {
+    if binding.tenant_id == session_tenant_id
+        && session_project_id.is_some_and(|project_id| project_id == binding.project_id)
+    {
+        Some(0)
+    } else if binding.tenant_id == session_tenant_id
+        && is_default_binding_project(&binding.project_id)
+    {
+        Some(1)
+    } else if binding.tenant_id == 0 && is_default_binding_project(&binding.project_id) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn select_model_binding<'a>(
+    session_tenant_id: i64,
+    session_project_id: Option<&str>,
+    candidates: &'a [ModelBindingCandidate],
+) -> Option<&'a ModelBindingCandidate> {
+    candidates
+        .iter()
+        .filter_map(|binding| {
+            model_binding_rank(session_tenant_id, session_project_id, binding)
+                .map(|rank| (rank, binding))
+        })
+        .min_by_key(|(rank, binding)| (*rank, binding.model_config_id))
+        .map(|(_, binding)| binding)
+}
+
+pub(crate) async fn resolve_default_chat_model(
+    pool: &PgPool,
+    tenant_id: i64,
+) -> anyhow::Result<(i64, f64, u32)> {
+    let binding: Option<(i64, f64, i32)> = sqlx::query_as(
+        "SELECT b.model_config_id, COALESCE(b.temperature, 0.7)::float8,
+                COALESCE(b.max_output_tokens, 4096)
+         FROM pent_model_role_bindings b
+         JOIN ai.model_configs m ON m.id=b.model_config_id
+         WHERE b.model_role='conversation' AND b.enabled=true
+           AND b.tenant_id IN ($1, 0)
+           AND b.project_id IN ('', '0')
+           AND m.type='chat' AND m.status=0 AND m.deleted=false
+         ORDER BY CASE WHEN b.tenant_id=$1 THEN 0 ELSE 1 END,
+                  CASE WHEN b.project_id='' THEN 0 ELSE 1 END,
+                  b.model_config_id
+         LIMIT 1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    binding
+        .map(|(id, temperature, max_tokens)| {
+            (
+                id,
+                temperature,
+                conversation_output_token_limit(max_tokens.max(1) as u32),
+            )
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("默认对话模型已删除或未配置，请前往“平台设置 → 基本设置”重新选择并保存")
+        })
+}
+
 impl AiModelGateway {
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -35,38 +118,76 @@ impl AiModelGateway {
         &self,
         session_id: &str,
     ) -> anyhow::Result<(i64, Option<f64>, u32)> {
-        let selected: Option<i64> = sqlx::query_scalar(
-            "SELECT m.id
-             FROM pent_agent_sessions s
-             JOIN ai.model_configs m
-               ON m.id=NULLIF(s.constraints->>'model_id','')::bigint
-              AND m.type='chat' AND m.status=0
-             WHERE s.id=$1",
+        let session: Option<(i64, Option<String>, Value)> = sqlx::query_as(
+            "SELECT tenant_id, project_id, constraints
+             FROM pent_agent_sessions
+             WHERE id=$1",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await?;
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pent_agent_sessions WHERE id=$1)")
-                .bind(session_id)
-                .fetch_one(&self.pool)
-                .await?;
-        if !exists {
+
+        let Some((tenant_id, project_id, constraints)) = session else {
             return Err(anyhow::anyhow!("Agent Session 不存在"));
-        }
-        let id = if let Some(id) = selected {
-            id
-        } else {
-            sqlx::query_scalar(
-                "SELECT id FROM ai.model_configs
-             WHERE type = 'chat' AND status = 0
-             ORDER BY id LIMIT 1",
-            )
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("未配置可用的聊天模型"))?
         };
-        Ok((id, Some(0.3), conversation_output_token_limit(2000)))
+
+        let explicit_model_id = constraints.get("model_id").and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        });
+        if let Some(model_id) = explicit_model_id {
+            let valid: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM ai.model_configs
+                     WHERE id=$1 AND type='chat' AND status=0 AND deleted=false
+                 )",
+            )
+            .bind(model_id)
+            .fetch_one(&self.pool)
+            .await?;
+            if valid {
+                return Ok((model_id, Some(0.3), conversation_output_token_limit(2000)));
+            }
+        }
+
+        let binding_rows: Vec<(i64, f64, i32, i64, String)> = sqlx::query_as(
+            "SELECT b.model_config_id, b.temperature::float8,
+                    b.max_output_tokens, b.tenant_id, b.project_id
+             FROM pent_model_role_bindings b
+             JOIN ai.model_configs m
+               ON m.id=b.model_config_id AND m.type='chat' AND m.status=0 AND m.deleted=false
+             WHERE b.model_role='conversation' AND b.enabled=true
+               AND b.tenant_id IN ($1, 0)",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let bindings = binding_rows
+            .into_iter()
+            .map(
+                |(model_config_id, temperature, max_output_tokens, tenant_id, project_id)| {
+                    ModelBindingCandidate {
+                        model_config_id,
+                        temperature,
+                        max_output_tokens,
+                        tenant_id,
+                        project_id,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        if let Some(binding) = select_model_binding(tenant_id, project_id.as_deref(), &bindings) {
+            return Ok((
+                binding.model_config_id,
+                Some(binding.temperature),
+                conversation_output_token_limit(binding.max_output_tokens.max(1) as u32),
+            ));
+        }
+
+        Err(anyhow::anyhow!(
+            "默认对话模型已删除或未配置，请前往“平台设置 → 基本设置”重新选择并保存"
+        ))
     }
 }
 
@@ -106,6 +227,52 @@ fn routing_intent(context: &ConversationContext) -> String {
         "{}\n{}\n{}\n{}",
         context.objective_snapshot, context.run_summary, last_user, recent_tool_results
     )
+}
+
+#[cfg(test)]
+mod model_selection_tests {
+    use super::*;
+
+    fn binding(model_config_id: i64, tenant_id: i64, project_id: &str) -> ModelBindingCandidate {
+        ModelBindingCandidate {
+            model_config_id,
+            temperature: 0.7,
+            max_output_tokens: 4096,
+            tenant_id,
+            project_id: project_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn project_binding_precedes_tenant_and_inherited_defaults() {
+        let candidates = vec![
+            binding(30, 0, "0"),
+            binding(20, 7, ""),
+            binding(10, 7, "project-a"),
+        ];
+
+        let selected = select_model_binding(7, Some("project-a"), &candidates).unwrap();
+
+        assert_eq!(selected.model_config_id, 10);
+    }
+
+    #[test]
+    fn tenant_default_precedes_inherited_default_without_project_binding() {
+        let candidates = vec![binding(30, 0, "0"), binding(20, 7, "")];
+
+        let selected = select_model_binding(7, Some("project-a"), &candidates).unwrap();
+
+        assert_eq!(selected.model_config_id, 20);
+    }
+
+    #[test]
+    fn unrelated_project_bindings_are_ignored() {
+        let candidates = vec![binding(10, 7, "project-b"), binding(30, 0, "0")];
+
+        let selected = select_model_binding(7, Some("project-a"), &candidates).unwrap();
+
+        assert_eq!(selected.model_config_id, 30);
+    }
 }
 
 #[async_trait]

@@ -1,13 +1,13 @@
 ---
 name: java-framework-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   Java 框架特定漏洞源码审计。当在 Java 白盒审计中需要检测框架层面的已知漏洞模式时触发。
   覆盖 5 大框架/组件: Spring 全家桶(SpEL/Actuator/参数绑定/Spring Cloud Gateway)、
   Struts2(OGNL/ActionMapping/Content-Type 解析)、Shiro(RememberMe 反序列化/URI 绕过)、
   FastJSON/Jackson/Gson(反序列化 autotype/polymorphic)、MyBatis(${} 注入/动态 SQL)。
   这些是 Java 生态中出现频率最高、影响面最广的框架级漏洞。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: spring, struts2, shiro, fastjson, jackson, mybatis, ognl, spel, actuator, rememberme, spring cloud, 框架漏洞, java source audit
   category: code-audit

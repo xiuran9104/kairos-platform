@@ -33,7 +33,7 @@ cargo build --release -p kairos-scan-agent
 新服务器首次部署建议流程：
 
 1. 安装 Rust stable、Docker Compose、Node.js `22.18+` 或 `24.x`，并通过 Corepack 使用 pnpm `11+`。
-   如需使用 Pent 主动检测，另需在 pent-agent 宿主机安装 `bubblewrap`、`nmap`、`nuclei`、`sqlmap`、`ffuf`、
+   如需使用 Pent 主动检测，另需在 pent-agent 宿主机安装 `bubblewrap`、`proxychains4`、`nmap`、`nuclei`、`sqlmap`、`ffuf`、
    `gobuster`、`whatweb`、`nikto`、`subfinder`、`amass`、`wfuzz`、`dirsearch`、
    `feroxbuster`、`dalfox` 等本地工具。
 2. 克隆代码到固定目录，例如 `/opt/kairos-platform`。

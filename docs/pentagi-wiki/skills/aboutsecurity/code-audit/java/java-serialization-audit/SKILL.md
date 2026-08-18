@@ -1,13 +1,13 @@
 ---
 name: java-serialization-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   Java 源码序列化类漏洞审计。当在 Java 白盒审计中需要检测序列化/反序列化相关漏洞时触发。
   覆盖 3 类风险: Java 原生反序列化(ObjectInputStream/Gadget Chain/ysoserial)、
   XXE(DocumentBuilderFactory/SAXParser/XMLInputFactory/TransformerFactory/SchemaFactory 五种解析器)、
   模板注入 SSTI(Velocity/FreeMarker/Thymeleaf 模板引擎代码执行)。
   Java 反序列化是 Java 生态最具特色的高危漏洞类型，Gadget Chain 分析是核心难点。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: deserialization, xxe, ssti, objectinputstream, gadget chain, ysoserial, xml, velocity, freemarker, thymeleaf, 反序列化, 模板注入, java source audit
   category: code-audit

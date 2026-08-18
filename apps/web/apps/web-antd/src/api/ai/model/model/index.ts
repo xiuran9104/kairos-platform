@@ -96,9 +96,10 @@ export function getModelPlatformCapabilities() {
 
 /** 使用供应商 API Key 同步账号可用模型 */
 export function discoverModels(data: {
-  apiKey: string;
-  platform: string;
-  url: string;
+  apiKey?: string;
+  configId?: number;
+  platform?: string;
+  url?: string;
 }) {
   return requestClient.post<{
     models: AiModelModelApi.DiscoveredModel[];

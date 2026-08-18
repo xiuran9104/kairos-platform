@@ -27,7 +27,7 @@ impl EmbeddingProvider {
     pub async fn try_configure(&mut self) -> Result<bool, String> {
         let row = sqlx::query_as::<_, (String, String, String)>(
             "SELECT model, url, api_key FROM ai.model_configs
-             WHERE type = 'embedding' AND status = 0
+             WHERE type = 'embedding' AND status = 0 AND deleted = false
              ORDER BY id LIMIT 1",
         )
         .fetch_optional(&self.pool)

@@ -17,6 +17,8 @@ async fn main() -> anyhow::Result<()> {
 
     kairos_platform_pent_server::infrastructure::process::verify_bubblewrap()
         .map_err(anyhow::Error::msg)?;
+    kairos_platform_pent_server::infrastructure::traffic_capture::verify_runtime()
+        .map_err(anyhow::Error::msg)?;
 
     match kairos_platform_pent_server::infrastructure::tool_lifecycle::sync_tool_directory() {
         Ok(report) => tracing::info!(
@@ -35,6 +37,8 @@ async fn main() -> anyhow::Result<()> {
         &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
     )
     .await;
+    kairos_platform_pent_server::transport::mq::init_conversation_tool_bus(nats_bus.handle())
+        .map_err(anyhow::Error::msg)?;
     let mcp_registry = kairos_platform_pent_tooling::mcp::registry::shared().await;
     let worker_id = format!(
         "worker-{}-{}-{}",

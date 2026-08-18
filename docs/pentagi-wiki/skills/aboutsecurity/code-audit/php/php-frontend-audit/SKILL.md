@@ -1,12 +1,12 @@
 ---
 name: php-frontend-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   PHP 源码前端交互类漏洞审计。当在 PHP 白盒审计中需要检测前端安全相关漏洞时触发。
   覆盖 5 类前端风险: XSS(反射/存储/DOM)、CSRF(Token 验证缺失)、
   开放重定向(header Location 可控)、CRLF 注入(HTTP 响应拆分)、会话与 Cookie 安全(固定/劫持/属性)。
   需要 php-audit-pipeline 提供的数据流证据。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: xss, csrf, open redirect, crlf injection, session, cookie, 跨站脚本, 跨站请求伪造, 会话安全, http response splitting, 前端安全审计
   category: code-audit

@@ -41,6 +41,9 @@ pub fn inherit_child_budget(
 ) -> AgentChildBudget {
     let checkpoint = ContextCheckpoint::from_context(context).loop_state;
     let configured = &context.budget_snapshot;
+    if !crate::budget_policy::budget_limits_enabled(configured) {
+        return child_cap;
+    }
     let value = |keys: &[&str], default: u64| {
         keys.iter()
             .find_map(|key| configured.get(key).and_then(serde_json::Value::as_u64))

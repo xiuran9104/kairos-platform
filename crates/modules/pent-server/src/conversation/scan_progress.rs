@@ -566,10 +566,9 @@ impl ScanProgress {
         }
 
         // A successful but fingerprint-identical result does not mean the
-        // tools are broken — it means the model needs to change strategy.
-        // Only failures increment the stall counter so a working-but-repetitive
-        // agent is caught by the budget limits (rounds / tokens / duration)
-        // instead of the stall detector.
+        // tool is broken. The shared AgentRunner still counts it as no
+        // effective progress and applies its liveness guard, including when
+        // resource budgets are unlimited.
         if !success {
             self.consecutive_no_progress += 1;
         }

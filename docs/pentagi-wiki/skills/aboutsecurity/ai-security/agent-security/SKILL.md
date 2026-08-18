@@ -1,12 +1,12 @@
 ---
 name: agent-security
 description: |
-risk: safe
-requires-explicit-authorization: false
   AI Agent 系统安全测试方法论。当目标系统使用 AI Agent 执行工具调用、多 Agent 协作、
   或自主决策时触发。覆盖 OWASP Agentic AI Security Top 10 (ASI01-ASI10):
   目标劫持、工具滥用、身份权限、供应链、代码执行、记忆投毒、多 Agent 通信、
   级联故障、人机信任利用、失控 Agent。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: agent security, ai agent, agentic ai, owasp asi, tool abuse, agent hijack, multi-agent, 智能体安全, agent 劫持, 工具滥用, 权限越界, 级联故障, kill switch, agent蠕虫, morris ii
   category: ai-security

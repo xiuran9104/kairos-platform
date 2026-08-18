@@ -15,6 +15,7 @@ pub mod tool_catalog_postgres;
 pub mod tool_lifecycle;
 pub mod tool_registry;
 pub mod tool_search_postgres;
+pub mod traffic_capture;
 pub mod vector;
 pub mod vision;
 

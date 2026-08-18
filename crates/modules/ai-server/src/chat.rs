@@ -127,13 +127,26 @@ async fn create_conversation(
     {
         Some(id) => id,
         None => sqlx::query_scalar(
-            "SELECT id FROM ai.model_configs WHERE type='chat' AND status=0 ORDER BY id LIMIT 1",
+            "SELECT id FROM ai.model_configs WHERE type='chat' AND status=0 AND deleted=false ORDER BY id LIMIT 1",
         )
         .fetch_optional(&state.pool)
         .await
         .map_err(|_| AppError::internal("读取聊天模型失败"))?
         .ok_or_else(|| AppError::bad_request("请先配置启用的聊天模型"))?,
     };
+    let model_is_available: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM ai.model_configs
+             WHERE id=$1 AND type='chat' AND status=0 AND deleted=false
+         )",
+    )
+    .bind(model_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| AppError::internal("读取聊天模型失败"))?;
+    if !model_is_available {
+        return Err(AppError::bad_request("模型已删除或未启用，请重新选择"));
+    }
     let title = v
         .title
         .filter(|x| !x.trim().is_empty())

@@ -1,12 +1,13 @@
 <script lang="ts" setup>
 import type { AiModelModelApi } from '#/api/ai/model/model';
+import type { PentAgentRole } from '#/api/pent/roles';
 
 import { onMounted, ref, watch } from 'vue';
 import { AiModelTypeEnum } from '@vben/constants';
 import { message } from 'ant-design-vue';
 
 import { getModelSimpleList } from '#/api/ai/model/model';
-import { updatePentProject, updatePentProjectModel } from '#/api/pent';
+import { getPentRoles, updatePentProject, updatePentProjectModel } from '#/api/pent';
 
 const props = defineProps<{ project: Record<string, any> }>();
 const emit = defineEmits<{ saved: [] }>();
@@ -14,9 +15,12 @@ const emit = defineEmits<{ saved: [] }>();
 const saving = ref(false);
 const modelsLoading = ref(false);
 const models = ref<AiModelModelApi.Model[]>([]);
+const rolesLoading = ref(false);
+const roles = ref<PentAgentRole[]>([]);
 const form = ref({
   assetScopeText: '',
   description: '',
+  defaultRoleId: '',
   modelConfigId: undefined as number | undefined,
   name: '',
   status: 'active',
@@ -29,6 +33,7 @@ function resetForm() {
       ? project.asset_scope.join('\n')
       : '',
     description: project.description || '',
+    defaultRoleId: project.default_role_id || '',
     modelConfigId: project.model_config_id || undefined,
     name: project.name || '',
     status: project.status || 'active',
@@ -43,6 +48,17 @@ async function loadModels() {
     models.value = [];
   } finally {
     modelsLoading.value = false;
+  }
+}
+
+async function loadRoles() {
+  rolesLoading.value = true;
+  try {
+    roles.value = ((await getPentRoles()) || []).filter((role) => role.enabled);
+  } catch {
+    roles.value = [];
+  } finally {
+    rolesLoading.value = false;
   }
 }
 
@@ -61,6 +77,7 @@ async function save() {
     await updatePentProject(props.project.id, {
       asset_scope: assetScope,
       description: form.value.description.trim(),
+      default_role_id: form.value.defaultRoleId || null,
       name,
       status: form.value.status,
     });
@@ -80,7 +97,7 @@ async function save() {
 }
 
 watch(() => props.project, resetForm, { deep: true, immediate: true });
-onMounted(loadModels);
+onMounted(() => Promise.all([loadModels(), loadRoles()]));
 </script>
 
 <template>
@@ -132,6 +149,24 @@ onMounted(loadModels);
           value: model.id,
         }))"
       />
+    </a-form-item>
+    <a-form-item label="默认 Agent 角色" extra="未选择时继承平台默认角色；对话仍可单独覆盖">
+      <a-select
+        v-model:value="form.defaultRoleId"
+        :loading="rolesLoading"
+        show-search
+        option-filter-prop="label"
+        :options="[
+          { label: '继承平台默认角色', value: '' },
+          ...roles.map((role) => ({
+            label: `${role.icon || '🎯'} ${role.name} · ${role.id}`,
+            value: role.id,
+          })),
+        ]"
+      />
+      <div style="margin-top: 4px; color: var(--ant-color-text-tertiary); font-size: 12px">
+        当前实际生效：{{ project.resolved_role_icon || '🎯' }} {{ project.resolved_role_name || '—' }}
+      </div>
     </a-form-item>
     <a-space>
       <a-button type="primary" :loading="saving" @click="save">保存设置</a-button>

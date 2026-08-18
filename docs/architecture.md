@@ -88,10 +88,11 @@ pent_tool_definitions 表（初始化快照）
 架构决策：**代理为主，不升级为 eBPF 主层**。Burp 式明文记录依赖 TLS 中间人，eBPF 只能拿到密文与连接元数据。
 
 ```text
-工具进程（注入 http_proxy/https_proxy + 平台 CA 信任）
+Web 工具进程（注入 http_proxy/https_proxy + ProxyChains connect 拦截 + 平台 CA 信任）
   -> mitm-proxy（127.0.0.1:8085）
      普通 HTTP：absolute-form 转发
-     CONNECT 443：TLS 终止（CA 动态签发叶子证书）-> 解密后转发
+     CONNECT：识别 HTTP/TLS；TLS 终止（CA 动态签发叶子证书）-> 解密后转发
+     非 HTTP/TLS CONNECT：保持原始 TCP 隧道，不写 HTTP 流量表
   -> 捕获 request/response -> TrafficSink
   -> pent_http_traffic（元数据 + body，PG）
 ```
@@ -99,7 +100,7 @@ pent_tool_definitions 表（初始化快照）
 - 模块：`crates/modules/mitm-proxy`（`ca.rs` / `tls.rs` / `proxy.rs` / `lib.rs`）。
 - CA 持久化于 `PENTA_MITM_CA_DIR`（默认 `storage/mitm/`，已 gitignore，私钥不入库）。
 - 落库：`pent-server/src/infrastructure/mitm_sink.rs` 实现 `TrafficSink`，写入 `pent_http_traffic`；大 Body 按 `PENTA_MITM_INLINE_BODY_LIMIT` 分流到 MinIO，数据库保留摘要、预览与对象键。
-- 注入：`infrastructure/process.rs` 在 `PENTA_TRAFFIC_CAPTURE=true` 时注入代理地址与 `SSL_CERT_FILE`/`CURL_CA_BUNDLE`/`REQUESTS_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS`。
+- 注入：`infrastructure/process.rs` 在流量采集开启时注入代理地址与 CA；`infrastructure/traffic_capture.rs` 为 Web 工具生成 run 级 ProxyChains 配置，使忽略代理变量的动态客户端也不能绕过采集。Nmap 与 TLS 专项检查不接入该拦截层。
 - 启动：`pent-agent` 调 `mitm_sink::spawn_mitm_proxy`。
 
 ### 5.4 对话运行时与护栏

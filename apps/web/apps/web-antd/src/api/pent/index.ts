@@ -40,6 +40,11 @@ export interface PentAgentSession {
   };
   status: string;
   active_run_id?: string;
+  requested_role_id?: string;
+  resolved_role_icon?: string;
+  resolved_role_id: string;
+  resolved_role_name: string;
+  role_source: 'fallback' | 'platform_default' | 'project' | 'session' | 'tenant_default';
   created_at: string;
 }
 
@@ -59,6 +64,7 @@ export interface CreatePentSessionInput {
   targets: string[];
   constraints: Record<string, any>;
   budget: Record<string, any>;
+  role_id?: string;
 }
 
 export function getPentProjects() { return requestClient.get('/pent/projects'); }
@@ -220,4 +226,9 @@ export function sendPentRunInstruction(
 }
 export function updatePentSessionModel(id: string, modelId: number) {
   return requestClient.put(`/pent/sessions/${id}/model`, { model_id: modelId });
+}
+export function updatePentSessionRole(id: string, roleId?: string) {
+  return requestClient.put<PentAgentSession>(`/pent/sessions/${id}/role`, {
+    role_id: roleId || null,
+  });
 }

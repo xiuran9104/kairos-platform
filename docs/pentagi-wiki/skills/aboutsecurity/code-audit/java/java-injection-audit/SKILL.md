@@ -1,12 +1,12 @@
 ---
 name: java-injection-audit
 description: |
-risk: safe
-requires-explicit-authorization: false
   Java 源码注入类漏洞审计。当在 Java 白盒审计中需要检测注入类漏洞时触发。
   覆盖 6 种注入: SQL 注入(JDBC/MyBatis/Hibernate/JPA)、命令注入(Runtime.exec/ProcessBuilder)、
   SSRF(HttpURLConnection/OkHttp/RestTemplate)、LDAP 注入、SpEL/OGNL 表达式注入、NoSQL 注入(MongoDB)。
   需要 java-audit-pipeline 提供的数据流证据(EVID_*)作为审计输入。
+risk: safe
+requires-explicit-authorization: false
 metadata:
   tags: java injection, sql injection, command injection, ssrf, spel, ognl, ldap injection, mybatis, hibernate, jpa, nosql, 注入审计, java source audit
   category: code-audit
