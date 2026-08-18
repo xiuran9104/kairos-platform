@@ -94,7 +94,18 @@ const creating = ref(false);
 const createForm = ref({ objective: '', project_id: undefined as string | undefined, role_id: '', targetsText: '' });
 
 function openCreate() {
-  createForm.value = { objective: '', project_id: undefined, role_id: '', targetsText: '' };
+  // 左侧已按项目筛选（或从项目页带 ?project_id= 跳转）时，自动带入关联项目
+  const presetProjectId =
+    projectFilter.value && projectFilter.value !== '__unbound__'
+      ? projectFilter.value
+      : undefined;
+  createForm.value = {
+    objective: '',
+    project_id: presetProjectId,
+    role_id: '',
+    targetsText: '',
+  };
+  if (presetProjectId) onProjectChange();
   showCreate.value = true;
 }
 
