@@ -1,8 +1,9 @@
 //! NATS message queue integration for Pent Agent.
 //!
-//! Run notifications are advisory and the database remains the source of
-//! truth for run state. Conversation recipe tools additionally use an
-//! explicit request/reply subject so security binaries only run in pent-agent.
+//! Gateway owns Run state and consumes NATS notifications as the primary
+//! dispatch signal. PostgreSQL leases provide multi-Gateway exclusion and
+//! recovery only. Security binaries execute in database-less pent-agent nodes
+//! through explicit request/reply subjects.
 //!
 //! ## Queue tiers
 //!
@@ -92,7 +93,21 @@ impl NatsEventBus {
     pub fn handle(&self) -> NatsHandle {
         NatsHandle {
             client: self.client.clone(),
+            control_pool: None,
         }
+    }
+
+    /// Build a Gateway-side handle that resolves credentials and owns all
+    /// execution audit persistence. Workers must use [`Self::handle`].
+    pub fn control_handle(&self, pool: kairos_platform_framework_database::PgPool) -> NatsHandle {
+        NatsHandle {
+            client: self.client.clone(),
+            control_pool: Some(pool),
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.client.is_some()
     }
 
     /// Publish a notification to a subject. Fire-and-forget; callers must
@@ -128,6 +143,7 @@ impl NatsEventBus {
 #[derive(Clone)]
 pub struct NatsHandle {
     client: Option<Client>,
+    control_pool: Option<kairos_platform_framework_database::PgPool>,
 }
 
 impl NatsHandle {
@@ -140,6 +156,17 @@ impl NatsHandle {
                 tracing::warn!(subject, %error, "NATS publish failed (via handle)");
             }
         }
+    }
+
+    pub async fn publish_checked(&self, subject: &str, payload: &[u8]) -> Result<(), String> {
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| "NATS 未连接".to_string())?;
+        client
+            .publish(subject.to_string(), payload.to_vec().into())
+            .await
+            .map_err(|error| format!("NATS publish failed: {error}"))
     }
 
     pub fn is_connected(&self) -> bool {
@@ -178,20 +205,32 @@ impl NatsHandle {
             .client
             .clone()
             .ok_or_else(|| "pent-agent 执行通道不可用（NATS 未连接）".to_string())?;
-        let payload = serde_json::to_vec(request)
+        let outbound = self.prepare_tool_execution_request(request).await?;
+        let payload = serde_json::to_vec(&outbound)
             .map_err(|error| format!("工具执行请求序列化失败: {error}"))?;
         let privileged = requires_privileged_worker(&request.tool_name);
-        let execute_subject = if privileged {
-            subjects::PRIVILEGED_TOOL_EXECUTE
-        } else {
-            subjects::CONVERSATION_TOOL_EXECUTE
-        };
-        let ping_subject = if privileged {
-            subjects::PRIVILEGED_TOOL_WORKER_PING
-        } else {
-            subjects::TOOL_WORKER_PING
-        };
-        self.probe_tool_worker(ping_subject).await?;
+        let execute_subject = subjects::tool_execute(&request.tool_name, privileged);
+        let ping_subject = subjects::tool_worker_ping(&request.tool_name, privileged);
+        if let Err(error) = self.probe_tool_worker(&ping_subject).await {
+            let alternatives = match &self.control_pool {
+                Some(pool) => healthy_tool_alternatives(pool, &request.tool_name)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            return Err(if alternatives.is_empty() {
+                format!(
+                    "{error}；工具 {} 当前没有具备该能力的在线节点",
+                    request.tool_name
+                )
+            } else {
+                format!(
+                    "{error}；工具 {} 不可用，可改用: {}",
+                    request.tool_name,
+                    alternatives.join(", ")
+                )
+            });
+        }
         let inbox = client.new_inbox();
         let mut replies = client
             .subscribe(inbox.clone())
@@ -202,11 +241,7 @@ impl NatsHandle {
             .await
             .map_err(|error| format!("工具执行心跳订阅失败: {error}"))?;
         client
-            .publish_with_reply(
-                execute_subject.to_string(),
-                inbox,
-                payload.into(),
-            )
+            .publish_with_reply(execute_subject, inbox, payload.into())
             .await
             .map_err(|error| format!("工具执行请求发送失败: {error}"))?;
         let cancel_subject = subjects::tool_cancel(&request.execution_id);
@@ -243,8 +278,56 @@ impl NatsHandle {
             }
         };
         cancellation.disarm();
-        serde_json::from_slice(&message.payload)
-            .map_err(|error| format!("工具执行响应解析失败: {error}"))
+        let response: RemoteToolExecutionResponse = serde_json::from_slice(&message.payload)
+            .map_err(|error| format!("工具执行响应解析失败: {error}"))?;
+        if let Some(pool) = &self.control_pool {
+            persist_control_plane_tool_result(pool, request, &response).await?;
+        }
+        Ok(response)
+    }
+
+    async fn prepare_tool_execution_request(
+        &self,
+        request: &RemoteToolExecutionRequest,
+    ) -> Result<RemoteToolExecutionRequest, String> {
+        let mut outbound = request.clone();
+        let expected_provider = outbound
+            .arguments
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let credential_required = crate::infrastructure::recipe::lookup(&outbound.tool_name)
+            .is_some_and(|recipe| {
+                recipe.parameters.iter().any(|parameter| {
+                    parameter.runtime_only
+                        && parameter.required
+                        && parameter.name == "_credential_ref"
+                })
+            });
+        let credential_ref = outbound
+            .arguments
+            .as_object_mut()
+            .and_then(|object| object.remove("_credential_ref"))
+            .and_then(|value| value.as_str().map(str::to_owned));
+        if credential_required && credential_ref.is_none() {
+            return Err("工具要求租户绑定的 _credential_ref".into());
+        }
+        if let Some(reference) = credential_ref {
+            let pool = self.control_pool.as_ref().ok_or_else(|| {
+                "执行节点不得解析数据库凭据；请求必须由 Gateway 控制面发起".to_string()
+            })?;
+            let environment = crate::infrastructure::cloud_credentials::resolve_for_execution(
+                pool,
+                &reference,
+                &outbound.tool_name,
+                expected_provider.as_deref(),
+                outbound.run_id.as_deref(),
+                &outbound.session_id,
+            )
+            .await?;
+            outbound.secret_environment = RemoteSecretEnvironment::new(environment.to_vec());
+        }
+        Ok(outbound)
     }
 
     async fn probe_tool_worker(&self, ping_subject: &str) -> Result<(), String> {
@@ -258,11 +341,7 @@ impl NatsHandle {
             .await
             .map_err(|error| format!("pent-agent 探测订阅失败: {error}"))?;
         client
-            .publish_with_reply(
-                ping_subject.to_string(),
-                inbox,
-                Vec::new().into(),
-            )
+            .publish_with_reply(ping_subject.to_string(), inbox, Vec::new().into())
             .await
             .map_err(|error| format!("pent-agent 探测请求失败: {error}"))?;
         tokio::time::timeout(
@@ -274,6 +353,39 @@ impl NatsHandle {
         .ok_or_else(|| "pent-agent 探测响应通道已关闭".to_string())?;
         Ok(())
     }
+}
+
+async fn healthy_tool_alternatives(
+    pool: &kairos_platform_framework_database::PgPool,
+    tool_name: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH requested AS (
+             SELECT capabilities FROM pent_tool_definitions
+             WHERE tool_id=$1 AND lifecycle_status='active'
+             ORDER BY version DESC LIMIT 1
+         )
+         SELECT DISTINCT candidate.tool_id
+         FROM pent_tool_definitions candidate
+         JOIN pent_tool_health health ON health.tool_id=candidate.tool_id
+         JOIN pent_workers worker ON worker.worker_id=health.worker_id
+         CROSS JOIN requested
+         WHERE candidate.tool_id<>$1
+           AND candidate.lifecycle_status='active'
+           AND health.status='healthy'
+           AND health.checked_at>now()-interval '30 seconds'
+           AND worker.status='active'
+           AND worker.last_heartbeat>now()-interval '30 seconds'
+           AND EXISTS (
+               SELECT 1
+               FROM jsonb_array_elements_text(candidate.capabilities) c(value)
+               WHERE requested.capabilities ? c.value
+           )
+         ORDER BY candidate.tool_id LIMIT 5",
+    )
+    .bind(tool_name)
+    .fetch_all(pool)
+    .await
 }
 
 /// Tools in this deliberately small allowlist are dispatched only to a worker
@@ -307,6 +419,15 @@ pub struct TerminalResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TerminalAuditEvent {
+    session_id: String,
+    actor: String,
+    tenant_id: i64,
+    event: String,
+    input_metadata: Option<serde_json::Value>,
+}
+
 impl TerminalResponse {
     fn error(error: impl Into<String>) -> Self {
         Self {
@@ -316,6 +437,32 @@ impl TerminalResponse {
             closed: true,
             error: Some(error.into()),
         }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct RemoteSecretEnvironment(Vec<(String, String)>);
+
+impl RemoteSecretEnvironment {
+    fn new(values: Vec<(String, String)>) -> Self {
+        Self(values)
+    }
+
+    fn into_secret_environment(self) -> kairos_platform_pent_tooling::backend::SecretEnvironment {
+        kairos_platform_pent_tooling::backend::SecretEnvironment::new(self.0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for RemoteSecretEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteSecretEnvironment")
+            .field("variable_count", &self.0.len())
+            .finish()
     }
 }
 
@@ -332,6 +479,10 @@ pub struct RemoteToolExecutionRequest {
     #[serde(default)]
     pub traffic_run_id: Option<String>,
     pub timeout_seconds: u64,
+    /// Ephemeral values resolved by Gateway and consumed only by the sandbox.
+    /// Debug output is redacted by the wrapper type.
+    #[serde(default)]
+    pub secret_environment: RemoteSecretEnvironment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +498,207 @@ pub struct RemoteToolOutput {
     pub exit_code: i32,
     pub duration_ms: u64,
     pub audit: kairos_platform_pent_tooling::backend::ExecutionAudit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigSnapshot {
+    pub recipes: Vec<crate::infrastructure::recipe::RuntimeRecipeDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerToolStatus {
+    pub tool_ids: Vec<String>,
+    pub installed: bool,
+    pub binary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerHeartbeat {
+    pub worker_id: String,
+    pub capacity: i32,
+    pub profile: String,
+    pub tools: Vec<WorkerToolStatus>,
+}
+
+/// Start capability heartbeats on a database-less execution node.
+pub fn spawn_worker_heartbeat(bus: NatsHandle, worker_id: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval_seconds = std::env::var("PENTA_WORKER_HEARTBEAT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10)
+            .clamp(5, 60);
+        let capacity = std::env::var("PENTA_WORKER_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(1)
+            .clamp(1, 100);
+        let profile = std::env::var("PENTA_WORKER_PROFILE").unwrap_or_else(|_| "standard".into());
+        let privileged_profile = profile.eq_ignore_ascii_case("privileged");
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+        loop {
+            interval.tick().await;
+            let tools = worker_tool_inventory(privileged_profile, false).await;
+            let heartbeat = WorkerHeartbeat {
+                worker_id: worker_id.clone(),
+                capacity,
+                profile: profile.clone(),
+                tools,
+            };
+            let payload = match serde_json::to_vec(&heartbeat) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(%error, "序列化执行节点心跳失败");
+                    continue;
+                }
+            };
+            if let Err(error) = bus
+                .publish_checked(subjects::WORKER_HEARTBEAT, &payload)
+                .await
+            {
+                tracing::warn!(%error, worker_id, "发送执行节点心跳失败");
+            }
+        }
+    })
+}
+
+pub async fn spawn_worker_heartbeat_persistence(
+    bus: &NatsEventBus,
+    pool: kairos_platform_framework_database::PgPool,
+) -> Result<(), String> {
+    let mut heartbeats = bus.subscribe(subjects::WORKER_HEARTBEAT).await?;
+    tokio::spawn(async move {
+        while let Some(payload) = heartbeats.next().await {
+            let heartbeat: WorkerHeartbeat = match serde_json::from_slice(&payload) {
+                Ok(heartbeat) => heartbeat,
+                Err(error) => {
+                    tracing::warn!(%error, "忽略无效执行节点心跳");
+                    continue;
+                }
+            };
+            if let Err(error) = persist_worker_heartbeat(&pool, &heartbeat).await {
+                tracing::warn!(%error, worker_id=%heartbeat.worker_id, "执行节点心跳持久化失败");
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn persist_worker_heartbeat(
+    pool: &kairos_platform_framework_database::PgPool,
+    heartbeat: &WorkerHeartbeat,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    let healthy_count = heartbeat.tools.iter().filter(|tool| tool.installed).count();
+    sqlx::query(
+        "INSERT INTO pent_workers(
+             worker_id,capacity,status,last_heartbeat,registered_at,
+             sandbox_backend,sandbox_ready,sandbox_detail
+         ) VALUES($1,$2,'active',now(),now(),'bubblewrap',true,$3)
+         ON CONFLICT(worker_id) DO UPDATE SET
+             capacity=EXCLUDED.capacity,status='active',last_heartbeat=now(),
+             sandbox_backend=EXCLUDED.sandbox_backend,sandbox_ready=true,
+             sandbox_detail=EXCLUDED.sandbox_detail",
+    )
+    .bind(&heartbeat.worker_id)
+    .bind(heartbeat.capacity)
+    .bind(serde_json::json!({
+        "profile": heartbeat.profile,
+        "healthy_tools": healthy_count,
+        "reported_tools": heartbeat.tools.len(),
+        "database_access": false,
+        "mount_namespace": true,
+        "pid_namespace": true,
+        "user_namespace": true,
+        "capabilities_dropped": true,
+        "seccomp": true
+    }))
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| error.to_string())?;
+    for tool in &heartbeat.tools {
+        sqlx::query(
+            "INSERT INTO pent_tool_health(tool_id,version,worker_id,status,detail,checked_at)
+             SELECT tool_id,version,$2,$3,$4,now()
+             FROM pent_tool_definitions
+             WHERE tool_id = ANY($1)
+             ON CONFLICT(tool_id,version,worker_id) DO UPDATE SET
+                 status=EXCLUDED.status,detail=EXCLUDED.detail,checked_at=now()",
+        )
+        .bind(&tool.tool_ids)
+        .bind(&heartbeat.worker_id)
+        .bind(if tool.installed {
+            "healthy"
+        } else {
+            "unhealthy"
+        })
+        .bind(serde_json::json!({
+            "binary": tool.binary,
+            "source": "agent-heartbeat"
+        }))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().await.map_err(|error| error.to_string())
+}
+
+pub async fn spawn_agent_config_responder(
+    bus: &NatsEventBus,
+    pool: kairos_platform_framework_database::PgPool,
+) -> Result<(), String> {
+    let Some(client) = bus.client.clone() else {
+        return Err("NATS 未连接，无法启动执行节点配置服务".into());
+    };
+    let mut requests = client
+        .queue_subscribe(
+            subjects::AGENT_CONFIG_REQUEST.to_string(),
+            "penta-agent-config-providers".to_string(),
+        )
+        .await
+        .map_err(|error| format!("订阅执行节点配置请求失败: {error}"))?;
+    tokio::spawn(async move {
+        while let Some(message) = requests.next().await {
+            let Some(reply) = message.reply else { continue };
+            let snapshot = match crate::infrastructure::recipe::snapshot_from_db(&pool).await {
+                Ok(recipes) => AgentConfigSnapshot { recipes },
+                Err(error) => {
+                    tracing::warn!(%error, "读取执行节点配置失败");
+                    continue;
+                }
+            };
+            match serde_json::to_vec(&snapshot) {
+                Ok(payload) => {
+                    if let Err(error) = client.publish(reply, payload.into()).await {
+                        tracing::warn!(%error, "发送执行节点配置失败");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "序列化执行节点配置失败"),
+            }
+        }
+    });
+    Ok(())
+}
+
+impl NatsHandle {
+    pub async fn request_agent_config(&self) -> Result<AgentConfigSnapshot, String> {
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| "执行节点配置通道不可用（NATS 未连接）".to_string())?;
+        let message = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.request(
+                subjects::AGENT_CONFIG_REQUEST.to_string(),
+                Vec::new().into(),
+            ),
+        )
+        .await
+        .map_err(|_| "等待 Gateway 执行节点配置超时".to_string())?
+        .map_err(|error| format!("请求 Gateway 执行节点配置失败: {error}"))?;
+        serde_json::from_slice(&message.payload)
+            .map_err(|error| format!("解析 Gateway 执行节点配置失败: {error}"))
+    }
 }
 
 static CONVERSATION_TOOL_BUS: OnceLock<NatsHandle> = OnceLock::new();
@@ -366,46 +718,54 @@ pub fn conversation_tool_bus() -> Option<NatsHandle> {
 
 /// Start the queue-group responder hosted by pent-agent. Queue subscription
 /// guarantees that exactly one worker handles each conversation tool call.
-pub async fn spawn_conversation_tool_responder(
-    bus: &NatsEventBus,
-    pool: kairos_platform_framework_database::PgPool,
-) -> Result<(), String> {
+pub async fn spawn_conversation_tool_responder(bus: &NatsEventBus) -> Result<(), String> {
     let Some(client) = bus.client.clone() else {
         return Err("NATS 未连接，无法启动对话工具执行器".into());
     };
     let privileged_profile = std::env::var("PENTA_WORKER_PROFILE")
         .is_ok_and(|value| value.eq_ignore_ascii_case("privileged"));
-    let (execute_subject, ping_subject, queue_group) = if privileged_profile {
-        (
-            subjects::PRIVILEGED_TOOL_EXECUTE,
-            subjects::PRIVILEGED_TOOL_WORKER_PING,
-            "penta-privileged-tool-workers",
-        )
+    let queue_group = if privileged_profile {
+        "penta-privileged-tool-workers"
     } else {
-        (
-            subjects::CONVERSATION_TOOL_EXECUTE,
-            subjects::TOOL_WORKER_PING,
-            "penta-tool-workers",
-        )
+        "penta-tool-workers"
     };
     tracing::info!(
-        worker_profile = if privileged_profile { "privileged" } else { "standard" },
+        worker_profile = if privileged_profile {
+            "privileged"
+        } else {
+            "standard"
+        },
         "pent-agent 工具执行 worker profile 已启用"
     );
-    let mut requests = client
-        .queue_subscribe(
-            execute_subject.to_string(),
-            queue_group.to_string(),
-        )
-        .await
-        .map_err(|error| format!("订阅对话工具执行队列失败: {error}"))?;
-    let mut probes = client
-        .queue_subscribe(
-            ping_subject.to_string(),
-            queue_group.to_string(),
-        )
-        .await
-        .map_err(|error| format!("订阅对话工具探测队列失败: {error}"))?;
+    let available_tools = available_remote_tools(privileged_profile).await;
+    if available_tools.is_empty() {
+        return Err("当前 pent-agent 没有可执行的已注册工具".into());
+    }
+    tracing::info!(tools=?available_tools, "pent-agent capability routes registered");
+    let mut request_subscriptions = Vec::with_capacity(available_tools.len());
+    let mut probe_subscriptions = Vec::with_capacity(available_tools.len());
+    for tool_name in &available_tools {
+        request_subscriptions.push(
+            client
+                .queue_subscribe(
+                    subjects::tool_execute(tool_name, privileged_profile),
+                    queue_group.to_string(),
+                )
+                .await
+                .map_err(|error| format!("订阅 {tool_name} 执行队列失败: {error}"))?,
+        );
+        probe_subscriptions.push(
+            client
+                .queue_subscribe(
+                    subjects::tool_worker_ping(tool_name, privileged_profile),
+                    queue_group.to_string(),
+                )
+                .await
+                .map_err(|error| format!("订阅 {tool_name} 探测队列失败: {error}"))?,
+        );
+    }
+    let mut requests = futures_util::stream::select_all(request_subscriptions);
+    let mut probes = futures_util::stream::select_all(probe_subscriptions);
     let probe_client = client.clone();
     tokio::spawn(async move {
         while let Some(message) = probes.next().await {
@@ -423,11 +783,9 @@ pub async fn spawn_conversation_tool_responder(
                 continue;
             };
             let response_client = client.clone();
-            let response_pool = pool.clone();
             tokio::spawn(async move {
                 let response =
-                    execute_remote_tool_request(&response_client, &response_pool, &message.payload)
-                        .await;
+                    execute_remote_tool_request(&response_client, &message.payload).await;
                 let payload = serde_json::to_vec(&response).unwrap_or_else(|_| {
                     br#"{"output":null,"error":"response serialization failed"}"#.to_vec()
                 });
@@ -440,6 +798,87 @@ pub async fn spawn_conversation_tool_responder(
     Ok(())
 }
 
+async fn available_remote_tools(privileged_profile: bool) -> Vec<String> {
+    worker_tool_inventory(privileged_profile, true)
+        .await
+        .into_iter()
+        .filter(|tool| tool.installed)
+        .filter_map(|tool| tool.tool_ids.into_iter().next())
+        .collect()
+}
+
+/// Build the exact capability inventory for this worker profile. This uses
+/// executable recipes (rather than the broader lifecycle catalog) so a
+/// healthy heartbeat always corresponds to a NATS route the worker can own.
+async fn worker_tool_inventory(
+    privileged_profile: bool,
+    allow_auto_install: bool,
+) -> Vec<WorkerToolStatus> {
+    let mut candidates = crate::infrastructure::recipe::executable_recipes();
+    if !privileged_profile {
+        candidates.push((
+            "http_request".into(),
+            crate::infrastructure::recipe::ExecutableRecipe {
+                program: "/usr/bin/curl",
+                args: Vec::new(),
+                target_position: Default::default(),
+                normalize_target: Default::default(),
+                target_type: crate::infrastructure::recipe::TargetType::Network,
+                parameters: Vec::new(),
+                resource_profile: Default::default(),
+            },
+        ));
+    }
+    let auto_install = allow_auto_install && crate::infrastructure::process::auto_install_enabled();
+    let mut inventory = Vec::new();
+    for (tool_name, recipe) in candidates {
+        if requires_privileged_worker(&tool_name) != privileged_profile {
+            continue;
+        }
+        let (installed, binary) =
+            if let Some(lifecycle) = crate::infrastructure::tool_lifecycle::find(&tool_name) {
+                if lifecycle.is_installed().await {
+                    (
+                        true,
+                        lifecycle
+                            .resolved_binary_path()
+                            .map(|path| path.to_string_lossy().into_owned()),
+                    )
+                } else if auto_install {
+                    let installed = lifecycle.ensure_available().await.is_ok();
+                    (
+                        installed,
+                        lifecycle
+                            .resolved_binary_path()
+                            .map(|path| path.to_string_lossy().into_owned()),
+                    )
+                } else {
+                    (false, None)
+                }
+            } else {
+                let installed = std::path::Path::new(recipe.program).exists();
+                installed
+                    .then(|| recipe.program.to_string())
+                    .map_or((false, None), |binary| (true, Some(binary)))
+            };
+        if !installed && allow_auto_install {
+            tracing::warn!(
+                tool_name,
+                program = recipe.program,
+                "capability route disabled: binary missing"
+            );
+        }
+        inventory.push(WorkerToolStatus {
+            tool_ids: vec![tool_name],
+            installed,
+            binary,
+        });
+    }
+    inventory.sort_by(|left, right| left.tool_ids.cmp(&right.tool_ids));
+    inventory.dedup_by(|left, right| left.tool_ids == right.tool_ids);
+    inventory
+}
+
 #[derive(Default)]
 struct TerminalOutputBuffer {
     sequence: u64,
@@ -449,10 +888,7 @@ struct TerminalOutputBuffer {
 /// Start the pent-agent-owned interactive terminal responder. Creation is
 /// load-balanced; every created session then receives a unique NATS subject
 /// subscribed only by the worker that owns its sandbox process.
-pub async fn spawn_terminal_responder(
-    bus: &NatsEventBus,
-    pool: kairos_platform_framework_database::PgPool,
-) -> Result<(), String> {
+pub async fn spawn_terminal_responder(bus: &NatsEventBus) -> Result<(), String> {
     let Some(client) = bus.client.clone() else {
         return Err("NATS 未连接，无法启动受治理终端执行器".into());
     };
@@ -467,13 +903,11 @@ pub async fn spawn_terminal_responder(
         while let Some(message) = creates.next().await {
             let Some(reply) = message.reply else { continue };
             let response_client = client.clone();
-            let response_pool = pool.clone();
             tokio::spawn(async move {
                 let request: Result<TerminalRequest, _> = serde_json::from_slice(&message.payload);
                 let response = match request {
                     Ok(request) if request.action == "create" => {
-                        create_terminal_session(response_client.clone(), response_pool, request)
-                            .await
+                        create_terminal_session(response_client.clone(), request).await
                     }
                     Ok(_) => TerminalResponse::error("终端创建请求 action 无效"),
                     Err(error) => TerminalResponse::error(format!("终端创建请求无效: {error}")),
@@ -488,7 +922,6 @@ pub async fn spawn_terminal_responder(
 
 async fn create_terminal_session(
     client: Client,
-    pool: kairos_platform_framework_database::PgPool,
     create_request: TerminalRequest,
 ) -> TerminalResponse {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -549,7 +982,7 @@ async fn create_terminal_session(
     let actor = create_request.actor.unwrap_or_else(|| "unknown".into());
     let tenant_id = create_request.tenant_id.unwrap_or(0);
     if let Err(error) =
-        persist_terminal_audit(&pool, &session_id, &actor, tenant_id, "created", None).await
+        publish_terminal_audit(&client, &session_id, &actor, tenant_id, "created", None).await
     {
         let _ = sandbox.child.kill().await;
         return TerminalResponse::error(error);
@@ -561,7 +994,7 @@ async fn create_terminal_session(
             tokio::select! {
                 _ = &mut expires => {
                     let _ = sandbox.child.kill().await;
-                    if let Err(error) = persist_terminal_audit(&pool, &session_id, &actor, tenant_id, "expired", None).await {
+                    if let Err(error) = publish_terminal_audit(&client, &session_id, &actor, tenant_id, "expired", None).await {
                         tracing::warn!(%error, session_id, "终端超时审计写入失败");
                     }
                     break;
@@ -585,7 +1018,7 @@ async fn create_terminal_session(
                             let data = request.data.unwrap_or_default();
                             if data.len() > 64 * 1024 {
                                 response = TerminalResponse::error("单次终端输入超过 64 KiB");
-                            } else if let Err(error) = persist_terminal_audit(&pool, &session_id, &actor, tenant_id, "input", Some(&data)).await {
+                            } else if let Err(error) = publish_terminal_audit(&client, &session_id, &actor, tenant_id, "input", Some(&data)).await {
                                 response = TerminalResponse::error(error);
                             } else if let Err(error) = input.write_all(data.as_bytes()).await {
                                 response = TerminalResponse::error(format!("写入终端失败: {error}"));
@@ -602,7 +1035,7 @@ async fn create_terminal_session(
                         }
                         Ok(request) if request.action == "close" => {
                             let _ = sandbox.child.kill().await;
-                            if let Err(error) = persist_terminal_audit(&pool, &session_id, &actor, tenant_id, "closed", None).await {
+                            if let Err(error) = publish_terminal_audit(&client, &session_id, &actor, tenant_id, "closed", None).await {
                                 tracing::warn!(%error, session_id, "终端关闭审计写入失败");
                                 response.error = Some(error);
                             }
@@ -628,19 +1061,64 @@ async fn create_terminal_session(
     }
 }
 
-async fn persist_terminal_audit(
-    pool: &kairos_platform_framework_database::PgPool,
+async fn publish_terminal_audit(
+    client: &Client,
     session_id: &str,
     actor: &str,
     tenant_id: i64,
     event: &str,
     input: Option<&str>,
 ) -> Result<(), String> {
-    let input_metadata = input.map(terminal_input_metadata);
+    let payload = serde_json::to_vec(&TerminalAuditEvent {
+        session_id: session_id.to_owned(),
+        actor: actor.to_owned(),
+        tenant_id,
+        event: event.to_owned(),
+        input_metadata: input.map(terminal_input_metadata),
+    })
+    .map_err(|error| format!("序列化终端审计失败: {error}"))?;
+    client
+        .publish(subjects::TERMINAL_AUDIT.to_string(), payload.into())
+        .await
+        .map_err(|error| format!("发送终端审计失败: {error}"))
+}
+
+pub async fn spawn_terminal_audit_persistence(
+    bus: &NatsEventBus,
+    pool: kairos_platform_framework_database::PgPool,
+) -> Result<(), String> {
+    let Some(client) = bus.client.clone() else {
+        return Err("NATS 未连接，无法启动终端审计持久化".into());
+    };
+    let mut events = client
+        .subscribe(subjects::TERMINAL_AUDIT.to_string())
+        .await
+        .map_err(|error| format!("订阅终端审计失败: {error}"))?;
+    tokio::spawn(async move {
+        while let Some(message) = events.next().await {
+            let event: TerminalAuditEvent = match serde_json::from_slice(&message.payload) {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::warn!(%error, "忽略无效终端审计事件");
+                    continue;
+                }
+            };
+            if let Err(error) = persist_terminal_audit_event(&pool, &event).await {
+                tracing::warn!(%error, session_id=%event.session_id, "终端审计持久化失败");
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn persist_terminal_audit_event(
+    pool: &kairos_platform_framework_database::PgPool,
+    event: &TerminalAuditEvent,
+) -> Result<(), String> {
     let extra = serde_json::json!({
-        "session_id": session_id,
-        "event": event,
-        "input": input_metadata,
+        "session_id": event.session_id,
+        "event": event.event,
+        "input": event.input_metadata,
         "network_policy": "none",
         "backend": "bubblewrap"
     })
@@ -652,12 +1130,12 @@ async fn persist_terminal_audit(
          ) VALUES(nextval('system_operate_log_seq'),$1,0,0,'pent_terminal',$2,0,$3,true,
                   $4,'NATS','penta.terminal',$5,$5,$6)",
     )
-    .bind(session_id)
-    .bind(event)
-    .bind(format!("terminal.{event}"))
+    .bind(&event.session_id)
+    .bind(&event.event)
+    .bind(format!("terminal.{}", event.event))
     .bind(extra)
-    .bind(actor.chars().take(64).collect::<String>())
-    .bind(tenant_id)
+    .bind(event.actor.chars().take(64).collect::<String>())
+    .bind(event.tenant_id)
     .execute(pool)
     .await
     .map_err(|error| format!("持久化终端审计失败: {error}"))?;
@@ -673,7 +1151,6 @@ fn terminal_input_metadata(value: &str) -> serde_json::Value {
 
 async fn execute_remote_tool_request(
     client: &Client,
-    pool: &kairos_platform_framework_database::PgPool,
     payload: &[u8],
 ) -> RemoteToolExecutionResponse {
     let request: RemoteToolExecutionRequest = match serde_json::from_slice(payload) {
@@ -736,48 +1213,19 @@ async fn execute_remote_tool_request(
         };
     }
     let mut arguments = request.arguments;
-    let expected_provider = arguments
-        .get("provider")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
     let credential_required = crate::infrastructure::recipe::lookup(&request.tool_name)
         .is_some_and(|recipe| {
             recipe.parameters.iter().any(|parameter| {
                 parameter.runtime_only && parameter.required && parameter.name == "_credential_ref"
             })
         });
-    let credential_ref = arguments
-        .as_object_mut()
-        .and_then(|object| object.remove("_credential_ref"))
-        .and_then(|value| value.as_str().map(str::to_owned));
-    if credential_required && credential_ref.is_none() {
+    if credential_required && request.secret_environment.is_empty() {
         return RemoteToolExecutionResponse {
             output: None,
-            error: Some("工具要求租户绑定的 _credential_ref".into()),
+            error: Some("Gateway 未提供工具所需的临时凭据环境".into()),
         };
     }
-    let secret_environment = match credential_ref {
-        Some(reference) => match crate::infrastructure::cloud_credentials::resolve_for_execution(
-            pool,
-            &reference,
-            &request.tool_name,
-            expected_provider.as_deref(),
-            request.run_id.as_deref(),
-            &request.session_id,
-        )
-        .await
-        {
-            Ok(environment) => environment,
-            Err(error) => {
-                return RemoteToolExecutionResponse {
-                    output: None,
-                    error: Some(error),
-                };
-            }
-        },
-        None => Default::default(),
-    };
-    let artifact_run_id = request.run_id.clone();
+    let secret_environment = request.secret_environment.into_secret_environment();
     let http_request = if request.tool_name == "http_request" {
         match prepare_remote_http_request(&request.session_id, &mut arguments).await {
             Ok(prepared) => Some(prepared),
@@ -848,83 +1296,58 @@ async fn execute_remote_tool_request(
                 duration_ms: output.duration_ms,
                 audit: output.audit,
             };
-            if let Some(run_id) = artifact_run_id.as_deref()
-                && let Err(error) = persist_remote_tool_call(
-                    pool,
-                    run_id,
-                    &request.execution_id,
-                    &request.tool_name,
-                    &arguments,
-                    &output,
-                )
-                .await
-            {
-                return RemoteToolExecutionResponse {
-                    output: None,
-                    error: Some(format!("持久化工具执行审计失败: {error}")),
-                };
-            }
-            if let Some(run_id) = artifact_run_id.filter(|run_id| valid_execution_id(run_id)) {
-                let artifact_pool = pool.clone();
-                let execution_id = request.execution_id.clone();
-                let artifact_output = output.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = persist_execution_artifact(
-                        &artifact_pool,
-                        &run_id,
-                        &execution_id,
-                        &artifact_output,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%error, run_id, "持久化对话工具执行产物失败");
-                    }
-                });
-            }
             RemoteToolExecutionResponse {
                 output: Some(output),
                 error: None,
             }
         }
-        Err(error) => {
-            if let Some(run_id) = artifact_run_id.as_deref()
-                && let Err(persist_error) = persist_remote_tool_failure(
-                    pool,
-                    run_id,
-                    &request.execution_id,
-                    &request.tool_name,
-                    &arguments,
-                    &error,
-                )
-                .await
-            {
-                return RemoteToolExecutionResponse {
-                    output: None,
-                    error: Some(format!("{error}; 持久化工具执行审计失败: {persist_error}")),
-                };
-            }
-            if let Some(run_id) = artifact_run_id.filter(|run_id| valid_execution_id(run_id)) {
-                let artifact_pool = pool.clone();
-                let execution_id = request.execution_id.clone();
-                let tool_name = request.tool_name.clone();
-                let artifact_error = error.clone();
-                tokio::spawn(async move {
-                    let payload =
-                        failure_artifact_payload(&execution_id, &tool_name, &artifact_error);
-                    if let Err(persist_error) =
-                        persist_json_artifact(&artifact_pool, &run_id, &execution_id, &payload)
-                            .await
-                    {
-                        tracing::warn!(%persist_error, run_id, "持久化对话工具失败产物失败");
-                    }
-                });
-            }
-            RemoteToolExecutionResponse {
-                output: None,
-                error: Some(error),
-            }
+        Err(error) => RemoteToolExecutionResponse {
+            output: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn persist_control_plane_tool_result(
+    pool: &kairos_platform_framework_database::PgPool,
+    request: &RemoteToolExecutionRequest,
+    response: &RemoteToolExecutionResponse,
+) -> Result<(), String> {
+    let Some(run_id) = request.run_id.as_deref() else {
+        return Ok(());
+    };
+    if let Some(output) = response.output.as_ref() {
+        persist_remote_tool_call(
+            pool,
+            run_id,
+            &request.execution_id,
+            &request.tool_name,
+            &request.arguments,
+            output,
+        )
+        .await
+        .map_err(|error| format!("持久化工具执行审计失败: {error}"))?;
+        if valid_execution_id(run_id) {
+            persist_execution_artifact(pool, run_id, &request.execution_id, output).await?;
+        }
+    } else if let Some(error) = response.error.as_deref() {
+        persist_remote_tool_failure(
+            pool,
+            run_id,
+            &request.execution_id,
+            &request.tool_name,
+            &request.arguments,
+            error,
+        )
+        .await
+        .map_err(|persist_error| format!("持久化工具执行审计失败: {persist_error}"))?;
+        if valid_execution_id(run_id) {
+            let payload =
+                failure_artifact_payload(&request.execution_id, &request.tool_name, error);
+            persist_json_artifact(pool, run_id, &request.execution_id, &payload).await?;
         }
     }
+    Ok(())
 }
 
 fn remote_tool_policy(
@@ -1224,8 +1647,14 @@ pub mod subjects {
     /// Evidence created (for downstream consumers).
     pub const EVIDENCE_CREATED: &str = "penta.evidence.created";
 
+    /// Captured HTTP exchange emitted by database-less execution nodes.
+    pub const TRAFFIC_CAPTURED: &str = "penta.traffic.captured";
+
     /// Worker heartbeat for liveness monitoring.
     pub const WORKER_HEARTBEAT: &str = "penta.worker.heartbeat";
+
+    /// Gateway-owned desired-state snapshot requested by database-less agents.
+    pub const AGENT_CONFIG_REQUEST: &str = "penta.agent.config.request";
 
     /// Request/reply endpoint for conversation recipe tools. Only pent-agent
     /// workers subscribe to this subject.
@@ -1233,7 +1662,31 @@ pub mod subjects {
     pub const TOOL_WORKER_PING: &str = "penta.tool.worker.ping";
     pub const PRIVILEGED_TOOL_EXECUTE: &str = "penta.tool.privileged.execute";
     pub const PRIVILEGED_TOOL_WORKER_PING: &str = "penta.tool.privileged.worker.ping";
+
+    pub fn tool_execute(tool_name: &str, privileged: bool) -> String {
+        let profile = if privileged { "privileged" } else { "standard" };
+        format!("penta.tool.{profile}.execute.{}", safe_token(tool_name))
+    }
+
+    pub fn tool_worker_ping(tool_name: &str, privileged: bool) -> String {
+        let profile = if privileged { "privileged" } else { "standard" };
+        format!("penta.tool.{profile}.ping.{}", safe_token(tool_name))
+    }
+
+    fn safe_token(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
     pub const TERMINAL_CREATE: &str = "penta.terminal.create";
+    pub const TERMINAL_AUDIT: &str = "penta.terminal.audit";
 
     pub fn tool_cancel(execution_id: &str) -> String {
         format!("penta.tool.cancel.{execution_id}")
@@ -1297,7 +1750,10 @@ mod tests {
     #[test]
     fn builtin_http_request_has_remote_execution_policy() {
         let (target_type, profile) = remote_tool_policy("http_request").expect("builtin policy");
-        assert_eq!(target_type, crate::infrastructure::recipe::TargetType::Network);
+        assert_eq!(
+            target_type,
+            crate::infrastructure::recipe::TargetType::Network
+        );
         assert_eq!(profile.timeout_seconds, 30);
     }
 
@@ -1312,6 +1768,7 @@ mod tests {
             run_id: Some("run-1".into()),
             traffic_run_id: None,
             timeout_seconds: 300,
+            secret_environment: Default::default(),
         };
         let encoded = serde_json::to_vec(&request).unwrap();
         let decoded: RemoteToolExecutionRequest = serde_json::from_slice(&encoded).unwrap();
@@ -1427,7 +1884,10 @@ mod tests {
 
     #[tokio::test]
     async fn disconnected_bus_fails_without_waiting() {
-        let bus = NatsHandle { client: None };
+        let bus = NatsHandle {
+            client: None,
+            control_pool: None,
+        };
         let request = RemoteToolExecutionRequest {
             execution_id: "execution-1".into(),
             tool_name: "nmap".into(),
@@ -1437,6 +1897,7 @@ mod tests {
             run_id: None,
             traffic_run_id: None,
             timeout_seconds: 300,
+            secret_environment: Default::default(),
         };
         let error = bus.request_tool_execution(&request).await.unwrap_err();
         assert!(error.contains("NATS 未连接"));
@@ -1462,6 +1923,7 @@ mod tests {
             run_id: None,
             traffic_run_id: None,
             timeout_seconds: 30,
+            secret_environment: Default::default(),
         };
 
         let response = bus.request_tool_execution(&request).await.unwrap();

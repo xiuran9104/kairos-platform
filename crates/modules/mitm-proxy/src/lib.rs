@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 /// One captured HTTP exchange, ready to persist.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrafficRecord {
     pub method: String,
     pub url: String,

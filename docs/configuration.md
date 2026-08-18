@@ -4,7 +4,7 @@
 
 | 变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | 是 | 无 | PostgreSQL 连接串 |
+| `DATABASE_URL` | Gateway 是；pent-agent 否 | 无 | Gateway PostgreSQL 连接串；不得注入 pent-agent |
 | `DATABASE_MIN_CONNECTIONS` | 否 | `1` | 最小连接数 |
 | `DATABASE_MAX_CONNECTIONS` | 否 | `20` | 最大连接数 |
 | `DATABASE_ACQUIRE_TIMEOUT_SECONDS` | 否 | `5` | 获取连接超时 |
@@ -29,11 +29,14 @@
 | `PENTA_TRAFFIC_PROXY` | 否 | `http://127.0.0.1:8085` | pent-agent 内置 MITM 的本地 IPv4 代理地址 |
 | `PENTA_FORCE_WEB_PROXY` | 否 | `true` | 为 Web 工具启用 ProxyChains 连接拦截；启用时缺少运行库会使 pent-agent 拒绝启动 |
 | `PENTA_PROXYCHAINS_LIBRARY` | 否 | 自动探测 | 自定义 `libproxychains.so.4` 绝对路径 |
+| `PENTA_RUN_RECOVERY_SECONDS` | 否 | `60` | Gateway 的租约/延迟重试恢复周期；正常 Run 由 NATS 事件立即触发 |
+| `PENTA_WORKER_HEARTBEAT_SECONDS` | 否 | `10` | pent-agent 通过 NATS 上报工具能力的周期 |
+| `PENTA_AUTO_INSTALL_TOOLS` | 否 | `true` | 缺失工具是否在 pent-agent 注册能力路由前尝试安装；生产建议预装并设为 `false`，避免延长启动时间 |
 
 ## Pent 本地工具执行
 
 Pent 的主动检测工具统一在 pent-agent 宿主机通过 bubblewrap 执行，不使用 Docker/OCI 工具镜像或容器执行器。
-Run 与对话中的 recipe 工具均由 pent-agent 执行；Gateway 不安装或启动安全工具。没有可用 worker 时，对话调用会在约 2 秒内失败。
+Run 与对话中的 recipe 工具均由 pent-agent 执行；Gateway 不安装或启动安全二进制。节点按已安装的具体工具注册能力路由，没有对应能力时会快速失败并返回可用替代工具。pent-agent 不需要也不允许配置 `DATABASE_URL`。
 Docker Compose 仍只用于 PostgreSQL、Redis、NATS、MinIO、Neo4j、Graphiti、
 headless Chrome 和 mitmproxy 等本地基础设施。
 
@@ -74,7 +77,7 @@ MCP registry 不可用时，会 fallback 到 Chrome DevTools HTTP API 打开页�
 curl -fsS -X PUT 'http://127.0.0.1:9222/json/new?http%3A%2F%2F127.0.0.1%3A5666%2F'
 ```
 
-`PENTA_MCP_SERVERS` 可选，用于显式声明外部 MCP Server。未配置时 pent-agent 会尝试默认的
+`PENTA_MCP_SERVERS` 可选，用于在 Gateway 显式声明外部 MCP Server。未配置时 Gateway 会尝试默认的
 Chrome DevTools MCP；该 MCP 初始化失败不影响 `mcp_navigate_page` 的 HTTP fallback。
 
 ## 前端环境变量

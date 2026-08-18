@@ -69,10 +69,13 @@ In another terminal, start the execution worker. The gateway never executes
 security tools:
 
 ```bash
-export DATABASE_URL='postgres://kairos_platform:kairos_platform@127.0.0.1:5432/kairos_platform'
 export PENTA_WORKER_ID='local-01'
 cargo run -p kairos-platform-pent-agent
 ```
+
+The Pent Agent is database-less. Gateway owns Run coordination, persisted MCP
+configuration, credentials, audits, and traffic metadata; do not provide
+`DATABASE_URL` to `kairos-platform-pent-agent`.
 
 In a second terminal, start the frontend:
 

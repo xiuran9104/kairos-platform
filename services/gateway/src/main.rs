@@ -45,13 +45,55 @@ async fn main() -> anyhow::Result<()> {
         &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
     )
     .await;
-    if let Err(error) =
-        kairos_platform_pent_server::transport::mq::init_conversation_tool_bus(nats_bus.handle())
-    {
+    // The Gateway owns persisted MCP desired state. This also fixes the old
+    // split-process bug where the agent populated a process-local registry
+    // that the Gateway conversation runtime could never see.
+    let mcp_registry = kairos_platform_pent_tooling::mcp::registry::shared().await;
+    kairos_platform_pent_server::spawn_mcp_reconciler(
+        database.clone(),
+        mcp_registry,
+        format!("gateway-mcp-{}", uuid::Uuid::new_v4()),
+    );
+    if let Err(error) = kairos_platform_pent_server::transport::mq::init_conversation_tool_bus(
+        nats_bus.control_handle(database.clone()),
+    ) {
         tracing::warn!(%error, "conversation recipe tools unavailable");
     }
-    let pent_state =
-        kairos_platform_pent_server::PentState::new(database.clone()).with_nats(nats_bus.handle());
+    kairos_platform_pent_server::transport::mq::spawn_agent_config_responder(
+        &nats_bus,
+        database.clone(),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    kairos_platform_pent_server::transport::mq::spawn_terminal_audit_persistence(
+        &nats_bus,
+        database.clone(),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    kairos_platform_pent_server::transport::mq::spawn_worker_heartbeat_persistence(
+        &nats_bus,
+        database.clone(),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    kairos_platform_pent_server::infrastructure::mitm_sink::spawn_traffic_persistence(
+        &nats_bus,
+        database.clone(),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let pent_state = kairos_platform_pent_server::PentState::new(database.clone())
+        .with_nats(nats_bus.control_handle(database.clone()));
+    let pent_config = kairos_platform_pent_server::PentConfig::from_env();
+    kairos_platform_pent_server::start_run_coordinator(
+        database.clone(),
+        format!("gateway-{}", uuid::Uuid::new_v4()),
+        pent_config.lease_ttl_seconds,
+        &nats_bus,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
     system_state.bootstrap().await?;
     // Reconcile conversation projections without stealing live worker Runs.
     match kairos_platform_pent_server::conversation::recovery::recover_conversation_state(&database)

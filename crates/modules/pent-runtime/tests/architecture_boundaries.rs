@@ -101,18 +101,31 @@ fn production_process_roles_do_not_overlap() {
             "start_worker",
             "init_global_executor",
             "PgMcpServerConfigSource",
-            "mcp::registry::shared",
+            "spawn_conversation_tool_responder",
+            "spawn_terminal_responder",
         ],
     );
+    for required in [
+        "start_run_coordinator",
+        "mcp::registry::shared",
+        "spawn_worker_heartbeat_persistence",
+        "spawn_traffic_persistence",
+    ] {
+        assert!(
+            gateway.contains(required),
+            "gateway must initialize {required}"
+        );
+    }
 
     let agent = read("services/pent-agent/src/main.rs");
     for required in [
-        "start_worker",
         "init_global_executor",
-        "spawn_mcp_reconciler",
-        "mcp::registry::shared",
         "verify_bubblewrap",
+        "spawn_conversation_tool_responder",
         "spawn_terminal_responder",
+        "spawn_worker_heartbeat",
+        "request_agent_config",
+        "spawn_mitm_proxy_nats",
     ] {
         assert!(
             agent.contains(required),
@@ -122,7 +135,23 @@ fn production_process_roles_do_not_overlap() {
     assert_absent(
         &agent,
         "pent-agent",
-        &["PentState", "routes(state)", "authenticate_pent"],
+        &[
+            "PentState",
+            "routes(state)",
+            "authenticate_pent",
+            "DatabaseConfig",
+            "DATABASE_URL",
+            "framework_database",
+            "sqlx::",
+            "start_run_coordinator",
+            "spawn_mcp_reconciler",
+        ],
+    );
+    let agent_manifest = read("services/pent-agent/Cargo.toml");
+    assert_absent(
+        &agent_manifest,
+        "pent-agent manifest",
+        &["framework-database", "sqlx"],
     );
 }
 
@@ -177,6 +206,7 @@ fn migrated_server_implementations_do_not_regress() {
         "crates/modules/pent-server/src/tooling/mcp/registry.rs",
         "crates/modules/pent-server/src/conversation/tool_bus.rs",
         "crates/modules/pent-server/src/conversation/checkpoint.rs",
+        "crates/modules/pent-server/src/cognition",
         "crates/modules/pent-server/src/tooling/dispatcher.rs",
         "crates/modules/pent-server/src/tooling/executors/mcp.rs",
         "crates/modules/pent-server/src/tooling/mcp/mod.rs",

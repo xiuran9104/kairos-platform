@@ -652,6 +652,7 @@ pub(crate) async fn execute_workflow_graph(
                                     .map(str::to_owned),
                                 traffic_run_id: None,
                                 timeout_seconds,
+                                secret_environment: Default::default(),
                             };
                             match bus.request_tool_execution(&request).await {
                                 Ok(response)

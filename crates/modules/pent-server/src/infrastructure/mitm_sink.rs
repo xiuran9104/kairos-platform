@@ -19,6 +19,28 @@ pub struct MitmTrafficSink {
     pool: PgPool,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CapturedTrafficRecord {
+    id: String,
+    run_id: String,
+    method: String,
+    url: String,
+    request_headers: serde_json::Value,
+    request_body: Option<String>,
+    request_sha256: Option<String>,
+    request_body_object_key: Option<String>,
+    response_status: Option<i32>,
+    response_headers: serde_json::Value,
+    response_body: Option<String>,
+    response_sha256: Option<String>,
+    response_body_object_key: Option<String>,
+    duration_ms: Option<i64>,
+}
+
+struct NatsTrafficSink {
+    nats: crate::transport::mq::NatsHandle,
+}
+
 impl MitmTrafficSink {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -28,73 +50,115 @@ impl MitmTrafficSink {
 #[async_trait]
 impl TrafficSink for MitmTrafficSink {
     async fn record(&self, record: TrafficRecord) -> anyhow::Result<()> {
-        let Some(run_id) = record.run_id.clone() else {
-            tracing::debug!(url = %record.url, "skipping unattributed MITM traffic");
+        let Some(record) = prepare_record(record).await else {
             return Ok(());
         };
-        let id = uuid::Uuid::new_v4().to_string();
-        let request_sha256 = record
-            .request_body
-            .as_ref()
-            .map(|body| format!("{:x}", Sha256::digest(body.as_bytes())));
-        let response_sha256 = record
-            .response_body
-            .as_ref()
-            .map(|body| format!("{:x}", Sha256::digest(body.as_bytes())));
-        let inline_limit = std::env::var("PENTA_MITM_INLINE_BODY_LIMIT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_INLINE_BODY_LIMIT)
-            .clamp(1024, 16 * 1024 * 1024);
-        let store = crate::infrastructure::object_store::ObjectStore::from_env();
-        let (request_body, request_body_object_key) = persist_large_body(
-            &store,
-            &run_id,
-            &id,
-            "request",
-            record.request_body,
-            inline_limit,
-        )
-        .await;
-        let (response_body, response_body_object_key) = persist_large_body(
-            &store,
-            &run_id,
-            &id,
-            "response",
-            record.response_body,
-            inline_limit,
-        )
-        .await;
+        persist_record(&self.pool, &record).await?;
+        Ok(())
+    }
+}
 
-        sqlx::query(
-            "INSERT INTO pent_http_traffic(
+#[async_trait]
+impl TrafficSink for NatsTrafficSink {
+    async fn record(&self, record: TrafficRecord) -> anyhow::Result<()> {
+        let Some(record) = prepare_record(record).await else {
+            return Ok(());
+        };
+        let payload = serde_json::to_vec(&record)?;
+        self.nats
+            .publish_checked(crate::transport::mq::subjects::TRAFFIC_CAPTURED, &payload)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+async fn prepare_record(record: TrafficRecord) -> Option<CapturedTrafficRecord> {
+    let Some(run_id) = record.run_id.clone() else {
+        tracing::debug!(url = %record.url, "skipping unattributed MITM traffic");
+        return None;
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let request_sha256 = record
+        .request_body
+        .as_ref()
+        .map(|body| format!("{:x}", Sha256::digest(body.as_bytes())));
+    let response_sha256 = record
+        .response_body
+        .as_ref()
+        .map(|body| format!("{:x}", Sha256::digest(body.as_bytes())));
+    let inline_limit = std::env::var("PENTA_MITM_INLINE_BODY_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_INLINE_BODY_LIMIT)
+        // Keep the full NATS envelope below the default 1 MiB max payload.
+        .clamp(1024, 256 * 1024);
+    let store = crate::infrastructure::object_store::ObjectStore::from_env();
+    let (request_body, request_body_object_key) = persist_large_body(
+        &store,
+        &run_id,
+        &id,
+        "request",
+        record.request_body,
+        inline_limit,
+    )
+    .await;
+    let (response_body, response_body_object_key) = persist_large_body(
+        &store,
+        &run_id,
+        &id,
+        "response",
+        record.response_body,
+        inline_limit,
+    )
+    .await;
+    Some(CapturedTrafficRecord {
+        id,
+        run_id,
+        method: record.method,
+        url: record.url,
+        request_headers: record.request_headers,
+        request_body,
+        request_sha256,
+        request_body_object_key,
+        response_status: record.response_status,
+        response_headers: record.response_headers,
+        response_body,
+        response_sha256,
+        response_body_object_key,
+        duration_ms: record.duration_ms,
+    })
+}
+
+async fn persist_record(pool: &PgPool, record: &CapturedTrafficRecord) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO pent_http_traffic(
                  id, run_id, tool_call_id, tool_name, method, url,
                  request_headers, request_body, response_status, response_headers,
                  response_body, response_sha256, duration_ms, replay_of, created_at,
                  request_sha256,request_body_object_key,response_body_object_key
-             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),$15,$16,$17)",
-        )
-        .bind(&id)
-        .bind(&run_id)
-        .bind(Option::<String>::None)
-        .bind("mitm_proxy")
-        .bind(&record.method)
-        .bind(&record.url)
-        .bind(&record.request_headers)
-        .bind(&request_body)
-        .bind(record.response_status)
-        .bind(&record.response_headers)
-        .bind(&response_body)
-        .bind(response_sha256)
-        .bind(record.duration_ms)
-        .bind(Option::<String>::None)
-        .bind(request_sha256)
-        .bind(request_body_object_key)
-        .bind(response_body_object_key)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
+             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),$15,$16,$17)
+             ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(&record.id)
+    .bind(&record.run_id)
+    .bind(Option::<String>::None)
+    .bind("mitm_proxy")
+    .bind(&record.method)
+    .bind(&record.url)
+    .bind(&record.request_headers)
+    .bind(&record.request_body)
+    .bind(record.response_status)
+    .bind(&record.response_headers)
+    .bind(&record.response_body)
+    .bind(&record.response_sha256)
+    .bind(record.duration_ms)
+    .bind(Option::<String>::None)
+    .bind(&record.request_sha256)
+    .bind(&record.request_body_object_key)
+    .bind(&record.response_body_object_key)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn persist_large_body(
@@ -173,6 +237,52 @@ pub fn spawn_mitm_proxy(pool: PgPool) -> Option<tokio::task::JoinHandle<Result<(
     let sink = Arc::new(MitmTrafficSink::new(pool));
     info!(addr = %config.bind_addr, "mitm traffic capture enabled");
     Some(proxy.spawn(sink))
+}
+
+/// Start capture on a database-less execution node. Bodies larger than the
+/// inline bound are written to the object store and only metadata is sent to
+/// Gateway, keeping the NATS envelope bounded without dropping traffic.
+pub fn spawn_mitm_proxy_nats(
+    nats: crate::transport::mq::NatsHandle,
+) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
+    if !traffic_capture_enabled() {
+        return None;
+    }
+    let config = MitmConfig::from_env();
+    let proxy = match MitmProxy::new(config.clone()) {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            warn!(%error, "mitm proxy init failed; traffic capture disabled");
+            return None;
+        }
+    };
+    let sink = Arc::new(NatsTrafficSink { nats });
+    info!(addr = %config.bind_addr, "database-less MITM traffic capture enabled");
+    Some(proxy.spawn(sink))
+}
+
+pub async fn spawn_traffic_persistence(
+    bus: &crate::transport::mq::NatsEventBus,
+    pool: PgPool,
+) -> Result<(), String> {
+    let mut records = bus
+        .subscribe(crate::transport::mq::subjects::TRAFFIC_CAPTURED)
+        .await?;
+    tokio::spawn(async move {
+        while let Some(payload) = records.next().await {
+            let record: CapturedTrafficRecord = match serde_json::from_slice(&payload) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(%error, "ignoring invalid MITM traffic event");
+                    continue;
+                }
+            };
+            if let Err(error) = persist_record(&pool, &record).await {
+                warn!(%error, traffic_id=%record.id, "MITM traffic persistence failed");
+            }
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]

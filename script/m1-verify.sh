@@ -20,24 +20,35 @@ echo "   数据库: ${PG:-ok}"
 REDIS=$(redis-cli -a kairos_platform ping 2>/dev/null || echo "unavailable")
 echo "   Redis: $REDIS"
 
-# ── 2. Create Task ────────────────────────────────────────────────
+# ── 2. Create Engagement Project, Task and Run ───────────────────
 echo ""
-echo "▶ 2. 创建渗透任务"
-TASK=$(curl -s -X POST "$BASE/api/tasks" -H 'Content-Type: application/json' -H "$AUTH" -d '{
+echo "▶ 2. 创建授权项目、渗透任务与 Run"
+PROJECT=$(curl -s -X POST "$BASE/pent/projects" -H 'Content-Type: application/json' -H "$AUTH" -d '{
+  "name": "Juice Shop M1 授权项目",
+  "description": "本地靶场自动验收",
+  "asset_scope": ["http://localhost:13000"]
+}')
+PROJECT_ID=$(echo "$PROJECT" | jq -r '.data.id')
+TASK=$(curl -s -X POST "$BASE/pent/tasks" -H 'Content-Type: application/json' -H "$AUTH" -d '{
+  "project_id": "'"$PROJECT_ID"'",
   "name": "Juice Shop M1 验收",
-  "targets": ["http://localhost:13000"],
   "priority": "high"
 }')
-TASK_ID=$(echo "$TASK" | jq -r '.data.task_id')
+TASK_ID=$(echo "$TASK" | jq -r '.data.id')
+RUN=$(curl -s -X POST "$BASE/pent/runs" -H 'Content-Type: application/json' -H "$AUTH" -d '{
+  "task_id": "'"$TASK_ID"'"
+}')
+RUN_ID=$(echo "$RUN" | jq -r '.data.id')
+echo "   Project ID: $PROJECT_ID"
 echo "   Task ID: $TASK_ID"
-echo "   Status:  $(echo "$TASK" | jq -r '.data.status')"
+echo "   Run ID:  $RUN_ID"
 
 # ── 3. Wait for Agent to Pick Up ─────────────────────────────────
 echo ""
 echo "▶ 3. 等待 Worker 接管（最多 60s）"
 for i in $(seq 1 30); do
   sleep 2
-  STATUS=$(curl -s "$BASE/api/tasks/$TASK_ID" -H "$AUTH" | jq -r '.data.latest_run.status // "unknown"')
+  STATUS=$(curl -s "$BASE/pent/tasks/$TASK_ID" -H "$AUTH" | jq -r '.data.latest_run.status // "unknown"')
   echo -ne "   [$i/30] Run status: $STATUS\r"
   if [ "$STATUS" = "running" ]; then
     echo ""
@@ -50,14 +61,14 @@ for i in $(seq 1 30); do
   fi
 done
 
-RUN_ID=$(curl -s "$BASE/api/tasks/$TASK_ID" -H "$AUTH" | jq -r '.data.latest_run.id')
+RUN_ID=$(curl -s "$BASE/pent/tasks/$TASK_ID" -H "$AUTH" | jq -r '.data.latest_run.id')
 echo "   Run ID: $RUN_ID"
 
 # ── 4. Watch SSE Stream (60s) ────────────────────────────────────
 echo ""
 echo "▶ 4. SSE 实时流（60s 采样，展示关键事件）"
 TOOL_COUNT=0
-timeout 60 curl -s -N "$BASE/api/tasks/$TASK_ID/stream" -H "$AUTH" 2>/dev/null | while IFS= read -r line; do
+timeout 60 curl -s -N "$BASE/pent/tasks/$TASK_ID/stream" -H "$AUTH" 2>/dev/null | while IFS= read -r line; do
   if [[ "$line" == event:* ]]; then
     EVT="${line#event: }"
   elif [[ "$line" == data:* && "$line" != "data: [DONE]" ]]; then
@@ -86,7 +97,7 @@ echo ""
 
 # ── 5. Check Findings & Progress ─────────────────────────────────
 echo "▶ 5. 运行状态检查"
-FULL=$(curl -s "$BASE/api/tasks/$TASK_ID" -H "$AUTH")
+FULL=$(curl -s "$BASE/pent/tasks/$TASK_ID" -H "$AUTH")
 echo "   任务状态: $(echo $FULL | jq -r '.data.status')"
 echo "   Run状态:  $(echo $FULL | jq -r '.data.latest_run.status')"
 echo "   Session:  $(echo $FULL | jq -r '.data.latest_run.session_id // "pending"')"
@@ -101,18 +112,18 @@ if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
   # ── 6. Report ──────────────────────────────────────────────────
   echo ""
   echo "▶ 6. 报告"
-  REPORT=$(curl -s "$BASE/api/reports/$RUN_ID" -H "$AUTH")
+  REPORT=$(curl -s "$BASE/pent/reports/$RUN_ID" -H "$AUTH")
   echo "   Artifact: $(echo $REPORT | jq -r '.data.artifact_id // "pending"')"
   echo "   Size:     $(echo $REPORT | jq -r '.data.size_bytes // 0') bytes"
   echo "   Format:   $(echo $REPORT | jq -r '.data.format // "pending"')"
 fi
 
 # ── 7. Cancel (if still running) ──────────────────────────────────
-CUR_STATUS=$(curl -s "$BASE/api/tasks/$TASK_ID" -H "$AUTH" | jq -r '.data.status')
+CUR_STATUS=$(curl -s "$BASE/pent/tasks/$TASK_ID" -H "$AUTH" | jq -r '.data.status')
 if [ "$CUR_STATUS" = "running" ]; then
   echo ""
   echo "▶ 7. 取消任务（验证取消功能）"
-  curl -s -X POST "$BASE/api/tasks/$TASK_ID/cancel" -H "$AUTH" | jq .
+  curl -s -X POST "$BASE/pent/tasks/$TASK_ID/cancel" -H "$AUTH" | jq .
 fi
 
 echo ""

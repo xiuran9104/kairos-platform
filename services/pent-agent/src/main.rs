@@ -5,7 +5,6 @@
 
 use axum::Router;
 use kairos_platform_framework_common::{ServiceConfig, health_route, init_tracing, serve};
-use kairos_platform_framework_database::{DatabaseConfig, connect, ensure_initialized};
 use kairos_platform_framework_web::{WebConfig, apply_web_layers};
 use kairos_platform_pent_server::PentConfig;
 
@@ -30,8 +29,6 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => tracing::warn!(%error, "controlled tool directory sync skipped"),
     }
 
-    let database = connect(&DatabaseConfig::from_env()?).await?;
-    ensure_initialized(&database).await?;
     let config = PentConfig::from_env();
     let nats_bus = kairos_platform_pent_server::transport::mq::NatsEventBus::connect(
         &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
@@ -39,58 +36,46 @@ async fn main() -> anyhow::Result<()> {
     .await;
     kairos_platform_pent_server::transport::mq::init_conversation_tool_bus(nats_bus.handle())
         .map_err(anyhow::Error::msg)?;
-    let mcp_registry = kairos_platform_pent_tooling::mcp::registry::shared().await;
     let worker_id = format!(
         "worker-{}-{}-{}",
         SERVICE_NAME,
         config.worker_id,
         uuid::Uuid::new_v4()
     );
-    kairos_platform_pent_server::spawn_mcp_reconciler(
-        database.clone(),
-        mcp_registry,
-        worker_id.clone(),
+    let _heartbeat = kairos_platform_pent_server::transport::mq::spawn_worker_heartbeat(
+        nats_bus.handle(),
+        worker_id,
     );
-    match kairos_platform_pent_server::infrastructure::recipe::load_from_db(&database).await {
-        Ok(count) => tracing::info!(count, "tool recipes loaded from pent_tool_definitions"),
-        Err(error) => {
-            tracing::warn!(%error, "tool recipe load failed; falling back to hardcoded registry")
-        }
-    }
+    let agent_config = nats_bus
+        .handle()
+        .request_agent_config()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let recipe_count = kairos_platform_pent_server::infrastructure::recipe::load_runtime_snapshot(
+        agent_config.recipes,
+    );
+    tracing::info!(recipe_count, "tool recipes synchronized from Gateway");
     let _ = kairos_platform_pent_server::infrastructure::execution::init_global_executor(
         std::sync::Arc::new(
             kairos_platform_pent_server::infrastructure::execution::ElasticExecutor::from_env(),
         ),
     );
     if let Err(error) =
-        kairos_platform_pent_server::transport::mq::spawn_conversation_tool_responder(
-            &nats_bus,
-            database.clone(),
-        )
-        .await
+        kairos_platform_pent_server::transport::mq::spawn_conversation_tool_responder(&nats_bus)
+            .await
     {
         tracing::warn!(%error, "conversation tool responder unavailable");
     }
-    if let Err(error) = kairos_platform_pent_server::transport::mq::spawn_terminal_responder(
-        &nats_bus,
-        database.clone(),
-    )
-    .await
+    if let Err(error) =
+        kairos_platform_pent_server::transport::mq::spawn_terminal_responder(&nats_bus).await
     {
         tracing::warn!(%error, "governed terminal responder unavailable");
     }
 
     // Start the in-process MITM traffic-capture proxy when enabled.
-    let _mitm_proxy =
-        kairos_platform_pent_server::infrastructure::mitm_sink::spawn_mitm_proxy(database.clone());
-
-    // Start the worker for async task processing
-    kairos_platform_pent_server::start_worker(
-        database.clone(),
-        worker_id,
-        config.lease_ttl_seconds,
-    )
-    .await;
+    let _mitm_proxy = kairos_platform_pent_server::infrastructure::mitm_sink::spawn_mitm_proxy_nats(
+        nats_bus.handle(),
+    );
 
     // The agent exposes health only. All authenticated business APIs, SSE and
     // task submission remain gateway responsibilities.

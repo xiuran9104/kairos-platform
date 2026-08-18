@@ -1,26 +1,26 @@
+mod agents;
 pub mod application;
-pub mod cognition;
+mod assets;
 pub mod config;
 pub mod conversation;
-pub mod infrastructure;
-pub(crate) mod report;
-mod agents;
-mod assets;
+mod engagement;
 mod facts;
 mod files;
 mod infocollect;
+pub mod infrastructure;
 mod knowledge_logs;
 mod mcp_servers;
 mod monitor;
-mod runtime_policy;
-mod roles;
+pub(crate) mod report;
 mod role_resolution;
+mod roles;
+mod runtime_policy;
 mod scan_verification;
 mod search_rank;
-mod terminal;
 mod security;
 mod session;
 mod skills;
+mod terminal;
 pub mod tooling;
 pub mod transport;
 mod workflows;
@@ -72,6 +72,10 @@ pub fn routes(state: PentState) -> Router {
         )
         .route("/pent/projects/{id}/model", put(update_project_model))
         .route(
+            "/pent/projects/{id}/authorization",
+            put(update_project_authorization),
+        )
+        .route(
             "/pent/settings/model-bindings",
             get(get_model_bindings).put(update_model_bindings),
         )
@@ -79,7 +83,10 @@ pub fn routes(state: PentState) -> Router {
             "/pent/settings/sections/{section}",
             get(get_platform_section).put(update_platform_section),
         )
-        .route("/pent/settings/robots", get(get_robot_settings).put(update_robot_settings))
+        .route(
+            "/pent/settings/robots",
+            get(get_robot_settings).put(update_robot_settings),
+        )
         .route("/pent/tasks", get(list_tasks).post(create_task))
         .route("/pent/tasks/{id}", get(get_task).delete(delete_task))
         .route("/pent/tasks/{id}/cancel", post(cancel_task))
@@ -119,7 +126,10 @@ pub fn routes(state: PentState) -> Router {
         .route("/pent/evidence/{id}", get(get_evidence))
         .route("/pent/findings/{id}", get(get_finding).post(review_finding))
         .route("/pent/projects/{id}/findings", get(get_project_findings))
-        .route("/api/projects/{id}/vulnerabilities", get(get_project_findings))
+        .route(
+            "/api/projects/{id}/vulnerabilities",
+            get(get_project_findings),
+        )
         .route("/pent/projects/{id}/traffic", get(get_project_traffic))
         .route("/pent/traffic/{id}", get(get_traffic))
         .route("/pent/artifacts/{id}/download", get(download_artifact))
@@ -217,9 +227,14 @@ async fn list_projects(
          )
          FROM pent_projects t
          WHERE t.tenant_id=$1 AND ($2 OR t.created_by=$3) AND t.deleted=0
-         ORDER BY t.created_at DESC LIMIT 100")
-        .bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-        .fetch_all(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
+         ORDER BY t.created_at DESC LIMIT 100",
+    )
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .fetch_all(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
     let mut resolved = Vec::with_capacity(rows.len());
     for row in rows {
         resolved.push(
@@ -270,6 +285,14 @@ async fn create_project(
     let name = body["name"].as_str().unwrap_or("untitled");
     let desc = body.get("description").and_then(|v| v.as_str());
     let scope = body.get("asset_scope").cloned().unwrap_or_default();
+    let engagement_mode = parse_engagement_mode(body.get("engagement_mode"))?;
+    let rules_of_engagement = body
+        .get("rules_of_engagement")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !rules_of_engagement.is_object() {
+        return Err(AppError::bad_request("交战规则必须是对象"));
+    }
     let default_role_id = body
         .get("default_role_id")
         .and_then(Value::as_str)
@@ -282,8 +305,8 @@ async fn create_project(
     {
         return Err(AppError::bad_request("角色不存在或未启用"));
     }
-    sqlx::query("INSERT INTO pent_projects(id,tenant_id,name,description,asset_scope,default_role_id,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)")
-        .bind(&id).bind(tenant_id).bind(name).bind(desc).bind(&scope).bind(default_role_id).bind(&user.user_id)
+    sqlx::query("INSERT INTO pent_projects(id,tenant_id,name,description,asset_scope,default_role_id,created_by,engagement_mode,rules_of_engagement) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+        .bind(&id).bind(tenant_id).bind(name).bind(desc).bind(&scope).bind(default_role_id).bind(&user.user_id).bind(engagement_mode).bind(rules_of_engagement)
         .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(
         json!({"id":id,"message":"项目创建成功"}),
@@ -297,7 +320,9 @@ async fn update_project_model(
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let model_config_id = body["model_config_id"].as_i64().filter(|&v| v > 0)
+    let model_config_id = body["model_config_id"]
+        .as_i64()
+        .filter(|&v| v > 0)
         .ok_or_else(|| AppError::bad_request("请选择有效的模型"))?;
     ensure_active_chat_model(&s.pool, model_config_id).await?;
     sqlx::query(
@@ -330,9 +355,7 @@ async fn update_project(
     if !asset_scope.is_array() {
         return Err(AppError::bad_request("资产范围必须是数组"));
     }
-    let status = body
-        .get("status")
-        .and_then(Value::as_str);
+    let status = body.get("status").and_then(Value::as_str);
     if let Some(status) = status {
         if !matches!(status, "active" | "paused" | "archived") {
             return Err(AppError::bad_request("项目状态无效"));
@@ -344,6 +367,17 @@ async fn update_project(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let engagement_mode = body
+        .get("engagement_mode")
+        .map(|value| parse_engagement_mode(Some(value)))
+        .transpose()?;
+    let rules_of_engagement = body.get("rules_of_engagement").cloned();
+    if rules_of_engagement
+        .as_ref()
+        .is_some_and(|rules| !rules.is_object())
+    {
+        return Err(AppError::bad_request("交战规则必须是对象"));
+    }
     if let Some(role_id) = default_role_id
         && !role_resolution::ensure_visible_role(&s.pool, tenant_id, role_id)
             .await
@@ -355,8 +389,10 @@ async fn update_project(
         "UPDATE pent_projects
          SET name=$2, description=$3, asset_scope=$4, status=COALESCE($5,status),
              default_role_id=CASE WHEN $6 THEN $7 ELSE default_role_id END,
+             engagement_mode=COALESCE($8,engagement_mode),
+             rules_of_engagement=COALESCE($9,rules_of_engagement),
              updated_at=now()
-         WHERE id=$1 AND tenant_id=$8 AND ($9 OR created_by=$10) AND deleted=0",
+         WHERE id=$1 AND tenant_id=$10 AND ($11 OR created_by=$12) AND deleted=0",
     )
     .bind(&id)
     .bind(name)
@@ -365,6 +401,8 @@ async fn update_project(
     .bind(status)
     .bind(role_was_supplied)
     .bind(default_role_id)
+    .bind(engagement_mode)
+    .bind(rules_of_engagement)
     .bind(tenant_id)
     .bind(security::tenant_wide(&user))
     .bind(&user.user_id)
@@ -374,6 +412,77 @@ async fn update_project(
     .rows_affected();
     if affected == 0 {
         return Err(AppError::not_found("项目不存在"));
+    }
+    get_project(State(s), Path(id), user).await
+}
+
+fn parse_engagement_mode(value: Option<&Value>) -> Result<&'static str, AppError> {
+    match value.and_then(Value::as_str).unwrap_or("assessment") {
+        "assessment" => Ok("assessment"),
+        "red_team" => Ok("red_team"),
+        _ => Err(AppError::bad_request(
+            "engagement_mode 必须是 assessment 或 red_team",
+        )),
+    }
+}
+
+async fn update_project_authorization(
+    State(s): State<PentState>,
+    Path(id): Path<String>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let tenant_id = security::tenant_id(&user)?;
+    let confirmed = body
+        .get("confirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let expires_at = if confirmed {
+        let raw = body
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::bad_request("红队授权必须设置 expires_at"))?;
+        let expires_at = chrono::DateTime::parse_from_rfc3339(raw)
+            .map_err(|_| AppError::bad_request("expires_at 必须是 RFC3339 时间"))?
+            .with_timezone(&chrono::Utc);
+        if expires_at <= chrono::Utc::now() {
+            return Err(AppError::bad_request("红队授权截止时间必须晚于当前时间"));
+        }
+        Some(expires_at)
+    } else {
+        None
+    };
+    let rules = body
+        .get("rules_of_engagement")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !rules.is_object() {
+        return Err(AppError::bad_request("交战规则必须是对象"));
+    }
+    let affected = sqlx::query(
+        "UPDATE pent_projects
+         SET authorization_status=CASE WHEN $2 THEN 'authorized' ELSE 'revoked' END,
+             authorization_confirmed_at=CASE WHEN $2 THEN now() ELSE authorization_confirmed_at END,
+             authorization_expires_at=$3,rules_of_engagement=$4,updated_at=now()
+         WHERE id=$1 AND tenant_id=$5 AND ($6 OR created_by=$7) AND deleted=0
+           AND engagement_mode='red_team'
+           AND jsonb_typeof(asset_scope)='array' AND jsonb_array_length(asset_scope)>0",
+    )
+    .bind(&id)
+    .bind(confirmed)
+    .bind(expires_at)
+    .bind(rules)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::bad_request(
+            "项目不存在、不是红队项目或尚未配置授权资产范围",
+        ));
     }
     get_project(State(s), Path(id), user).await
 }
@@ -438,7 +547,12 @@ async fn get_task(
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let v = sqlx::query_scalar::<_, Value>(
-        "SELECT to_jsonb(t) FROM pent_tasks t
+        "SELECT to_jsonb(t) || jsonb_build_object(
+             'latest_run', (
+                 SELECT to_jsonb(r) FROM pent_runs r
+                 WHERE r.task_id=t.id ORDER BY r.created_at DESC LIMIT 1
+             )
+         ) FROM pent_tasks t
          WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0",
     )
     .bind(&id)
@@ -502,7 +616,7 @@ async fn cancel_task(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    sqlx::query(
+    let affected = sqlx::query(
         "UPDATE pent_tasks SET status='cancelled',updated_at=now()
          WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0",
     )
@@ -510,6 +624,21 @@ async fn cancel_task(
     .bind(tenant_id)
     .bind(security::tenant_wide(&user))
     .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::not_found("任务不存在"));
+    }
+    sqlx::query(
+        "UPDATE pent_runs
+         SET cancel_requested_at=COALESCE(cancel_requested_at,now()),
+             status='cancelled', completed_at=COALESCE(completed_at,now()), updated_at=now()
+         WHERE task_id=$1 AND tenant_id=$2 AND status IN ('queued','running','cancelling')",
+    )
+    .bind(&id)
+    .bind(tenant_id)
     .execute(&s.pool)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
@@ -622,7 +751,10 @@ async fn get_run_plan(
     let plan = sqlx::query_scalar::<_, Value>(
         "SELECT graph FROM pent_plan_versions WHERE run_id=$1 ORDER BY version DESC LIMIT 1",
     )
-    .bind(&id).fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?
+    .bind(&id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
     .unwrap_or_else(|| json!({"run_id":id,"version":0,"nodes":[]}));
     Ok(Json(ApiResponse::new(plan)))
 }
@@ -636,40 +768,45 @@ async fn create_run(
     let task_id = body["task_id"]
         .as_str()
         .ok_or_else(|| AppError::bad_request("task_id required"))?;
-    let affected = sqlx::query(
+    let task: (Option<String>, Option<String>, Value, Option<String>) = sqlx::query_as(
+        "SELECT project_id,description,target_scope,tool_profile_id
+         FROM pent_tasks
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR created_by=$4) AND deleted=0
+           AND (
+               target_scope->>'confirmed'='true'
+               OR (target_scope ? 'confirmed_at' AND target_scope ? 'confirmed_by')
+           )
+           AND jsonb_array_length(target_scope->'targets') > 0",
+    )
+    .bind(task_id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .ok_or_else(|| AppError::bad_request("任务不存在、无权访问或未确认目标范围"))?;
+    let scope = engagement::authorized_scope(&s.pool, tenant_id, task.0.as_deref(), task.2)
+        .await
+        .map_err(AppError::bad_request)?;
+    sqlx::query(
         "INSERT INTO pent_runs(
              id,task_id,tenant_id,user_id,project_id,status,
              objective_snapshot,scope_snapshot,policy_snapshot,budget_snapshot
          )
-         SELECT $1,$2,t.tenant_id,$3,t.project_id,'queued',
-                t.description,t.target_scope,
-                jsonb_build_object('tool_profile_id',t.tool_profile_id,'scope_confirmed',true),
-                '{}'::jsonb
-         FROM pent_tasks t
-         WHERE t.id=$2 AND t.tenant_id=$4 AND ($5 OR t.created_by=$3) AND t.deleted=0
-           AND (
-               t.target_scope->>'confirmed'='true'
-               OR (
-                   t.target_scope ? 'confirmed_at'
-                   AND t.target_scope ? 'confirmed_by'
-               )
-           )
-           AND jsonb_array_length(t.target_scope->'targets') > 0",
+         VALUES($1,$2,$3,$4,$5,'queued',$6,$7,$8,'{}'::jsonb)",
     )
     .bind(&id)
     .bind(task_id)
-    .bind(&user.user_id)
     .bind(tenant_id)
-    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(&task.0)
+    .bind(&task.1)
+    .bind(&scope)
+    .bind(json!({"tool_profile_id": task.3, "scope_confirmed": true}))
     .execute(&s.pool)
     .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    .rows_affected();
-    if affected == 0 {
-        return Err(AppError::bad_request(
-            "任务不存在、无权访问或未确认目标范围",
-        ));
-    }
+    .map_err(|e| AppError::internal(e.to_string()))?;
     // NATS: notify workers that a new run is available
     if let Some(ref nats) = s.nats {
         let payload =
@@ -733,13 +870,24 @@ async fn create_batch_runs(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("对目标进行授权安全测试");
+    let engagement_metadata =
+        engagement::authorized_scope(&s.pool, tenant_id, Some(project_id), json!({}))
+            .await
+            .map_err(AppError::bad_request)?;
 
     let mut created = Vec::with_capacity(targets.len());
     for target in &targets {
         let task_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
-        let scope = normalize_confirmed_scope(json!([target]), &user.user_id)?;
-        let mut tx = s.pool.begin().await.map_err(|e| AppError::internal(e.to_string()))?;
+        let scope = engagement::apply_metadata(
+            normalize_confirmed_scope(json!([target]), &user.user_id)?,
+            &engagement_metadata,
+        );
+        let mut tx = s
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         sqlx::query(
             "INSERT INTO pent_tasks(
                  id, tenant_id, name, description, target_scope, priority, project_id, created_by
@@ -773,17 +921,17 @@ async fn create_batch_runs(
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
-        sqlx::query(
-            "UPDATE pent_tasks SET status='running', updated_at=now() WHERE id=$1",
-        )
-        .bind(&task_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-        tx.commit().await.map_err(|e| AppError::internal(e.to_string()))?;
+        sqlx::query("UPDATE pent_tasks SET status='running', updated_at=now() WHERE id=$1")
+            .bind(&task_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         if let Some(ref nats) = s.nats {
-            let payload =
-                serde_json::to_vec(&json!({"run_id": run_id, "task_id": task_id})).unwrap_or_default();
+            let payload = serde_json::to_vec(&json!({"run_id": run_id, "task_id": task_id}))
+                .unwrap_or_default();
             nats.publish("penta.run.requested", &payload).await;
         }
         created.push(json!({"target": target, "task_id": task_id, "run_id": run_id}));
@@ -860,11 +1008,28 @@ async fn pause_run(
          WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4)
            AND status IN ('queued','running','waiting_approval')",
     )
-    .bind(&id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-    .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.rows_affected();
-    if affected == 0 { return Err(AppError::bad_request("Run 不存在或当前状态不能暂停")); }
-    append_run_event(&s.pool, &id, "run.interrupted", json!({"mode":"pause","requested_by":user.user_id})).await.map_err(AppError::internal)?;
-    Ok(Json(ApiResponse::new(json!({"message":"Run 已暂停；检查点和 Evidence 已保留"}))))
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::bad_request("Run 不存在或当前状态不能暂停"));
+    }
+    append_run_event(
+        &s.pool,
+        &id,
+        "run.interrupted",
+        json!({"mode":"pause","requested_by":user.user_id}),
+    )
+    .await
+    .map_err(AppError::internal)?;
+    Ok(Json(ApiResponse::new(
+        json!({"message":"Run 已暂停；检查点和 Evidence 已保留"}),
+    )))
 }
 
 async fn resume_run(
@@ -873,22 +1038,56 @@ async fn resume_run(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let affected = sqlx::query(
-        "UPDATE pent_runs SET status='queued',cancel_requested_at=NULL,completed_at=NULL,
-                failure_code=NULL,failure_message=NULL,next_attempt_at=now(),updated_at=now()
+    let run: (Option<String>, Value) = sqlx::query_as(
+        "SELECT project_id,scope_snapshot FROM pent_runs
          WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4) AND status='paused'",
     )
-    .bind(&id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
-    .execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.rows_affected();
-    if affected == 0 { return Err(AppError::bad_request("Run 不存在或当前状态不能恢复")); }
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?
+    .ok_or_else(|| AppError::bad_request("Run 不存在或当前状态不能恢复"))?;
+    let refreshed_scope = engagement::authorized_scope(&s.pool, tenant_id, run.0.as_deref(), run.1)
+        .await
+        .map_err(AppError::bad_request)?;
+    let affected = sqlx::query(
+        "UPDATE pent_runs SET status='queued',cancel_requested_at=NULL,completed_at=NULL,
+                failure_code=NULL,failure_message=NULL,next_attempt_at=now(),
+                scope_snapshot=$5,updated_at=now()
+         WHERE id=$1 AND tenant_id=$2 AND ($3 OR user_id=$4) AND status='paused'",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(security::tenant_wide(&user))
+    .bind(&user.user_id)
+    .bind(refreshed_scope)
+    .execute(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .rows_affected();
+    if affected == 0 {
+        return Err(AppError::bad_request("Run 不存在或当前状态不能恢复"));
+    }
     sqlx::query("UPDATE pent_agent_sessions SET status='running',active_run_id=$1,updated_at=now() WHERE id=(SELECT session_id FROM pent_runs WHERE id=$1)")
         .bind(&id).execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    append_run_event(&s.pool, &id, "run.resumed", json!({"source":"checkpoint","requested_by":user.user_id})).await.map_err(AppError::internal)?;
+    append_run_event(
+        &s.pool,
+        &id,
+        "run.resumed",
+        json!({"source":"checkpoint","requested_by":user.user_id}),
+    )
+    .await
+    .map_err(AppError::internal)?;
     if let Some(ref nats) = s.nats {
         let payload = serde_json::to_vec(&json!({"run_id":id,"resume":true})).unwrap_or_default();
         nats.publish("penta.run.requested", &payload).await;
     }
-    Ok(Json(ApiResponse::new(json!({"message":"Run 已从检查点重新入队"}))))
+    Ok(Json(ApiResponse::new(
+        json!({"message":"Run 已从检查点重新入队"}),
+    )))
 }
 
 async fn delete_run(
@@ -925,11 +1124,13 @@ async fn delete_run(
         ));
     }
 
-    sqlx::query("UPDATE pent_agent_sessions SET active_run_id=NULL,updated_at=now() WHERE active_run_id=$1")
-        .bind(&id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| AppError::internal(error.to_string()))?;
+    sqlx::query(
+        "UPDATE pent_agent_sessions SET active_run_id=NULL,updated_at=now() WHERE active_run_id=$1",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AppError::internal(error.to_string()))?;
 
     for table in [
         "pent_approvals",
@@ -1037,8 +1238,14 @@ async fn get_tool_call_result(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100)
         .clamp(1, 500);
-    let search = params.get("search").map(String::as_str).filter(|v| !v.is_empty());
-    let filter = params.get("filter").map(String::as_str).filter(|v| !v.is_empty());
+    let search = params
+        .get("search")
+        .map(String::as_str)
+        .filter(|v| !v.is_empty());
+    let filter = params
+        .get("filter")
+        .map(String::as_str)
+        .filter(|v| !v.is_empty());
     let row = sqlx::query_as::<
         _,
         (
@@ -1099,213 +1306,85 @@ async fn get_tool_call_result(
     }))))
 }
 
-// ── Worker executor with AI agent and lease renewal ─────────────────────
+// ── Gateway-owned Run coordinator ───────────────────────────────────────
 
-/// Background worker: picks up queued runs, calls AI for analysis, manages lease.
-// ── Host tool auto-install ──────────────────────────────────────────────
-
-async fn ensure_host_tools(pool: PgPool, worker_id: String) {
-    use crate::infrastructure::tool_lifecycle;
-
-    let auto_install = crate::infrastructure::process::auto_install_enabled();
-    if !auto_install {
-        tracing::info!("host tool startup auto-install disabled");
+/// Start the control-plane Run coordinator.
+///
+/// NATS notifications are the primary dispatch signal. PostgreSQL remains the
+/// authoritative state store and the lease is retained for multi-Gateway
+/// exactly-once claims and crash recovery, but there is no short-interval work
+/// polling loop. A low-frequency maintenance tick only repairs expired leases
+/// and wakes Runs whose retry delay has elapsed.
+pub async fn start_run_coordinator(
+    pool: PgPool,
+    coordinator_id: String,
+    lease_ttl: i64,
+    bus: &crate::transport::mq::NatsEventBus,
+) -> Result<(), String> {
+    if !bus.is_connected() {
+        return Err("NATS 未连接，Run 协调器拒绝启动".into());
     }
+    let mut requested = bus
+        .subscribe(crate::transport::mq::subjects::RUN_REQUESTED)
+        .await?;
 
-    let tools = tool_lifecycle::all_host_tools();
-    let mut healthy = 0usize;
-    let mut installed = 0usize;
-    let mut failed = Vec::new();
-
-    for lifecycle in &tools {
-        if lifecycle.is_installed().await {
-            healthy += 1;
-            record_worker_tool_health(
-                &pool,
-                &worker_id,
-                lifecycle,
-                "healthy",
-                serde_json::json!({
-                    "binary": lifecycle.resolved_binary_path(),
-                    "source": "worker-startup"
-                }),
-            )
-            .await;
-            continue;
-        }
-        if !auto_install {
-            failed.push(lifecycle.tool_name);
-            record_worker_tool_health(
-                &pool,
-                &worker_id,
-                lifecycle,
-                "unhealthy",
-                serde_json::json!({
-                    "binary": lifecycle.binary_path,
-                    "error": "binary missing and auto-install disabled",
-                    "source": "worker-startup"
-                }),
-            )
-            .await;
-            continue;
-        }
-        tracing::warn!(
-            tool = lifecycle.tool_name,
-            path = lifecycle.binary_path,
-            "host tool missing; attempting install"
-        );
-        match lifecycle.install().await {
-            Ok(()) => {
-                tracing::info!(tool = lifecycle.tool_name, "installed successfully");
-                installed += 1;
-                record_worker_tool_health(
-                    &pool,
-                    &worker_id,
-                    lifecycle,
-                    "healthy",
-                    serde_json::json!({
-                        "binary": lifecycle.resolved_binary_path(),
-                        "source": "worker-auto-install"
-                    }),
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    tool = lifecycle.tool_name,
-                    error = %error,
-                    "install failed; tool will not be available"
-                );
-                failed.push(lifecycle.tool_name);
-                record_worker_tool_health(
-                    &pool,
-                    &worker_id,
-                    lifecycle,
-                    "unhealthy",
-                    serde_json::json!({
-                        "binary": lifecycle.binary_path,
-                        "error": error,
-                        "source": "worker-auto-install"
-                    }),
-                )
-                .await;
-            }
-        }
-    }
-
-    tracing::info!(
-        healthy,
-        installed,
-        failed = ?failed,
-        total = tools.len(),
-        "host tool startup check complete"
-    );
-
-    let refresh_seconds = std::env::var("PENTA_TOOL_HEALTH_REFRESH_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(60)
-        .clamp(15, 3_600);
-    let mut refresh = tokio::time::interval(std::time::Duration::from_secs(refresh_seconds));
-    // The startup pass above is the first observation; don't immediately
-    // duplicate it when Tokio's interval produces its eager first tick.
-    refresh.tick().await;
-    loop {
-        refresh.tick().await;
-        for lifecycle in &tools {
-            let installed = lifecycle.is_installed().await;
-            record_worker_tool_health(
-                &pool,
-                &worker_id,
-                lifecycle,
-                if installed { "healthy" } else { "unhealthy" },
-                serde_json::json!({
-                    "binary": lifecycle.resolved_binary_path(),
-                    "configured_binary": lifecycle.binary_path,
-                    "source": "worker-health-refresh"
-                }),
-            )
-            .await;
-        }
-    }
-}
-
-async fn record_worker_tool_health(
-    pool: &PgPool,
-    worker_id: &str,
-    lifecycle: &crate::infrastructure::tool_lifecycle::ToolLifecycle,
-    status: &str,
-    detail: serde_json::Value,
-) {
-    let mut tool_ids = Vec::with_capacity(lifecycle.aliases.len() + 1);
-    tool_ids.push(lifecycle.tool_name.to_string());
-    tool_ids.extend(lifecycle.aliases.iter().map(|alias| (*alias).to_string()));
-    if let Err(error) = sqlx::query(
-        "INSERT INTO pent_tool_health(tool_id,version,worker_id,status,detail,checked_at)
-         SELECT tool_id,version,$2,$3,$4,now()
-         FROM pent_tool_definitions
-         WHERE tool_id = ANY($1)
-         ON CONFLICT(tool_id,version,worker_id) DO UPDATE SET
-             status=EXCLUDED.status,detail=EXCLUDED.detail,checked_at=now()",
-    )
-    .bind(&tool_ids)
-    .bind(worker_id)
-    .bind(status)
-    .bind(detail)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(tool = lifecycle.tool_name, %error, "failed to persist worker tool health");
-    }
-}
-
-pub async fn start_worker(pool: PgPool, worker_id: String, lease_ttl: i64) {
-    if let Err(error) = register_worker(&pool, &worker_id).await {
-        tracing::warn!(worker=%worker_id, error=%error, "worker registration failed");
-    }
-    tokio::spawn(ensure_host_tools(pool.clone(), worker_id.clone()));
-    // Run recovery before polling for new work. This immediately re-queues
-    // expired parent leases, making their unfinished child-agent events
-    // eligible for recovery by the normal exactly-once run claim path.
+    // Run recovery before accepting HTTP traffic. This immediately re-queues
+    // expired control-plane leases and makes them eligible for startup drain.
     if let Err(error) = maintenance_scanner(&pool).await {
-        tracing::warn!(worker=%worker_id, error=%error, "initial Pent recovery scan failed");
+        tracing::warn!(coordinator=%coordinator_id, error=%error, "initial Pent recovery scan failed");
     }
     match recoverable_sub_agent_count(&pool).await {
         Ok(count) if count > 0 => {
-            tracing::info!(worker=%worker_id, count, "unfinished sub-agents queued for startup recovery");
+            tracing::info!(coordinator=%coordinator_id, count, "unfinished sub-agents queued for startup recovery");
         }
         Ok(_) => {}
         Err(error) => {
-            tracing::warn!(worker=%worker_id, error=%error, "startup sub-agent scan failed");
+            tracing::warn!(coordinator=%coordinator_id, error=%error, "startup sub-agent scan failed");
         }
     }
-    let maintenance_pool = pool.clone();
+    let maintenance_seconds = std::env::var("PENTA_RUN_RECOVERY_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(30, 3_600);
     tokio::spawn(async move {
+        let mut maintenance =
+            tokio::time::interval(std::time::Duration::from_secs(maintenance_seconds));
+        // The startup recovery above is the first maintenance pass.
+        maintenance.tick().await;
+
+        if let Err(error) = drain_available_runs(&pool, &coordinator_id, lease_ttl).await {
+            tracing::warn!(coordinator=%coordinator_id, %error, "startup Run drain failed");
+        }
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if let Err(error) = maintenance_scanner(&maintenance_pool).await {
-                tracing::warn!(error=%error, "Pent maintenance scanner failed");
+            tokio::select! {
+                notification = requested.next() => {
+                    if notification.is_none() {
+                        tracing::error!(coordinator=%coordinator_id, "Run notification subscription closed");
+                        break;
+                    }
+                }
+                _ = maintenance.tick() => {
+                    if let Err(error) = maintenance_scanner(&pool).await {
+                        tracing::warn!(coordinator=%coordinator_id, %error, "Pent maintenance scanner failed");
+                    }
+                }
+            }
+            if let Err(error) = drain_available_runs(&pool, &coordinator_id, lease_ttl).await {
+                tracing::warn!(coordinator=%coordinator_id, %error, "Run coordinator dispatch failed");
             }
         }
     });
-    let heartbeat_pool = pool.clone();
-    let heartbeat_worker = worker_id.clone();
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) = heartbeat_worker_record(&heartbeat_pool, &heartbeat_worker).await {
-                tracing::warn!(worker=%heartbeat_worker, error=%error, "worker heartbeat failed");
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        }
-    });
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = process_one_run(&pool, &worker_id, lease_ttl).await {
-                tracing::warn!(worker=%worker_id, error=%e, "worker error");
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-    });
+    Ok(())
+}
+
+async fn drain_available_runs(
+    pool: &PgPool,
+    coordinator_id: &str,
+    lease_ttl: i64,
+) -> Result<(), String> {
+    while process_one_run(pool, coordinator_id, lease_ttl).await? {}
+    Ok(())
 }
 
 async fn recoverable_sub_agent_count(pool: &PgPool) -> Result<i64, String> {
@@ -1327,46 +1406,6 @@ async fn recoverable_sub_agent_count(pool: &PgPool) -> Result<i64, String> {
     .fetch_one(pool)
     .await
     .map_err(|error| error.to_string())
-}
-
-async fn register_worker(pool: &PgPool, worker_id: &str) -> Result<(), String> {
-    let capacity: i32 = std::env::var("PENTA_WORKER_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-        .clamp(1, 100);
-    sqlx::query(
-        "INSERT INTO pent_workers(
-             worker_id,capacity,status,last_heartbeat,registered_at,
-             sandbox_backend,sandbox_ready,sandbox_detail
-         )
-         VALUES($1,$2,'active',now(),now(),'bubblewrap',true,
-             jsonb_build_object(
-                 'mount_namespace',true,'pid_namespace',true,'user_namespace',true,
-                 'capabilities_dropped',true,'seccomp',true,'network_isolated',false,
-                 'container_backend',false
-             ))
-         ON CONFLICT(worker_id) DO UPDATE SET
-             capacity=EXCLUDED.capacity,status='active',last_heartbeat=now(),
-             sandbox_backend=EXCLUDED.sandbox_backend,sandbox_ready=true,
-             sandbox_detail=EXCLUDED.sandbox_detail",
-    )
-    .bind(worker_id)
-    .bind(capacity)
-    .execute(pool)
-    .await
-    .map_err(|error| error.to_string())?;
-    tracing::info!(worker_id, capacity, "worker registered");
-    Ok(())
-}
-
-async fn heartbeat_worker_record(pool: &PgPool, worker_id: &str) -> Result<(), String> {
-    sqlx::query("UPDATE pent_workers SET status='active',last_heartbeat=now() WHERE worker_id=$1")
-        .bind(worker_id)
-        .execute(pool)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 async fn maintenance_scanner(pool: &PgPool) -> Result<(), String> {
@@ -1419,7 +1458,10 @@ async fn maintenance_scanner(pool: &PgPool) -> Result<(), String> {
         tracing::info!(count = expired, "expired Pent approvals");
     }
     if released_sub_agents > 0 {
-        tracing::info!(count = released_sub_agents, "released orphaned sub-agent claims");
+        tracing::info!(
+            count = released_sub_agents,
+            "released orphaned sub-agent claims"
+        );
     }
     Ok(())
 }
@@ -1595,15 +1637,34 @@ async fn metrics(
         let mut out = String::new();
         out.push_str(&format!("# HELP pent_runs_total Run count by status\n"));
         out.push_str(&format!("# TYPE pent_runs_total gauge\n"));
-        out.push_str(&format!("pent_runs_total{{status=\"queued\"}} {}\n", queued));
-        out.push_str(&format!("pent_runs_total{{status=\"running\"}} {}\n", running));
-        out.push_str(&format!("pent_runs_total{{status=\"completed\"}} {}\n", completed));
-        out.push_str(&format!("pent_runs_total{{status=\"failed\"}} {}\n", failed));
-        out.push_str(&format!("pent_runs_total{{status=\"cancelled\"}} {}\n", cancelled));
-        out.push_str(&format!("# HELP pent_approvals_pending Pending approval count\n"));
+        out.push_str(&format!(
+            "pent_runs_total{{status=\"queued\"}} {}\n",
+            queued
+        ));
+        out.push_str(&format!(
+            "pent_runs_total{{status=\"running\"}} {}\n",
+            running
+        ));
+        out.push_str(&format!(
+            "pent_runs_total{{status=\"completed\"}} {}\n",
+            completed
+        ));
+        out.push_str(&format!(
+            "pent_runs_total{{status=\"failed\"}} {}\n",
+            failed
+        ));
+        out.push_str(&format!(
+            "pent_runs_total{{status=\"cancelled\"}} {}\n",
+            cancelled
+        ));
+        out.push_str(&format!(
+            "# HELP pent_approvals_pending Pending approval count\n"
+        ));
         out.push_str(&format!("# TYPE pent_approvals_pending gauge\n"));
         out.push_str(&format!("pent_approvals_pending {}\n", waiting));
-        out.push_str(&format!("# HELP pent_sessions_total Active agent sessions\n"));
+        out.push_str(&format!(
+            "# HELP pent_sessions_total Active agent sessions\n"
+        ));
         out.push_str(&format!("# TYPE pent_sessions_total gauge\n"));
         out.push_str(&format!("pent_sessions_total {}\n", sessions.unwrap_or(0)));
         out.push_str(&format!("# HELP pent_findings_total Total findings\n"));
@@ -1617,7 +1678,9 @@ async fn metrics(
         out.push_str(&format!("pent_tool_calls_total {}\n", calls));
         let success = if completed + failed > 0 {
             completed as f64 / (completed + failed) as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         out.push_str(&format!("# HELP pent_success_rate Run success rate\n"));
         out.push_str(&format!("# TYPE pent_success_rate gauge\n"));
         out.push_str(&format!("pent_success_rate {:.4}\n", success));
@@ -1704,10 +1767,9 @@ async fn tools_overview(
     )))
 }
 
-
-async fn process_one_run(pool: &PgPool, worker_id: &str, lease_ttl: i64) -> Result<(), String> {
+async fn process_one_run(pool: &PgPool, worker_id: &str, lease_ttl: i64) -> Result<bool, String> {
     let Some(claim) = runtime_policy::claim(pool, worker_id, lease_ttl).await? else {
-        return Ok(());
+        return Ok(false);
     };
     let lease_pool = pool.clone();
     let lease_run_id = claim.id.clone();
@@ -1748,7 +1810,7 @@ async fn process_one_run(pool: &PgPool, worker_id: &str, lease_ttl: i64) -> Resu
         handle_run_failure(pool, &claim, &error).await?;
         return Err(error);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn execute_claimed_run(
@@ -1760,11 +1822,11 @@ async fn execute_claimed_run(
     if run_cancel_requested(pool, &run_id).await? {
         return Err("RUN_CANCELLED".into());
     }
-    // Every run executes through the session-driven conversation runtime.
+    // Every run executes through the Gateway-owned conversation runtime.
     // Runs created outside the chat flow (e.g. from a task) get a synthetic
     // agent session attached so the autonomous tool loop, evidence gates and
-    // reporting apply uniformly. The H-PER-M cognition engine code is kept but
-    // is no longer dispatched.
+    // reporting apply uniformly. Security binaries are still delegated to a
+    // pent-agent over the governed NATS request/reply protocol.
     ensure_run_session(pool, &run_id).await?;
     let session_run = tokio::select! {
         result = crate::conversation::run_bridge::execute_session_run(pool, &run_id, worker_id) => result,
@@ -1872,6 +1934,7 @@ async fn handle_run_failure(
     let incomplete = error.starts_with("RUN_INCOMPLETE:") || error.starts_with("RUN_BLOCKED:");
     let permanent = cancelled
         || incomplete
+        || conversation::agent_pipeline::is_permanent_model_configuration_error(error)
         || error.contains("缺少已确认")
         || error.contains("审批已拒绝")
         || error.contains("目标范围");
@@ -2349,33 +2412,86 @@ async fn attack_graph(
 
 fn platform_section_defaults(section: &str) -> Option<Value> {
     Some(match section {
-        "assets" => json!({"auto_discovery":true,"discovery_interval_minutes":60,"alive_check_enabled":true,"asset_retention_days":365,"duplicate_strategy":"merge","risk_sync_enabled":true}),
-        "knowledge" => json!({"enabled":true,"base_path":"knowledge_base","embedding_model_config_id":0,"retrieval_top_k":5,"similarity_threshold":0.65,"sub_index_filter":"","multi_query_max_queries":4,"rerank_model_config_id":0,"prefetch_top_k":20,"max_context_chars":0,"max_context_tokens":0,"chunk_strategy":"markdown_then_recursive","request_timeout_seconds":120,"batch_size":64,"prefer_source_file":false,"sub_indexes":"","chunk_size":768,"chunk_overlap":50,"max_chunks_per_item":20,"max_rpm":100,"rate_limit_delay_ms":600,"max_retries":3,"retry_delay_ms":1000}),
-        "c2" => json!({"enabled":true,"heartbeat_seconds":30,"offline_timeout_seconds":120,"max_concurrent_jobs":10,"tls_required":true,"allow_unregistered_nodes":false,"command_timeout_seconds":600}),
-        "robots" => json!({"enabled":true,"max_active_agents":8,"default_role_id":role_resolution::PLATFORM_DEFAULT_ROLE_ID,"auto_assign_tasks":true,"idle_timeout_minutes":30,"memory_enabled":true,"collaboration_enabled":true}),
-        "terminal" => json!({"session_timeout_minutes":60,"max_sessions_per_user":5,"command_audit_enabled":true,"dangerous_command_confirmation":true,"file_transfer_enabled":true,"max_upload_mb":100,"default_shell":"bash"}),
+        "assets" => {
+            json!({"auto_discovery":true,"discovery_interval_minutes":60,"alive_check_enabled":true,"asset_retention_days":365,"duplicate_strategy":"merge","risk_sync_enabled":true})
+        }
+        "knowledge" => {
+            json!({"enabled":true,"base_path":"knowledge_base","embedding_model_config_id":0,"retrieval_top_k":5,"similarity_threshold":0.65,"sub_index_filter":"","multi_query_max_queries":4,"rerank_model_config_id":0,"prefetch_top_k":20,"max_context_chars":0,"max_context_tokens":0,"chunk_strategy":"markdown_then_recursive","request_timeout_seconds":120,"batch_size":64,"prefer_source_file":false,"sub_indexes":"","chunk_size":768,"chunk_overlap":50,"max_chunks_per_item":20,"max_rpm":100,"rate_limit_delay_ms":600,"max_retries":3,"retry_delay_ms":1000})
+        }
+        "c2" => {
+            json!({"enabled":true,"heartbeat_seconds":30,"offline_timeout_seconds":120,"max_concurrent_jobs":10,"tls_required":true,"allow_unregistered_nodes":false,"command_timeout_seconds":600})
+        }
+        "robots" => {
+            json!({"enabled":true,"max_active_agents":8,"default_role_id":role_resolution::PLATFORM_DEFAULT_ROLE_ID,"auto_assign_tasks":true,"idle_timeout_minutes":30,"memory_enabled":true,"collaboration_enabled":true})
+        }
+        "terminal" => {
+            json!({"session_timeout_minutes":60,"max_sessions_per_user":5,"command_audit_enabled":true,"dangerous_command_confirmation":true,"file_transfer_enabled":true,"max_upload_mb":100,"default_shell":"bash"})
+        }
         _ => return None,
     })
 }
 
-async fn get_robot_settings(State(s): State<PentState>, user: CurrentUser) -> Result<Json<ApiResponse<Value>>, AppError> {
+async fn get_robot_settings(
+    State(s): State<PentState>,
+    user: CurrentUser,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
     let stored = sqlx::query_scalar::<_, Option<Value>>("SELECT agent_config->'robot_channels' FROM pent_runtime_policies WHERE tenant_id IN ($1,0) ORDER BY (tenant_id=$1) DESC LIMIT 1")
         .bind(tenant_id).fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.flatten().unwrap_or_else(|| json!({}));
-    let channels = ["wechat","wecom","dingtalk","lark","telegram","slack","discord","qq"];
+    let channels = [
+        "wechat", "wecom", "dingtalk", "lark", "telegram", "slack", "discord", "qq",
+    ];
     Ok(Json(ApiResponse::new(Value::Array(channels.into_iter().map(|id| json!({"id":id,"enabled":stored[id]["enabled"].as_bool().unwrap_or(false),"app_id":stored[id]["app_id"].as_str().unwrap_or(""),"configured":stored[id]["secret"].as_str().is_some_and(|v| !v.is_empty())})).collect()))))
 }
 
-async fn update_robot_settings(State(s): State<PentState>, user: CurrentUser, Json(body): Json<Value>) -> Result<Json<ApiResponse<Value>>, AppError> {
+async fn update_robot_settings(
+    State(s): State<PentState>,
+    user: CurrentUser,
+    Json(body): Json<Value>,
+) -> Result<Json<ApiResponse<Value>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let old = sqlx::query_scalar::<_, Option<Value>>("SELECT agent_config->'robot_channels' FROM pent_runtime_policies WHERE tenant_id=$1").bind(tenant_id).fetch_optional(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?.flatten().unwrap_or_else(|| json!({}));
-    let rows = body["channels"].as_array().ok_or_else(|| AppError::bad_request("channels 必须是数组"))?;
+    let old = sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT agent_config->'robot_channels' FROM pent_runtime_policies WHERE tenant_id=$1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&s.pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .flatten()
+    .unwrap_or_else(|| json!({}));
+    let rows = body["channels"]
+        .as_array()
+        .ok_or_else(|| AppError::bad_request("channels 必须是数组"))?;
     let mut saved = serde_json::Map::new();
-    for row in rows { let id=row["id"].as_str().filter(|v| matches!(*v,"wechat"|"wecom"|"dingtalk"|"lark"|"telegram"|"slack"|"discord"|"qq")).ok_or_else(|| AppError::bad_request("不支持的机器人类型"))?; let input=row["secret"].as_str().unwrap_or(""); let secret=if input.is_empty(){old[id]["secret"].clone()}else{Value::String(infrastructure::secrets::encrypt_api_key(input))}; saved.insert(id.into(),json!({"enabled":row["enabled"].as_bool().unwrap_or(false),"app_id":row["app_id"].as_str().unwrap_or(""),"secret":secret})); }
-    let config=Value::Object(saved);
+    for row in rows {
+        let id = row["id"]
+            .as_str()
+            .filter(|v| {
+                matches!(
+                    *v,
+                    "wechat"
+                        | "wecom"
+                        | "dingtalk"
+                        | "lark"
+                        | "telegram"
+                        | "slack"
+                        | "discord"
+                        | "qq"
+                )
+            })
+            .ok_or_else(|| AppError::bad_request("不支持的机器人类型"))?;
+        let input = row["secret"].as_str().unwrap_or("");
+        let secret = if input.is_empty() {
+            old[id]["secret"].clone()
+        } else {
+            Value::String(infrastructure::secrets::encrypt_api_key(input))
+        };
+        saved.insert(id.into(),json!({"enabled":row["enabled"].as_bool().unwrap_or(false),"app_id":row["app_id"].as_str().unwrap_or(""),"secret":secret}));
+    }
+    let config = Value::Object(saved);
     sqlx::query("INSERT INTO pent_runtime_policies(tenant_id,agent_config,updated_by) VALUES($1,jsonb_build_object('robot_channels',$2),$3) ON CONFLICT(tenant_id) DO UPDATE SET agent_config=pent_runtime_policies.agent_config || jsonb_build_object('robot_channels',$2),updated_by=$3,updated_at=now()")
         .bind(tenant_id).bind(&config).bind(&user.user_id).execute(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    get_robot_settings(State(s),user).await
+    get_robot_settings(State(s), user).await
 }
 
 async fn get_platform_section(
@@ -2383,8 +2499,8 @@ async fn get_platform_section(
     Path(section): Path<String>,
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let defaults = platform_section_defaults(&section)
-        .ok_or_else(|| AppError::not_found("设置分类不存在"))?;
+    let defaults =
+        platform_section_defaults(&section).ok_or_else(|| AppError::not_found("设置分类不存在"))?;
     let tenant_id = security::tenant_id(&user)?;
     let stored = sqlx::query_scalar::<_, Option<Value>>(
         "SELECT agent_config->'platform_settings'->$2
@@ -2419,8 +2535,8 @@ async fn update_platform_section(
     user: CurrentUser,
     Json(body): Json<Value>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
-    let defaults = platform_section_defaults(&section)
-        .ok_or_else(|| AppError::not_found("设置分类不存在"))?;
+    let defaults =
+        platform_section_defaults(&section).ok_or_else(|| AppError::not_found("设置分类不存在"))?;
     let values = body
         .as_object()
         .ok_or_else(|| AppError::bad_request("设置内容必须是对象"))?;
@@ -2497,7 +2613,11 @@ async fn update_model_bindings(
     let bindings = body["bindings"]
         .as_array()
         .ok_or_else(|| AppError::bad_request("bindings 必须是数组"))?;
-    let mut tx = s.pool.begin().await.map_err(|e| AppError::internal(e.to_string()))?;
+    let mut tx = s
+        .pool
+        .begin()
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
     for binding in bindings {
         let role = binding["model_role"]
             .as_str()
@@ -2544,7 +2664,9 @@ async fn update_model_bindings(
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     }
-    tx.commit().await.map_err(|e| AppError::internal(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(ApiResponse::new(json!({"message":"已保存"}))))
 }
 
@@ -2586,14 +2708,16 @@ async fn get_runtime_policy(
     .fetch_optional(&s.pool)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?
-    .unwrap_or_else(|| json!({
-        "max_concurrent_runs": 5,
-        "lease_ttl_seconds": 120,
-        "max_tool_timeout_seconds": 900,
-        "max_retries_per_run": 3,
-        "retry_base_delay_seconds": 15,
-        "inherited": true
-    }));
+    .unwrap_or_else(|| {
+        json!({
+            "max_concurrent_runs": 5,
+            "lease_ttl_seconds": 120,
+            "max_tool_timeout_seconds": 900,
+            "max_retries_per_run": 3,
+            "retry_base_delay_seconds": 15,
+            "inherited": true
+        })
+    });
     Ok(Json(ApiResponse::new(policy)))
 }
 
@@ -2876,7 +3000,9 @@ async fn get_project_findings(
     )
     .bind(&project_id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
     .fetch_one(&s.pool).await.map_err(|e| AppError::internal(e.to_string()))?;
-    if !exists { return Err(AppError::bad_request("项目不存在或无权访问")); }
+    if !exists {
+        return Err(AppError::bad_request("项目不存在或无权访问"));
+    }
     // Use project_id directly when populated, fall back to run-level join
     let items = sqlx::query_scalar::<_, Value>(
         "SELECT row_to_json(t) FROM (
@@ -2906,10 +3032,14 @@ async fn get_project_findings(
     )
     .bind(&project_id).bind(tenant_id).bind(security::tenant_wide(&user)).bind(&user.user_id)
     .fetch_all(&s.pool).await.unwrap_or_default();
-    let severity_summary: serde_json::Value = summary.into_iter().fold(json!({}), |mut acc, (sev, cnt)| {
-        acc[&sev] = json!(cnt); acc
-    });
-    Ok(Json(ApiResponse::new(json!({"items": items, "severity_summary": severity_summary}))))
+    let severity_summary: serde_json::Value =
+        summary.into_iter().fold(json!({}), |mut acc, (sev, cnt)| {
+            acc[&sev] = json!(cnt);
+            acc
+        });
+    Ok(Json(ApiResponse::new(
+        json!({"items": items, "severity_summary": severity_summary}),
+    )))
 }
 
 async fn get_project_traffic(
@@ -2919,7 +3049,11 @@ async fn get_project_traffic(
     user: CurrentUser,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, AppError> {
     let tenant_id = security::tenant_id(&user)?;
-    let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(100).clamp(1, 500);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
     let rows = sqlx::query_scalar::<_, Value>(
         "SELECT to_jsonb(t) FROM (
              SELECT t.id, t.run_id, t.tool_name, t.method, t.url, t.response_status, t.duration_ms, t.created_at

@@ -10,7 +10,7 @@ use kairos_platform_framework_database::PgPool;
 pub(super) async fn recently_unavailable_tools(pool: &PgPool) -> anyhow::Result<HashSet<String>> {
     let ttl_minutes = std::env::var("PENTA_TOOL_HEALTH_TTL_MINUTES")
         .ok()
-        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(10)
         .clamp(1, 1_440);
     let rows = sqlx::query_as::<_, (String, bool, i64)>(

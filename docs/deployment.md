@@ -28,7 +28,7 @@ cargo build --release -p kairos-scan-agent
 - `GATEWAY_HOST` 和 `GATEWAY_PORT`
 - 可选 `REDIS_URL`
 
-推荐由 systemd、Docker、Kubernetes 或其他进程管理器注入环境变量并负责重启。多个网关实例可以共享 PostgreSQL 和 Redis；异步任务轮询使用持久化状态，重复轮询应由供应商任务查询接口保持幂等。
+推荐由 systemd、Docker、Kubernetes 或其他进程管理器注入环境变量并负责重启。多个网关实例可以共享 PostgreSQL、Redis 和 NATS；Pent Run 以 NATS 为主触发并通过 PostgreSQL 租约排他执行，启动/低频维护负责恢复。
 
 新服务器首次部署建议流程：
 
@@ -68,7 +68,19 @@ export PENTA_WORKER_PROFILE=privileged
 cargo run -p kairos-platform-pent-agent
 ```
 
-该节点应使用独立系统账号和网络边界。不要在普通 worker 上设置此变量；任意脚本执行与 Metasploit 仍保持未开放。
+该节点应使用独立系统账号和网络边界，且不配置 `DATABASE_URL`。不要在普通 worker 上设置此变量；任意脚本执行与 Metasploit 仍保持未开放。
+
+本地授权红队回归靶场：
+
+```bash
+bash script/red-team-labs.sh up
+bash script/test-red-team-labs.sh
+```
+
+靶场只绑定 `127.0.0.1`。回归脚本会创建带截止时间和交战规则的 Red Team Engagement，再提交 Run。
+脚本默认等待 Run 结束，并要求至少 1 条发现；可通过 `RED_TEAM_TIMEOUT_SECONDS` 和
+`RED_TEAM_MIN_FINDINGS` 调整验收门槛。仅验证提交链路时设置
+`RED_TEAM_WAIT_FOR_COMPLETION=false`。执行完整回归前必须先配置一个认证有效的默认对话模型；401/403 会立即把 Run 标记为永久失败，不再反复重试。
 
 systemd 示例：
 

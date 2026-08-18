@@ -157,6 +157,11 @@ async fn applies_all_migrations_to_empty_postgres() {
     }
     for (table, column) in [
         ("pent_projects", "default_role_id"),
+        ("pent_projects", "engagement_mode"),
+        ("pent_projects", "authorization_status"),
+        ("pent_projects", "authorization_confirmed_at"),
+        ("pent_projects", "authorization_expires_at"),
+        ("pent_projects", "rules_of_engagement"),
         ("pent_mcp_servers", "config_revision"),
         ("pent_workers", "sandbox_backend"),
         ("pent_workers", "sandbox_ready"),

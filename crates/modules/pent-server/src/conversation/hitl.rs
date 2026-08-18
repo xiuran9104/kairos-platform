@@ -67,6 +67,7 @@ pub struct HitlPolicy {
     pub audit_model_id: Option<i64>,
     pub audit_system_prompt: String,
     pub audit_user_prompt: String,
+    pub engagement_pre_authorized: bool,
     global_whitelist: HashSet<String>,
     session_whitelist: HashSet<String>,
 }
@@ -87,6 +88,7 @@ impl HitlPolicy {
             audit_model_id: None,
             audit_system_prompt: String::new(),
             audit_user_prompt: String::new(),
+            engagement_pre_authorized: false,
             global_whitelist: normalize(global_whitelist),
             session_whitelist: normalize(session_whitelist),
         }
@@ -121,7 +123,11 @@ impl HitlGate {
         arguments: &str,
     ) -> anyhow::Result<HitlOutcome> {
         let policy = self.load_policy(run_id, session_id).await?;
-        if !policy.requires_review(tool_name) {
+        let per_action_approval = self.requires_per_action_approval(tool_name).await?;
+        if policy.engagement_pre_authorized && !per_action_approval {
+            return Ok(HitlOutcome::Approved(arguments.to_string()));
+        }
+        if !per_action_approval && !policy.requires_review(tool_name) {
             return Ok(HitlOutcome::Approved(arguments.to_string()));
         }
         let approval_id = format!("approval-{}", uuid::Uuid::new_v4());
@@ -164,14 +170,15 @@ impl HitlGate {
     }
 
     async fn load_policy(&self, run_id: &str, session_id: &str) -> anyhow::Result<HitlPolicy> {
-        let row: (bool, String, String, Value, Option<i64>, String, String, i32, Value, Value) = sqlx::query_as(
+        let row: (bool, String, String, Value, Option<i64>, String, String, i32, Value, Value, Value) = sqlx::query_as(
             "SELECT COALESCE((r.policy_snapshot->'hitl'->>'enabled')::boolean, (s.constraints->'hitl'->>'enabled')::boolean, p.hitl_enabled, false),
                     COALESCE(r.policy_snapshot->'hitl'->>'mode', s.constraints->'hitl'->>'mode', p.hitl_mode, 'approval'),
                     COALESCE(r.policy_snapshot->'hitl'->>'reviewer', s.constraints->'hitl'->>'reviewer', p.hitl_reviewer, 'human'),
                     COALESCE(p.hitl_tool_whitelist, '[]'::jsonb), p.hitl_audit_model_id,
                     COALESCE(p.hitl_audit_system_prompt,''), COALESCE(p.hitl_audit_user_prompt,''),
                     COALESCE(p.approval_ttl_seconds,1800), COALESCE(s.constraints->'hitl'->'tool_whitelist','[]'::jsonb),
-                    COALESCE(r.policy_snapshot->'hitl'->'tool_whitelist','[]'::jsonb)
+                    COALESCE(r.policy_snapshot->'hitl'->'tool_whitelist','[]'::jsonb),
+                    r.scope_snapshot
              FROM pent_runs r JOIN pent_agent_sessions s ON s.id=$2
              LEFT JOIN LATERAL (SELECT * FROM pent_runtime_policies WHERE tenant_id IN (r.tenant_id,0) ORDER BY (tenant_id=r.tenant_id) DESC LIMIT 1) p ON true
              WHERE r.id=$1")
@@ -189,7 +196,21 @@ impl HitlGate {
         policy.audit_system_prompt = row.5;
         policy.audit_user_prompt = row.6;
         policy.approval_ttl_seconds = row.7;
+        policy.engagement_pre_authorized = crate::engagement::is_pre_authorized_red_team(&row.10);
         Ok(policy)
+    }
+
+    async fn requires_per_action_approval(&self, tool_name: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pent_tool_definitions
+                 WHERE tool_id=$1 AND lifecycle_status='active'
+                   AND (approval_policy='always' OR risk_level='critical')
+             )",
+        )
+        .bind(tool_name)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn create_approval(

@@ -13,6 +13,8 @@ pg_dump "$database_url" \
   --format=plain \
   --no-owner \
   --no-privileges \
+  --exclude-table-data='ai.chat_conversations' \
+  --exclude-table-data='ai.chat_messages' \
   --exclude-table-data='pent_agent_sessions' \
   --exclude-table-data='pent_cloud_credentials' \
   --exclude-table-data='pent_agent_lessons' \
@@ -40,6 +42,7 @@ pg_dump "$database_url" \
   --exclude-table-data='pent_subtasks' \
   --exclude-table-data='pent_tasks' \
   --exclude-table-data='pent_tool_feedback' \
+  --exclude-table-data='pent_tool_health' \
   --exclude-table-data='pent_tool_route_decisions' \
   --exclude-table-data='pent_workers' \
   --exclude-table-data='scan_assets' \
@@ -66,9 +69,11 @@ BEGIN { FS = OFS = "\t"; in_copy = 0; sensitive_count = 0 }
 /^COPY / {
   in_copy = 1
   sensitive_count = 0
+  deleted_column = 0
   login_ip_column = 0
   login_date_column = 0
   sanitize_user_login = ($0 ~ /^COPY public[.]system_users /)
+  sanitize_model_configs = ($0 ~ /^COPY ai[.]model_configs /)
   header = $0
   sub(/^COPY [^(]+\(/, "", header)
   sub(/\) FROM stdin;$/, "", header)
@@ -84,6 +89,9 @@ BEGIN { FS = OFS = "\t"; in_copy = 0; sensitive_count = 0 }
     }
     if (sanitize_user_login && name == "login_date") {
       login_date_column = i
+    }
+    if (sanitize_model_configs && name == "deleted") {
+      deleted_column = i
     }
   }
   print
@@ -104,6 +112,11 @@ in_copy {
   }
   if (login_date_column > 0) {
     $login_date_column = "\\N"
+  }
+  # Local administrators may soft-delete catalog models. A new installation
+  # must still receive the reviewed baseline catalog rather than local state.
+  if (deleted_column > 0) {
+    $deleted_column = "f"
   }
 }
 { print }

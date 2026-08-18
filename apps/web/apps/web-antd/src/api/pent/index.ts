@@ -72,6 +72,7 @@ export function createPentProject(data: any) { return requestClient.post('/pent/
 export function updatePentProject(id: string, data: any) { return requestClient.put(`/pent/projects/${id}`, data); }
 export function deletePentProject(id: string) { return requestClient.delete(`/pent/projects/${id}`); }
 export function updatePentProjectModel(id: string, modelConfigId: number) { return requestClient.put(`/pent/projects/${id}/model`, { model_config_id: modelConfigId }); }
+export function updatePentProjectAuthorization(id: string, data: any) { return requestClient.put(`/pent/projects/${id}/authorization`, data); }
 export function getPentTasks() { return requestClient.get('/pent/tasks'); }
 export function createPentTask(data: any) { return requestClient.post('/pent/tasks', data); }
 export function cancelPentTask(id: string) { return requestClient.post(`/pent/tasks/${id}/cancel`); }

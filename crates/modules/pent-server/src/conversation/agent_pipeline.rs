@@ -97,11 +97,41 @@ pub fn is_transient_model_error(error: &anyhow::Error) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+/// Errors that cannot recover through backoff and must be surfaced as model
+/// configuration failures. Keeping this separate from the transient matcher
+/// avoids retrying authentication failures while still allowing an unknown
+/// transport error to use the bounded Run retry policy.
+pub fn is_permanent_model_configuration_error(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    [
+        "http 401",
+        "status: 401",
+        "401 unauthorized",
+        "http 403",
+        "status: 403",
+        "403 forbidden",
+        "invalid authentication",
+        "authentication fails",
+        "authentication failed",
+        "invalid api key",
+        "incorrect api key",
+        "api key not valid",
+        "api key is required",
+        "missing api key",
+        "insufficient_quota",
+        "billing quota",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 pub fn plan_completion_rejection(progress: &PlanProgress) -> Option<String> {
-    (!progress.is_complete()).then(|| format!(
-        "计划尚未收敛：总计 {}，待执行 {}，进行中 {}，阻塞 {}；请继续执行或显式更新步骤状态",
-        progress.total, progress.pending, progress.active, progress.blocked
-    ))
+    (!progress.is_complete()).then(|| {
+        format!(
+            "计划尚未收敛：总计 {}，待执行 {}，进行中 {}，阻塞 {}；请继续执行或显式更新步骤状态",
+            progress.total, progress.pending, progress.active, progress.blocked
+        )
+    })
 }
 
 pub fn supervisor_completion_rejection(agents: &[RuntimeSubAgent]) -> Option<String> {
@@ -144,6 +174,15 @@ mod tests {
         assert!(!is_transient_model_error(&anyhow::anyhow!(
             "HTTP 401 invalid api key"
         )));
+        assert!(is_permanent_model_configuration_error(
+            "模型调用失败: Invalid Authentication"
+        ));
+        assert!(is_permanent_model_configuration_error(
+            "HTTP 401 Unauthorized: Authentication Fails (governor)"
+        ));
+        assert!(!is_permanent_model_configuration_error(
+            "HTTP 503 service unavailable"
+        ));
     }
 
     #[test]
@@ -192,13 +231,9 @@ mod tests {
             completed_at: None,
         };
         assert!(supervisor_completion_rejection(&[]).is_some());
-        assert!(
-            supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Running)]).is_some()
-        );
+        assert!(supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Running)]).is_some());
         assert!(supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Failed)]).is_some());
-        assert!(
-            supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Completed)]).is_none()
-        );
+        assert!(supervisor_completion_rejection(&[agent(RuntimeAgentStatus::Completed)]).is_none());
         let mut uncollected = agent(RuntimeAgentStatus::Completed);
         uncollected.collected = false;
         assert!(supervisor_completion_rejection(&[uncollected]).is_some());

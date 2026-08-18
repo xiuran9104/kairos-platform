@@ -9,7 +9,7 @@ const report = ref<any>(null);
 const loading = ref(false);
 async function load() {
   loading.value = true;
-  try { report.value = (await requestClient.get(`/api/reports/${reportId.value}`))?.data; }
+  try { report.value = (await requestClient.get(`/pent/reports/${reportId.value}`))?.data; }
   finally { loading.value = false; }
 }
 onMounted(load);

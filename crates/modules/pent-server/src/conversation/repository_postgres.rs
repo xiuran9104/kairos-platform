@@ -183,6 +183,14 @@ impl ConversationRepository for PgConversationRepository {
         let task_id = uuid::Uuid::new_v4().to_string();
         let run_id = uuid::Uuid::new_v4().to_string();
         let task_name = task_display_name(&session.2, &session.3);
+        let authorized_scope = crate::engagement::authorized_scope(
+            &self.pool,
+            session.0,
+            session.1.as_deref(),
+            session.3.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
         sqlx::query(
             "INSERT INTO pent_tasks(
                  id,tenant_id,project_id,name,description,target_scope,status,created_by
@@ -193,7 +201,7 @@ impl ConversationRepository for PgConversationRepository {
         .bind(&session.1)
         .bind(&task_name)
         .bind(&session.2)
-        .bind(&session.3)
+        .bind(&authorized_scope)
         .bind(&session.6)
         .execute(&mut *tx)
         .await?;
@@ -210,7 +218,7 @@ impl ConversationRepository for PgConversationRepository {
         .bind(&session.1)
         .bind(session_id)
         .bind(&session.2)
-        .bind(&session.3)
+        .bind(&authorized_scope)
         .bind(&session.4)
         .bind(&session.5)
         .execute(&mut *tx)

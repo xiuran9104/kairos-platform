@@ -218,6 +218,7 @@ async fn execute_verification(
         run_id: None,
         traffic_run_id: Some(id.clone()),
         timeout_seconds: 600,
+        secret_environment: Default::default(),
     };
     let response = match bus.request_tool_execution(&request).await {
         Ok(response) => response,

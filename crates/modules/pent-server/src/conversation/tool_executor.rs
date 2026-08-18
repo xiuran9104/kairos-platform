@@ -307,6 +307,7 @@ async fn execute_recipe_tool(
         timeout_seconds: crate::infrastructure::recipe::lookup(name)
             .map(|recipe| recipe.resource_profile.timeout_seconds)
             .unwrap_or(300),
+        secret_environment: Default::default(),
     };
     match bus.request_tool_execution(&request).await {
         Ok(response) if response.error.is_some() => {
@@ -500,6 +501,7 @@ async fn execute_isolated_http_request(
         run_id: run_id.map(str::to_owned),
         traffic_run_id: None,
         timeout_seconds: 30,
+        secret_environment: Default::default(),
     };
     let output = match bus.request_tool_execution(&request).await {
         Ok(response) if response.error.is_none() && response.output.is_some() => {
@@ -571,6 +573,7 @@ async fn execute_isolated_http_probe(
             run_id: run_id.map(str::to_owned),
             traffic_run_id: None,
             timeout_seconds: 30,
+            secret_environment: Default::default(),
         };
         match bus.request_tool_execution(&request).await {
             Ok(response) if response.error.is_none() && response.output.is_some() => {

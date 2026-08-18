@@ -1655,6 +1655,7 @@ dependencies = [
  "kairos-platform-infra-server",
  "kairos-platform-media-server",
  "kairos-platform-pent-server",
+ "kairos-platform-pent-tooling",
  "kairos-platform-scan-server",
  "kairos-platform-system-server",
  "serde",
@@ -1662,6 +1663,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1746,10 +1748,8 @@ dependencies = [
  "anyhow",
  "axum",
  "kairos-platform-framework-common",
- "kairos-platform-framework-database",
  "kairos-platform-framework-web",
  "kairos-platform-pent-server",
- "kairos-platform-pent-tooling",
  "tokio",
  "tracing",
  "uuid",

@@ -82,9 +82,8 @@ services:
     shm_size: 2gb
 
   # ── M2-F12: Distributed Pent Agent worker nodes ──────────────────
-  # Each instance is an independent worker that claims queued runs via
-  # DB advisory lock. Scale horizontally by increasing the replica count
-  # or adding more named instances with distinct worker ids.
+  # Database-less execution nodes. Gateway owns Run coordination and durable
+  # state; agents receive desired state and publish audits through NATS.
   pent-agent-1:
     build:
       context: ../..
@@ -92,7 +91,6 @@ services:
     container_name: kairos-platform-pent-agent-1
     command: cargo run -p kairos-platform-pent-agent
     environment:
-      DATABASE_URL: postgres://kairos_platform:kairos_platform@postgres:5432/kairos_platform
       REDIS_URL: redis://redis:6379
       NATS_URL: nats://nats:4222
       PENT_AGENT_PORT: "8081"
@@ -111,7 +109,6 @@ services:
     container_name: kairos-platform-pent-agent-2
     command: cargo run -p kairos-platform-pent-agent
     environment:
-      DATABASE_URL: postgres://kairos_platform:kairos_platform@postgres:5432/kairos_platform
       REDIS_URL: redis://redis:6379
       NATS_URL: nats://nats:4222
       PENT_AGENT_PORT: "8082"
@@ -122,6 +119,32 @@ services:
     restart: unless-stopped
     profiles:
       - distributed
+
+  # ── Isolated red-team regression targets (loopback only) ─────────
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: kairos-lab-juice-shop
+    ports:
+      - "127.0.0.1:13000:3000"
+    profiles:
+      - red-team-labs
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: kairos-lab-dvwa
+    ports:
+      - "127.0.0.1:13001:80"
+    profiles:
+      - red-team-labs
+
+  webgoat:
+    image: webgoat/webgoat:latest
+    container_name: kairos-lab-webgoat
+    ports:
+      - "127.0.0.1:13002:8080"
+      - "127.0.0.1:13003:9090"
+    profiles:
+      - red-team-labs
 
 volumes:
   kairos-platform-postgres:

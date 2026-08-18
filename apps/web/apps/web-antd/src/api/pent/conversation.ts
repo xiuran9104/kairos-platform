@@ -16,15 +16,15 @@ export function createPentTaskApi(data: {
     tool_whitelist?: string[];
   };
 }) {
-  return requestClient.post('/api/tasks', data, { timeout: 30_000 });
+  return requestClient.post('/pent/tasks', data, { timeout: 30_000 });
 }
 
 export function getPentTaskApi(id: string) {
-  return requestClient.get(`/api/tasks/${id}`);
+  return requestClient.get(`/pent/tasks/${id}`);
 }
 
 export function cancelPentTaskApi(id: string) {
-  return requestClient.post(`/api/tasks/${id}/cancel`);
+  return requestClient.post(`/pent/tasks/${id}/cancel`);
 }
 
 // ── Turn management (used by task monitoring) ──────────────────────

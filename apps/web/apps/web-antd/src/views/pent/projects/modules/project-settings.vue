@@ -7,7 +7,12 @@ import { AiModelTypeEnum } from '@vben/constants';
 import { message } from 'ant-design-vue';
 
 import { getModelSimpleList } from '#/api/ai/model/model';
-import { getPentRoles, updatePentProject, updatePentProjectModel } from '#/api/pent';
+import {
+  getPentRoles,
+  updatePentProject,
+  updatePentProjectAuthorization,
+  updatePentProjectModel,
+} from '#/api/pent';
 
 const props = defineProps<{ project: Record<string, any> }>();
 const emit = defineEmits<{ saved: [] }>();
@@ -21,9 +26,12 @@ const form = ref({
   assetScopeText: '',
   description: '',
   defaultRoleId: '',
+  engagementMode: 'assessment',
   modelConfigId: undefined as number | undefined,
   name: '',
   status: 'active',
+  authorizationExpiresAt: '',
+  rulesOfEngagement: '{}',
 });
 
 function resetForm() {
@@ -34,9 +42,14 @@ function resetForm() {
       : '',
     description: project.description || '',
     defaultRoleId: project.default_role_id || '',
+    engagementMode: project.engagement_mode || 'assessment',
     modelConfigId: project.model_config_id || undefined,
     name: project.name || '',
     status: project.status || 'active',
+    authorizationExpiresAt: project.authorization_expires_at
+      ? project.authorization_expires_at.slice(0, 16)
+      : '',
+    rulesOfEngagement: JSON.stringify(project.rules_of_engagement || {}, null, 2),
   };
 }
 
@@ -74,11 +87,20 @@ async function save() {
     .filter(Boolean);
   saving.value = true;
   try {
+    let rulesOfEngagement: Record<string, any> = {};
+    try {
+      rulesOfEngagement = JSON.parse(form.value.rulesOfEngagement || '{}');
+    } catch {
+      message.warning('交战规则必须是合法 JSON');
+      return;
+    }
     await updatePentProject(props.project.id, {
       asset_scope: assetScope,
       description: form.value.description.trim(),
       default_role_id: form.value.defaultRoleId || null,
+      engagement_mode: form.value.engagementMode,
       name,
+      rules_of_engagement: rulesOfEngagement,
       status: form.value.status,
     });
     if (
@@ -91,6 +113,37 @@ async function save() {
     emit('saved');
   } catch (error: any) {
     message.error(error?.message || '保存项目设置失败');
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function authorizeRedTeam(confirmed: boolean) {
+  if (form.value.engagementMode !== 'red_team') return;
+  if (confirmed && !form.value.authorizationExpiresAt) {
+    message.warning('请设置授权截止时间');
+    return;
+  }
+  let rulesOfEngagement: Record<string, any> = {};
+  try {
+    rulesOfEngagement = JSON.parse(form.value.rulesOfEngagement || '{}');
+  } catch {
+    message.warning('交战规则必须是合法 JSON');
+    return;
+  }
+  saving.value = true;
+  try {
+    await updatePentProjectAuthorization(props.project.id, {
+      confirmed,
+      expires_at: confirmed
+        ? new Date(form.value.authorizationExpiresAt).toISOString()
+        : undefined,
+      rules_of_engagement: rulesOfEngagement,
+    });
+    message.success(confirmed ? '红队 Engagement 已授权' : '红队授权已撤销');
+    emit('saved');
+  } catch (error: any) {
+    message.error(error?.message || '更新授权失败');
   } finally {
     saving.value = false;
   }
@@ -137,6 +190,26 @@ onMounted(() => Promise.all([loadModels(), loadRoles()]));
         placeholder="example.com&#10;10.0.0.0/24&#10;https://app.example.com"
       />
     </a-form-item>
+    <a-form-item label="执行模式">
+      <a-radio-group v-model:value="form.engagementMode">
+        <a-radio-button value="assessment">安全评估</a-radio-button>
+        <a-radio-button value="red_team">授权红队</a-radio-button>
+      </a-radio-group>
+    </a-form-item>
+    <template v-if="form.engagementMode === 'red_team'">
+      <a-alert
+        :message="project.authorization_status === 'authorized' ? '红队授权生效中' : '红队模式尚未授权，Run 将被拒绝'"
+        :type="project.authorization_status === 'authorized' ? 'success' : 'warning'"
+        show-icon
+        style="margin-bottom: 16px"
+      />
+      <a-form-item label="授权截止时间" required>
+        <a-input v-model:value="form.authorizationExpiresAt" type="datetime-local" />
+      </a-form-item>
+      <a-form-item label="交战规则（JSON）" extra="记录时间窗口、禁止动作、速率限制和允许的验证深度">
+        <a-textarea v-model:value="form.rulesOfEngagement" :rows="6" />
+      </a-form-item>
+    </template>
     <a-form-item label="默认对话模型" extra="未选择时由运行时使用平台默认聊天模型">
       <a-select
         v-model:value="form.modelConfigId"
@@ -170,6 +243,18 @@ onMounted(() => Promise.all([loadModels(), loadRoles()]));
     </a-form-item>
     <a-space>
       <a-button type="primary" :loading="saving" @click="save">保存设置</a-button>
+      <a-button
+        v-if="form.engagementMode === 'red_team'"
+        type="primary"
+        danger
+        :loading="saving"
+        @click="authorizeRedTeam(true)"
+      >确认红队授权</a-button>
+      <a-button
+        v-if="form.engagementMode === 'red_team' && project.authorization_status === 'authorized'"
+        :loading="saving"
+        @click="authorizeRedTeam(false)"
+      >撤销授权</a-button>
       <a-button @click="resetForm">撤销修改</a-button>
     </a-space>
   </a-form>

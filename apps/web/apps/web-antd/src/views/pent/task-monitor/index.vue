@@ -37,7 +37,7 @@ async function loadTask() {
   if (!taskId.value) return;
   loading.value = true;
   try {
-    const resp: any = await requestClient.get(`/api/tasks/${taskId.value}`);
+    const resp: any = await requestClient.get(`/pent/tasks/${taskId.value}`);
     task.value = resp?.data ?? resp;
     if (task.value?.latest_run?.status === 'running' || task.value?.status === 'running') {
       startRunStream();
@@ -88,7 +88,7 @@ function stopRunStream() {
 async function cancelTask() {
   if (!taskId.value) return;
   try {
-    await requestClient.post(`/api/tasks/${taskId.value}/cancel`);
+    await requestClient.post(`/pent/tasks/${taskId.value}/cancel`);
     message.success('任务已取消');
     if (task.value) task.value.status = 'cancelled';
     stopRunStream();
@@ -103,7 +103,7 @@ function startPolling() {
   pollTimer.value = setInterval(async () => {
     if (!taskId.value) return;
     try {
-      const resp: any = await requestClient.get(`/api/tasks/${taskId.value}`);
+      const resp: any = await requestClient.get(`/pent/tasks/${taskId.value}`);
       const data = resp?.data ?? resp;
       if (data) {
         task.value = data;
@@ -150,7 +150,7 @@ const turns = ref<any[]>([]);
 async function refreshTurns() {
   if (!taskId.value) return;
   try {
-    const resp: any = await requestClient.get(`/api/tasks/${taskId.value}`);
+    const resp: any = await requestClient.get(`/pent/tasks/${taskId.value}`);
     const data = resp?.data ?? resp;
     if (data?.latest_run?.id) {
       const tid = data.latest_run.id;

@@ -21,14 +21,20 @@ pub(crate) fn routes() -> Router<PentState> {
             "/pent/sessions/{id}",
             get(get_session).put(update_session).delete(delete_session),
         )
-        .route("/pent/sessions/{id}/model", axum::routing::put(update_session_model))
+        .route(
+            "/pent/sessions/{id}/model",
+            axum::routing::put(update_session_model),
+        )
         .route(
             "/pent/sessions/{id}/messages",
             get(list_messages).post(create_message),
         )
         .route("/pent/sessions/{id}/scope/confirm", post(confirm_scope))
         .route("/pent/sessions/{id}/runs", post(create_session_run))
-        .route("/pent/sessions/{id}/role", axum::routing::put(update_session_role))
+        .route(
+            "/pent/sessions/{id}/role",
+            axum::routing::put(update_session_role),
+        )
         .route("/pent/runs/{id}/instructions", post(create_instruction))
 }
 
@@ -449,7 +455,11 @@ async fn create_session(
         "confirmed_by": user.user_id
     });
     let mut constraints = request.constraints.clone();
-    if let Some(role_id) = request.role_id.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(role_id) = request
+        .role_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         if !crate::role_resolution::ensure_visible_role(&state.pool, tenant_id, role_id)
             .await
             .map_err(|error| AppError::internal(error.to_string()))?
@@ -572,7 +582,10 @@ async fn create_message(
     tokio::spawn(async move {
         let execution = async {
             let runtime = crate::conversation::build_runtime(&pool, None);
-            if let Err(error) = runtime.execute_turn(turn_id_clone.clone(), &turn_request).await {
+            if let Err(error) = runtime
+                .execute_turn(turn_id_clone.clone(), &turn_request)
+                .await
+            {
                 tracing::warn!(error = %error, "conversation turn execution failed");
             }
         };
@@ -702,6 +715,10 @@ async fn create_session_run(
     .map_err(internal)?;
     let (project_id, objective, scope, constraints, budget) =
         row.ok_or_else(|| AppError::bad_request("会话不存在或状态不可用"))?;
+    let scope =
+        crate::engagement::authorized_scope(&state.pool, tenant_id, project_id.as_deref(), scope)
+            .await
+            .map_err(AppError::bad_request)?;
     let requested_role_id = constraints.get("role_id").and_then(Value::as_str);
     let resolved_role = crate::role_resolution::resolve_role(
         &state.pool,

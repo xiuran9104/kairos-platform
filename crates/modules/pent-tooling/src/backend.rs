@@ -16,11 +16,19 @@ impl SecretEnvironment {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.0.iter().map(|(name, value)| (name.as_str(), value.as_str()))
+        self.0
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Copy the secret pairs for a single trusted control-plane to worker
+    /// transport hop. Callers must keep the resulting value out of logs.
+    pub fn to_vec(&self) -> Vec<(String, String)> {
+        self.0.clone()
     }
 }
 

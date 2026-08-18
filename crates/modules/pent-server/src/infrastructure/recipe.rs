@@ -473,6 +473,15 @@ impl ExecutableRecipe {
 
 static RECIPE_STORE: RwLock<Option<Arc<HashMap<String, ExecutableRecipe>>>> = RwLock::new(None);
 
+/// Serializable desired-state entry sent from Gateway to database-less
+/// execution nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRecipeDefinition {
+    pub tool_id: String,
+    pub executor: serde_json::Value,
+    pub resource_profile: serde_json::Value,
+}
+
 pub fn set_global_recipes(recipes: HashMap<String, ExecutableRecipe>) {
     let mut guard = RECIPE_STORE.write().expect("recipe store poisoned");
     *guard = Some(Arc::new(recipes));
@@ -496,11 +505,32 @@ pub fn has_executable(tool_name: &str) -> bool {
         .is_some_and(|store| store.contains_key(tool_name))
 }
 
+pub fn executable_recipes() -> Vec<(String, ExecutableRecipe)> {
+    RECIPE_STORE
+        .read()
+        .expect("recipe store poisoned")
+        .as_ref()
+        .map(|store| {
+            store
+                .iter()
+                .map(|(name, recipe)| (name.clone(), recipe.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Load executable recipes from `pent_tool_definitions` into the global store.
 /// Returns the number of recipes loaded.
 pub async fn load_from_db(
     pool: &kairos_platform_framework_database::PgPool,
 ) -> anyhow::Result<usize> {
+    let definitions = snapshot_from_db(pool).await?;
+    Ok(load_runtime_snapshot(definitions))
+}
+
+pub async fn snapshot_from_db(
+    pool: &kairos_platform_framework_database::PgPool,
+) -> anyhow::Result<Vec<RuntimeRecipeDefinition>> {
     let rows: Vec<(String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
         "SELECT tool_id, executor, resource_profile FROM pent_tool_definitions
          WHERE lifecycle_status = 'active'
@@ -509,17 +539,30 @@ pub async fn load_from_db(
     )
     .fetch_all(pool)
     .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(tool_id, executor, resource_profile)| RuntimeRecipeDefinition {
+                tool_id,
+                executor,
+                resource_profile,
+            },
+        )
+        .collect())
+}
+
+pub fn load_runtime_snapshot(definitions: Vec<RuntimeRecipeDefinition>) -> usize {
     let mut recipes = HashMap::new();
-    for (tool_id, executor, resource_profile) in rows {
-        if let Some(recipe) = ExecutableRecipe::from_executor_json(&executor) {
-            let profile = serde_json::from_value(resource_profile).unwrap_or_default();
+    for definition in definitions {
+        if let Some(recipe) = ExecutableRecipe::from_executor_json(&definition.executor) {
+            let profile = serde_json::from_value(definition.resource_profile).unwrap_or_default();
             let recipe = recipe.with_resource_profile(profile);
-            recipes.insert(tool_id, recipe);
+            recipes.insert(definition.tool_id, recipe);
         }
     }
     let count = recipes.len();
     set_global_recipes(recipes);
-    Ok(count)
+    count
 }
 
 // ── Template rendering ──────────────────────────────────────────────────
@@ -658,9 +701,9 @@ pub fn render_recipe_from_json(
         }
         if matches!(param.type_.as_str(), "bool" | "boolean") {
             let enabled = match args.get(&param.name).or(param.default.as_ref()) {
-                Some(value) => value.as_bool().ok_or_else(|| {
-                    format!("参数 {} 必须是布尔值", param.name)
-                })?,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| format!("参数 {} 必须是布尔值", param.name))?,
                 None if param.required => {
                     return Err(format!("缺少必需参数: {}", param.name));
                 }
@@ -1135,10 +1178,7 @@ recipes:
             &NetworkPolicy::Full,
         )
         .unwrap();
-        assert_eq!(
-            prepared.args,
-            vec!["-sT", "example.com", "--introspection"]
-        );
+        assert_eq!(prepared.args, vec!["-sT", "example.com", "--introspection"]);
     }
 
     #[test]
@@ -1213,8 +1253,18 @@ recipes:
         .unwrap();
         assert_eq!(command.program, "/usr/local/bin/prowler");
         assert!(command.args.contains(&"aws".to_string()));
-        assert!(!command.args.iter().any(|arg| arg.contains("credential-opaque-1")));
-        assert!(!command.args.iter().any(|arg| arg.contains("credential_ref")));
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg.contains("credential-opaque-1"))
+        );
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg.contains("credential_ref"))
+        );
 
         let scout = recipes
             .iter()
@@ -1231,7 +1281,12 @@ recipes:
         .unwrap();
         assert_eq!(scout_command.program, "/usr/local/bin/scout");
         assert!(scout_command.args.contains(&"azure".to_string()));
-        assert!(!scout_command.args.iter().any(|arg| arg.contains("credential-opaque-2")));
+        assert!(
+            !scout_command
+                .args
+                .iter()
+                .any(|arg| arg.contains("credential-opaque-2"))
+        );
     }
 
     #[test]
