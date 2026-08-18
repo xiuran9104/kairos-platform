@@ -143,6 +143,12 @@ services:
     ports:
       - "127.0.0.1:13002:8080"
       - "127.0.0.1:13003:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/WebGoat/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     profiles:
       - red-team-labs
 
