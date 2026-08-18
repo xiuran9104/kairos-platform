@@ -962,6 +962,9 @@ recipes:
     - -jsonl
     - -silent
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 1.0
     memory_mb: 512
@@ -1659,8 +1662,12 @@ recipes:
   - url
   executor:
     type: host
-    program: /usr/bin/hakrawler
-    args: []
+    program: /usr/local/bin/hakrawler
+    args:
+    - -u
+    - -insecure
+    - -timeout
+    - '30'
   resource_profile:
     cpu_cores: 0.3
     memory_mb: 64
@@ -1669,11 +1676,10 @@ recipes:
   parameters:
   - name: target
     type: string
-    description: ''
+    description: 目标 URL（经 stdin 传入；当前 hakrawler 版本不支持 -url 参数）
     required: true
     target: true
-    flag: -url
-    format: flag
+    format: stdin
 - tool_id: httrack
   version: 1.0.0
   manifest_version: 1
@@ -2557,6 +2563,9 @@ recipes:
     - -bulk-size
     - '1'
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 0.5
     memory_mb: 256
@@ -2608,6 +2617,9 @@ recipes:
     - -bulk-size
     - '1'
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 0.5
     memory_mb: 256
@@ -2659,6 +2671,9 @@ recipes:
     - -bulk-size
     - '1'
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 0.5
     memory_mb: 256
@@ -2710,6 +2725,9 @@ recipes:
     - -bulk-size
     - '1'
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 0.5
     memory_mb: 256
@@ -2756,6 +2774,9 @@ recipes:
     - -bulk-size
     - '1'
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 0.5
     memory_mb: 256
@@ -2807,6 +2828,9 @@ recipes:
     - -bulk-size
     - '1'
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 0.5
     memory_mb: 256
@@ -2934,6 +2958,9 @@ recipes:
     - -jsonl
     - -silent
     - -no-interactsh
+    - -t
+    - /tool-data/nuclei-templates
+    - -duc
   resource_profile:
     cpu_cores: 1.0
     memory_mb: 512

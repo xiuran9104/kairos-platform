@@ -13,7 +13,7 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 pub use kairos_platform_pent_tooling::backend::{
@@ -66,6 +66,7 @@ pub async fn spawn_interactive_shell(
     let prepared = PreparedTool {
         program: "/bin/bash",
         args: vec!["--noprofile".into(), "--norc".into()],
+        stdin: None,
     };
     let sandbox = build_bubblewrap_command(&prepared, prepared.program, &limits, &[], &[])?;
     let mut command = Command::new(&sandbox.program);
@@ -417,7 +418,11 @@ async fn execute_prepared_tool(
         }
     }
     let child_result = cmd
-        .stdin(Stdio::null())
+        .stdin(if prepared.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -425,6 +430,12 @@ async fn execute_prepared_tool(
     drop(sandbox.seccomp_file);
     let _ = std::fs::remove_file(&sandbox.seccomp_path);
     let mut child = child_result.map_err(|error| format!("无法启动工具 {tool_name}: {error}"))?;
+
+    // Feed stdin-driven tools (e.g. hakrawler) their payload, then drop the
+    // handle so the tool observes EOF and starts processing.
+    if let (Some(payload), Some(mut stdin)) = (&prepared.stdin, child.stdin.take()) {
+        let _ = stdin.write_all(payload.as_bytes()).await;
+    }
 
     // ── M3: cgroup v2 isolation ────────────────────────────────────
     // Attach the spawned process to a per-task cgroup so the kernel
@@ -731,6 +742,29 @@ fn build_bubblewrap_command(
         ] {
             args.extend(["--ro-bind-try".into(), path.into(), path.into()]);
         }
+        // Tool data directories required by wrapper scripts or template
+        // engines at canonical paths (read-only; ro-bind-try skips them when
+        // absent so missing optional tooling never breaks unrelated tools):
+        // - /var/lib/nikto + /etc/nikto.conf: /usr/bin/nikto is a shell
+        //   wrapper execing /var/lib/nikto/nikto.pl; without these binds
+        //   nikto exits 127 inside the sandbox.
+        bind_ro_dir(&mut args, Path::new("/var/lib/nikto"));
+        args.extend([
+            "--ro-bind-try".into(),
+            "/etc/nikto.conf".into(),
+            "/etc/nikto.conf".into(),
+        ]);
+        // nuclei needs its template library; the sandbox HOME cannot see the
+        // host's per-user template dir, so bind it at a fixed path that
+        // recipes reference via `-t /tool-data/nuclei-templates`.
+        if let Some(templates) = nuclei_templates_dir() {
+            args.extend(["--dir".into(), "/tool-data".into()]);
+            args.extend([
+                "--ro-bind".into(),
+                templates.to_string_lossy().into_owned(),
+                NUCLEI_SANDBOX_TEMPLATES_DIR.into(),
+            ]);
+        }
         bind_external_tool_runtime(&mut args, resolved_program)?;
         args.extend([
             "--dir".into(),
@@ -810,6 +844,27 @@ fn build_bubblewrap_command(
             seccomp_path,
         })
     }
+}
+
+/// Fixed sandbox path where the host's nuclei template library is bound.
+/// Recipes reference it via `-t /tool-data/nuclei-templates`.
+pub(crate) const NUCLEI_SANDBOX_TEMPLATES_DIR: &str = "/tool-data/nuclei-templates";
+
+/// Locate the host's nuclei template library. `PENTA_NUCLEI_TEMPLATES_DIR`
+/// wins; otherwise probe the common per-user install locations.
+#[cfg(target_os = "linux")]
+fn nuclei_templates_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PENTA_NUCLEI_TEMPLATES_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+    {
+        return Some(dir);
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    [".local/nuclei-templates", "nuclei-templates", ".config/nuclei/templates"]
+        .iter()
+        .map(|candidate| home.join(candidate))
+        .find(|path| path.is_dir())
 }
 
 #[cfg(target_os = "linux")]
@@ -1181,6 +1236,7 @@ mod tests {
         let mut curl = PreparedTool {
             program: "/usr/bin/curl",
             args: vec!["https://example.test".into()],
+            stdin: None,
         };
         inject_run_id_header(&mut curl, Some("run-123"));
         assert!(
@@ -1192,6 +1248,7 @@ mod tests {
         let mut nmap = PreparedTool {
             program: "/usr/bin/nmap",
             args: vec!["example.test".into()],
+            stdin: None,
         };
         inject_run_id_header(&mut nmap, Some("run-123"));
         assert!(!nmap.args.iter().any(|arg| arg.contains("x-kairos-run-id")));
@@ -1267,6 +1324,7 @@ mod tests {
         let prepared = PreparedTool {
             program: "/usr/bin/sh",
             args: vec!["-c".into(), script],
+            stdin: None,
         };
         let limits = ToolExecutionLimits {
             network_access: NetworkPolicy::Full,

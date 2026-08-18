@@ -672,6 +672,7 @@ pub fn render_recipe(
     Ok(PreparedTool {
         program: recipe.program,
         args,
+        stdin: None,
     })
 }
 
@@ -694,6 +695,7 @@ pub fn render_recipe_from_json(
     let mut command: Vec<String> = fixed;
     let mut positional: Vec<(usize, String)> = Vec::new();
     let mut target: Option<String> = None;
+    let mut stdin: Option<String> = None;
 
     for param in &recipe.parameters {
         if param.runtime_only {
@@ -732,6 +734,15 @@ pub fn render_recipe_from_json(
             target = Some(value.clone());
         }
         match param.format.as_deref().unwrap_or("flag") {
+            "stdin" => {
+                // Tools like hakrawler read targets from stdin instead of a
+                // CLI flag; deliver the value as one newline-terminated line.
+                let mut payload = value;
+                if !payload.ends_with('\n') {
+                    payload.push('\n');
+                }
+                stdin = Some(payload);
+            }
             "positional" => {
                 let position = param.position.unwrap_or(command.len());
                 positional.push((position, value));
@@ -786,6 +797,7 @@ pub fn render_recipe_from_json(
     Ok(PreparedTool {
         program: recipe.program,
         args: command,
+        stdin,
     })
 }
 
@@ -1154,6 +1166,31 @@ recipes:
         let bad = render_recipe_from_json(
             &recipe,
             &serde_json::json!({"target": "other.com"}),
+            &policy,
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn json_rendering_routes_stdin_format_to_stdin_payload() {
+        let mut target = p("target", "stdin");
+        target.target = true;
+        let recipe = param_recipe(vec![target]);
+
+        let prepared = render_recipe_from_json(
+            &recipe,
+            &serde_json::json!({"target": "http://example.com"}),
+            &NetworkPolicy::Full,
+        )
+        .unwrap();
+        assert_eq!(prepared.args, vec!["-sT"]);
+        assert_eq!(prepared.stdin.as_deref(), Some("http://example.com\n"));
+
+        // Scope validation still applies to stdin-delivered targets.
+        let policy = NetworkPolicy::TargetOnly("example.com".into());
+        let bad = render_recipe_from_json(
+            &recipe,
+            &serde_json::json!({"target": "http://other.com"}),
             &policy,
         );
         assert!(bad.is_err());

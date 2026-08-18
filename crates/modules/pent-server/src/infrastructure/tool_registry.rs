@@ -6,6 +6,9 @@ use super::process::NetworkPolicy;
 pub struct PreparedTool {
     pub program: &'static str,
     pub args: Vec<String>,
+    /// Optional stdin payload for tools that read targets from standard
+    /// input instead of CLI flags (e.g. hakrawler).
+    pub stdin: Option<String>,
 }
 
 /// DesRed-style structured rendering: render a recipe from the model's JSON
@@ -59,6 +62,7 @@ pub fn prepare_tool(
                     "--url".into(),
                     normalize_http_probe_target(target),
                 ],
+                stdin: None,
             })
         }
         "http_request" => {
@@ -119,6 +123,7 @@ pub fn prepare_tool(
             Ok(PreparedTool {
                 program: "/usr/bin/curl",
                 args,
+                stdin: None,
             })
         }
         _ => Err(format!("工具 {tool_name} 未在配方中注册")),

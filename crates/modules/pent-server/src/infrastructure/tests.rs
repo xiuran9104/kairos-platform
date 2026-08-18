@@ -236,6 +236,7 @@ mod tool_execution_tests {
         let mut curl = PreparedTool {
             program: "/usr/bin/curl",
             args: vec!["--silent".into()],
+            stdin: None,
         };
         inject_run_id_header(&mut curl, Some("run-123"));
         assert!(curl.args.iter().any(|a| a == "--header"));
@@ -244,6 +245,7 @@ mod tool_execution_tests {
         let mut nmap = PreparedTool {
             program: "/usr/bin/nmap",
             args: vec!["-sV".into()],
+            stdin: None,
         };
         inject_run_id_header(&mut nmap, Some("run-123"));
         assert!(!nmap.args.iter().any(|a| a == "--header"));
@@ -251,6 +253,7 @@ mod tool_execution_tests {
         let mut curl_no_run = PreparedTool {
             program: "/usr/bin/curl",
             args: vec![],
+            stdin: None,
         };
         inject_run_id_header(&mut curl_no_run, None);
         assert!(curl_no_run.args.is_empty());
