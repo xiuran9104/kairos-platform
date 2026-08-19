@@ -15,6 +15,22 @@ use tracing::{info, warn};
 
 const DEFAULT_INLINE_BODY_LIMIT: usize = 256 * 1024;
 
+/// PostgreSQL `text` rejects NUL bytes; tool output and MITM payloads are
+/// arbitrary bytes lossily decoded to UTF-8, so a single `\0` would fail the
+/// whole insert and the traffic record would be lost. Replace NUL with a
+/// visible escape before binding.
+pub(crate) fn sanitize_pg_text(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains('\0') {
+        std::borrow::Cow::Owned(value.replace('\0', "\\0"))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
+pub(crate) fn sanitize_pg_text_opt(value: &Option<String>) -> Option<std::borrow::Cow<'_, str>> {
+    value.as_deref().map(sanitize_pg_text)
+}
+
 pub struct MitmTrafficSink {
     pool: PgPool,
 }
@@ -146,10 +162,10 @@ async fn persist_record(pool: &PgPool, record: &CapturedTrafficRecord) -> anyhow
     .bind(&record.method)
     .bind(&record.url)
     .bind(&record.request_headers)
-    .bind(&record.request_body)
+    .bind(sanitize_pg_text_opt(&record.request_body))
     .bind(record.response_status)
     .bind(&record.response_headers)
-    .bind(&record.response_body)
+    .bind(sanitize_pg_text_opt(&record.response_body))
     .bind(&record.response_sha256)
     .bind(record.duration_ms)
     .bind(Option::<String>::None)
@@ -287,7 +303,18 @@ pub async fn spawn_traffic_persistence(
 
 #[cfg(test)]
 mod tests {
-    use super::traffic_capture_enabled_from;
+    use super::{sanitize_pg_text, sanitize_pg_text_opt, traffic_capture_enabled_from};
+
+    #[test]
+    fn sanitize_pg_text_escapes_nul_bytes() {
+        assert_eq!(sanitize_pg_text("plain body"), "plain body");
+        assert_eq!(sanitize_pg_text("a\0b\0"), "a\\0b\\0");
+        assert_eq!(
+            sanitize_pg_text_opt(&Some("x\0y".to_string())).as_deref(),
+            Some("x\\0y")
+        );
+        assert!(sanitize_pg_text_opt(&None).is_none());
+    }
 
     #[test]
     fn traffic_capture_defaults_to_enabled() {

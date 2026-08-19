@@ -964,10 +964,14 @@ impl ConversationRepository for PgConversationRepository {
             .bind(&draft.method)
             .bind(&draft.url)
             .bind(&draft.request_headers)
-            .bind(&draft.request_body)
+            .bind(crate::infrastructure::mitm_sink::sanitize_pg_text_opt(
+                &draft.request_body,
+            ))
             .bind(draft.response_status)
             .bind(&draft.response_headers)
-            .bind(&draft.response_body)
+            .bind(crate::infrastructure::mitm_sink::sanitize_pg_text_opt(
+                &draft.response_body,
+            ))
             .bind(sha256)
             .bind(draft.duration_ms)
             .bind(replay_of)
