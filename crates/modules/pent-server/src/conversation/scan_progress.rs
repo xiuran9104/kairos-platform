@@ -4,6 +4,9 @@ use std::collections::{HashMap, HashSet};
 const STALL_WARNING_THRESHOLD: usize = 3;
 const STALL_STOP_THRESHOLD: usize = 8;
 const MIN_EVIDENCE_CATEGORY_DIVERSITY: usize = 2;
+/// Consecutive failures of the same tool that trigger a strategy-switch
+/// prompt (and removal of that tool from the model's catalog).
+const TOOL_FAILURE_SWITCH_THRESHOLD: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WebCoverageArea {
@@ -329,6 +332,10 @@ pub(super) struct ScanProgress {
     /// Tools that have been temporarily removed from the catalog due to
     /// consecutive failures. Cleared when any different tool succeeds.
     exhausted_tools: HashSet<String>,
+    /// Model-facing strategy-switch hints queued when a tool crosses
+    /// [`TOOL_FAILURE_SWITCH_THRESHOLD`]; drained once per round by the
+    /// runtime and pushed into `recent_messages`.
+    switch_hints: Vec<String>,
     dvwa_objective: bool,
     dvwa_require_findings: bool,
     dvwa_covered: HashSet<String>,
@@ -398,6 +405,7 @@ impl ScanProgress {
             traffic_replay_count: 0,
             consecutive_tool_failures: HashMap::new(),
             exhausted_tools: HashSet::new(),
+            switch_hints: Vec::new(),
             dvwa_objective,
             dvwa_require_findings,
             dvwa_covered: HashSet::new(),
@@ -579,7 +587,11 @@ impl ScanProgress {
                 .entry(tool_name.to_string())
                 .and_modify(|c| *c += 1)
                 .or_insert(1);
-            if *failures >= 3 {
+            if *failures == TOOL_FAILURE_SWITCH_THRESHOLD {
+                self.switch_hints
+                    .push(Self::build_switch_hint(tool_name, *failures));
+            }
+            if *failures >= TOOL_FAILURE_SWITCH_THRESHOLD {
                 self.exhausted_tools.insert(tool_name.to_string());
             }
         } else {
@@ -656,6 +668,26 @@ impl ScanProgress {
     /// removed from the model's catalog to force tool rotation.
     pub(super) fn exhausted_tools(&self) -> &HashSet<String> {
         &self.exhausted_tools
+    }
+
+    /// Drain strategy-switch hints queued since the last drain. The runtime
+    /// pushes each hint into `recent_messages` once per round so the model is
+    /// explicitly told to stop retrying the failing tool with similar
+    /// arguments.
+    pub(super) fn take_switch_hints(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.switch_hints)
+    }
+
+    /// Build the model-facing instruction emitted once when a tool hits the
+    /// consecutive-failure switch threshold.
+    fn build_switch_hint(tool_name: &str, failures: usize) -> String {
+        format!(
+            "运行时报告：工具 `{tool_name}` 已连续 {failures} 次调用失败。\
+             停止用该工具的同类参数机械重试，立即切换策略：\n\
+             - 换用其他专用工具（当前目录没有替代能力时先 tool_search 检索）；\n\
+             - 或更换 payload 家族、枚举维度、请求方法等输入面；\n\
+             - 若该路径确实不可行，转向其他攻击面，或在路径耗尽时给出有依据的 NO_PATH。"
+        )
     }
 
     /// Reject a premature NO_PATH while the last call still produced new
@@ -1225,10 +1257,46 @@ mod tests {
                 diagnostic = Some(d);
             }
         }
-        let diagnostic = diagnostic.expect("4th consecutive failure must emit diagnostic");
+        let diagnostic = diagnostic.expect("3rd consecutive failure must emit diagnostic");
         assert!(diagnostic.contains("没有产生新观察"));
         assert!(diagnostic.contains("已用工具"));
         assert_eq!(progress.consecutive_no_progress(), 3);
+    }
+
+    #[test]
+    fn third_same_tool_failure_emits_one_switch_hint_and_success_resets_it() {
+        let mut progress = ScanProgress::new("扫描 https://example.test");
+
+        for failure in 1..=2 {
+            progress.record_tool_result(
+                "sqlmap",
+                false,
+                false,
+                &format!(r#"{{"error":"failed-{failure}"}}"#),
+            );
+            assert!(progress.take_switch_hints().is_empty());
+            assert!(!progress.exhausted_tools().contains("sqlmap"));
+        }
+
+        progress.record_tool_result("sqlmap", false, false, r#"{"error":"failed-3"}"#);
+        let hints = progress.take_switch_hints();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("连续 3 次"));
+        assert!(hints[0].contains("切换策略"));
+        assert!(progress.take_switch_hints().is_empty());
+        assert!(progress.exhausted_tools().contains("sqlmap"));
+
+        progress.record_tool_result(
+            "http_request",
+            true,
+            true,
+            r#"{"status":200,"marker":"fresh-evidence"}"#,
+        );
+        assert!(progress.exhausted_tools().is_empty());
+
+        progress.record_tool_result("sqlmap", false, false, r#"{"error":"new-streak"}"#);
+        assert!(progress.take_switch_hints().is_empty());
+        assert!(!progress.exhausted_tools().contains("sqlmap"));
     }
 
     #[test]

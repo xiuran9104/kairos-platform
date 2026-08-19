@@ -200,7 +200,9 @@ impl WebCoverageLedger {
 
     pub(super) fn final_rejection(&self) -> Option<String> {
         if !self.discovery_performed {
-            return Some("尚未执行 Web 爬取、目录枚举、JS/API 收集，无法证明攻击面已经建立".into());
+            return Some("尚未执行 Web 爬取、目录枚举、JS/API 收集，无法证明攻击面已经建立；\
+                         请先调用 hakrawler/katana 或 web_crawl/dir_fuzz 建立攻击面账本，再逐项验证后 FINAL"
+                .into());
         }
         if self.endpoints.is_empty() {
             return Some(
@@ -211,7 +213,7 @@ impl WebCoverageLedger {
         let actions = self.missing_actions();
         (!actions.is_empty()).then(|| {
             format!(
-                "端点级验证仍有 {} 项未完成：{}",
+                "端点级验证仍有 {} 项未完成：{}。请按提示调用对应专项验证工具，记录阳性或阴性证据后再 FINAL",
                 actions.len(),
                 actions.into_iter().take(8).collect::<Vec<_>>().join("；")
             )

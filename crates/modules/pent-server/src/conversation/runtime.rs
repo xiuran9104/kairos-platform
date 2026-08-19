@@ -22,8 +22,8 @@ use super::{
     ConversationKnowledgeSource, ConversationModelGateway, ConversationRepository,
     ConversationToolExecutor, FindingRecorder, InlineToolExecutor, ModelToolCall, ModelTurnOutput,
     PlanStore, RoleResolver, RuntimeAgentStatus, RuntimeEnrichment, RuntimeToolCall,
-    RuntimeToolResult, SkillStore, ToolApprovalGate, ToolExecutionClass, ToolExecutionContext,
-    ToolApprovalOutcome, ToolApprovalRequest,
+    RuntimeToolResult, SkillStore, ToolApprovalGate, ToolApprovalOutcome, ToolApprovalRequest,
+    ToolExecutionClass, ToolExecutionContext,
 };
 use kairos_platform_pent_runtime::agent_loop::{
     AgentDirective, AgentLoopLimits, parse_agent_directive,
@@ -83,6 +83,12 @@ const AUTONOMOUS_LOOP_PROMPT: &str = r#"## 自主工具循环已启动
 - 浏览器操作 → mcp_navigate_page / mcp_take_screenshot（不要 curl）
 
 每次执行前先问自己：有没有专用工具能做这件事？当前目录里没有时调用 tool_search；有就用专用工具，不要用 curl/http_request 替代。
+
+## 结束条件与停止约束（FINAL/NO_PATH 前逐项自检）
+- 每个声称的漏洞必须已通过 record_finding 落库并引用 Evidence ID；无证据的结论一律降级为未验证线索。
+- 空结果、404、超时不得直接下“不存在”结论：必须换策略（换工具/换 payload 家族/换枚举维度）再验证一次。
+- 同一工具同类参数连续失败时立即停止重试，按运行时提示切换策略。
+- 确认无漏洞时也要说明覆盖了哪些攻击面、用什么证据排除。
 
 不要输出等待确认的计划、不要枚举工具列表、不要在工具调用前请求许可。"#;
 
@@ -406,7 +412,9 @@ impl ConversationRuntime {
                     let arguments = parsed
                         .get("arguments")
                         .filter(|value| value.is_object())
-                        .ok_or_else(|| anyhow::anyhow!("start_tool_execution.arguments 必须是对象"))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("start_tool_execution.arguments 必须是对象")
+                        })?
                         .to_string();
                     anyhow::ensure!(
                         super::tool_executor::has_conversation_handler(tool_name),
@@ -423,7 +431,9 @@ impl ConversationRuntime {
                         .filter(|values| !values.is_empty())
                     {
                         anyhow::ensure!(
-                            whitelist.iter().any(|value| value.as_str() == Some(tool_name)),
+                            whitelist
+                                .iter()
+                                .any(|value| value.as_str() == Some(tool_name)),
                             "当前 Agent 角色不允许后台调用工具 {tool_name}"
                         );
                     }
@@ -453,13 +463,11 @@ impl ConversationRuntime {
                                 )
                                 .await
                         }
-                        ToolApprovalOutcome::Rejected(reason) => {
-                            Ok(serde_json::json!({
-                                "error": reason,
-                                "blocked": true,
-                                "retryable": false
-                            }))
-                        }
+                        ToolApprovalOutcome::Rejected(reason) => Ok(serde_json::json!({
+                            "error": reason,
+                            "blocked": true,
+                            "retryable": false
+                        })),
                     }
                 }
                 "get_tool_execution" => {
@@ -826,9 +834,11 @@ impl ConversationRuntime {
                     scan_progress.record_traffic_replay();
                 }
 
-                let evidence_id = processed
-                    .evidence_id
-                    .or_else(|| detached.as_ref().and_then(|value| value.evidence_id.clone()));
+                let evidence_id = processed.evidence_id.or_else(|| {
+                    detached
+                        .as_ref()
+                        .and_then(|value| value.evidence_id.clone())
+                });
                 if let Some(eid) = evidence_id.as_ref() {
                     evidence_ids.push(eid.clone());
                     scan_progress.record_evidence_tool(&eid, observed_tool_name);
@@ -930,6 +940,15 @@ impl ConversationRuntime {
                                   请判断失败原因并立即改变工具或参数；如果没有可行替代路径，\
                                   返回 NO_PATH 并说明具体阻塞，不要继续机械重试。"
                         .into(),
+                    format: "text".into(),
+                });
+            }
+            // Same-tool consecutive failures: force a strategy switch.
+            for (index, hint) in scan_progress.take_switch_hints().into_iter().enumerate() {
+                context.recent_messages.push(AgentMessage {
+                    message_id: format!("runtime_switch_strategy:round_{round}:{index}"),
+                    role: "user".into(),
+                    content: hint,
                     format: "text".into(),
                 });
             }
@@ -1158,7 +1177,10 @@ impl ConversationRuntime {
             super::agent_pipeline::OrchestrationMode::Deep => Ok(None),
             super::agent_pipeline::OrchestrationMode::PlanExecute => {
                 let Some(run_id) = run_id else {
-                    return Ok(Some("plan_execute 缺少可持久化的 Run".into()));
+                    return Ok(Some(
+                        "plan_execute 缺少可持久化的 Run；请先创建或绑定 Run，再调用 plan_create 建立执行计划"
+                            .into(),
+                    ));
                 };
                 let Some(progress) = self.plan_store.progress(run_id).await? else {
                     return Ok(Some("尚未创建执行计划，请先调用 plan_create".into()));
@@ -1542,7 +1564,8 @@ impl ConversationRuntime {
                     historical.success,
                 );
                 if historical.tool_name == "skill_load" && historical.success {
-                    if let Some(name) = skill_name_from_arguments(&historical.arguments.to_string()) {
+                    if let Some(name) = skill_name_from_arguments(&historical.arguments.to_string())
+                    {
                         loaded_skills.insert(name);
                     }
                 }
@@ -2814,22 +2837,16 @@ fn skill_name_from_arguments(arguments: &str) -> Option<String> {
 
 fn required_skill_family(tool_name: &str) -> Option<(&'static str, &'static [&'static str])> {
     match tool_name {
-        "sqlmap" | "sqlmap_scan" | "sqli_validate" => {
-            Some(("SQL 注入", &["sql", "injection"]))
-        }
+        "sqlmap" | "sqlmap_scan" | "sqli_validate" => Some(("SQL 注入", &["sql", "injection"])),
         "xss_validate" | "xsser" | "web_xss_scan" | "dalfox" => Some(("XSS", &["xss"])),
         "csrf_validate" => Some(("CSRF", &["csrf"])),
         "command_injection_validate" | "commix" => {
             Some(("命令注入", &["command-injection", "command_injection"]))
         }
-        "file_inclusion_validate" => Some((
-            "文件包含",
-            &["file-inclusion", "file_inclusion", "lfi"],
-        )),
-        "file_upload_validate" => Some((
-            "文件上传",
-            &["file-upload", "file_upload", "webshell"],
-        )),
+        "file_inclusion_validate" => {
+            Some(("文件包含", &["file-inclusion", "file_inclusion", "lfi"]))
+        }
+        "file_upload_validate" => Some(("文件上传", &["file-upload", "file_upload", "webshell"])),
         _ => None,
     }
 }
@@ -2868,11 +2885,9 @@ fn skill_gate_rejection(
         let Some((family, keywords)) = required_skill_family(&call.name) else {
             continue;
         };
-        let covered = loaded_skills.iter().any(|skill| {
-            keywords
-                .iter()
-                .any(|keyword| skill.contains(keyword))
-        });
+        let covered = loaded_skills
+            .iter()
+            .any(|skill| keywords.iter().any(|keyword| skill.contains(keyword)));
         if !covered {
             return Some(format!(
                 "专项 Skill 门槛：调用 {} 前必须加载匹配的 {family} Skill。\
@@ -2926,7 +2941,10 @@ fn detached_tool_observation(
     control_tool_name: &str,
     content: &str,
 ) -> Option<DetachedToolObservation> {
-    if !matches!(control_tool_name, "get_tool_execution" | "wait_tool_execution") {
+    if !matches!(
+        control_tool_name,
+        "get_tool_execution" | "wait_tool_execution"
+    ) {
         return None;
     }
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;

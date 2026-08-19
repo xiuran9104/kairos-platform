@@ -136,7 +136,9 @@ pub fn plan_completion_rejection(progress: &PlanProgress) -> Option<String> {
 
 pub fn supervisor_completion_rejection(agents: &[RuntimeSubAgent]) -> Option<String> {
     if agents.is_empty() {
-        return Some("supervisor 尚未委派任何专业子代理".into());
+        return Some(
+            "supervisor 尚未委派任何专业子代理；请先 agent_spawn 委派专项子代理执行".into(),
+        );
     }
     let running = agents
         .iter()
