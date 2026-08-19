@@ -11,6 +11,11 @@ function statusFromEvent(event: any): string | undefined {
   if (type === 'run.failed') return 'failed';
   if (type === 'run.retry_scheduled' || type === 'run.queued') return 'queued';
   if (type === 'run.started' || type === 'run.claimed') return 'running';
+  // Only run-scoped events may update the run status. tool.executed and
+  // similar payloads carry the *tool call's* status (succeeded/failed/
+  // blocked); treating it as the run status makes a single failed tool
+  // call display the whole run as failed.
+  if (!type.startsWith('run.')) return undefined;
   try {
     const data = JSON.parse(event?.data || '{}');
     return data?.payload?.status;
