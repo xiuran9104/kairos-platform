@@ -59,14 +59,39 @@ impl ModelObservationCompactor {
         Self { max_chars }
     }
 
+    /// Compact without a call-level reference; the marker falls back to
+    /// generic Evidence read-back guidance.
     pub fn compact(self, content: &str) -> String {
+        self.compact_with_reference(content, None)
+    }
+
+    /// Head/tail double preview: keep ~2/3 of the budget from the head and
+    /// ~1/3 from the tail, and mark the omitted middle with its size, the
+    /// total size, and how to read the full response back from Evidence.
+    pub fn compact_with_reference(self, content: &str, reference: Option<&str>) -> String {
         let char_count = content.chars().count();
         if char_count <= self.max_chars {
             return content.to_string();
         }
-        let prefix: String = content.chars().take(self.max_chars).collect();
+        let head_chars = self.max_chars * 2 / 3;
+        let tail_chars = self.max_chars.saturating_sub(head_chars);
+        let head: String = content.chars().take(head_chars).collect();
+        let tail: String = content
+            .chars()
+            .skip(char_count.saturating_sub(tail_chars))
+            .collect();
+        let omitted = char_count - head_chars - tail_chars;
+        let read_back = match reference {
+            Some(reference) => format!(
+                "；该 Evidence 与本次调用关联（{reference}），可用 evidence_list 按 tool_call_id 定位，再用 evidence_view 分页回读完整正文，或用 evidence_search 搜索关键词"
+            ),
+            None => {
+                "；可用 evidence_list/evidence_search 定位对应 Evidence，再用 evidence_view 分页回读完整正文"
+                    .to_string()
+            }
+        };
         format!(
-            "{prefix}\n...[模型上下文已截断；完整原始响应已保存为 Evidence，共 {char_count} 字符]"
+            "{head}\n\n...[中间已省略 {omitted} 字符，原始输出共 {char_count} 字符；完整原始响应已保存为 Evidence{read_back}。需要完整内容时请回读 Evidence，不要凭截断内容下结论]...\n\n{tail}"
         )
     }
 }
@@ -111,7 +136,15 @@ impl ObservationProjector {
                 &item.result.content,
             ),
             normalized: item.normalized.clone(),
-            model_content: self.compactor.compact(&item.result.content),
+            // Evidence is persisted after projection, so the evidence id is
+            // not available here; reference the call itself instead.
+            model_content: self.compactor.compact_with_reference(
+                &item.result.content,
+                Some(&format!(
+                    "tool_call_id=\"{}\", tool=\"{}\"",
+                    item.call_id, item.tool_name
+                )),
+            ),
         }
     }
 }
@@ -227,7 +260,56 @@ mod tests {
         let raw = "a".repeat(DEFAULT_MODEL_OBSERVATION_CHARS + 10);
         let compact = ModelObservationCompactor::default().compact(&raw);
         assert!(compact.contains("完整原始响应已保存为 Evidence"));
-        assert!(compact.len() < raw.len() + 100);
+        assert!(compact.len() < raw.len() + 1_000);
+    }
+
+    #[test]
+    fn short_content_is_not_compacted() {
+        let raw = "短输出，不需要压缩";
+        let compact = ModelObservationCompactor::default().compact(raw);
+        assert_eq!(compact, raw);
+    }
+
+    #[test]
+    fn compacted_content_keeps_head_tail_and_marker() {
+        let raw = format!(
+            "{}{}{}",
+            "H".repeat(6_000),
+            "M".repeat(4_000),
+            "T".repeat(3_000)
+        );
+        let char_count = raw.chars().count();
+        let compact = ModelObservationCompactor::default().compact(&raw);
+        let head_chars = DEFAULT_MODEL_OBSERVATION_CHARS * 2 / 3;
+        let tail_chars = DEFAULT_MODEL_OBSERVATION_CHARS - head_chars;
+        assert!(compact.starts_with(&"H".repeat(head_chars)));
+        assert!(compact.ends_with(&"T".repeat(tail_chars)));
+        assert!(!compact.contains('M'));
+        let omitted = char_count - DEFAULT_MODEL_OBSERVATION_CHARS;
+        assert!(compact.contains(&format!("中间已省略 {omitted} 字符")));
+        assert!(compact.contains(&format!("原始输出共 {char_count} 字符")));
+        assert!(compact.contains("evidence_view"));
+        assert!(compact.contains("不要凭截断内容下结论"));
+    }
+
+    #[test]
+    fn compact_without_reference_uses_generic_read_back_guidance() {
+        let raw = "a".repeat(DEFAULT_MODEL_OBSERVATION_CHARS + 10);
+        let compact = ModelObservationCompactor::default().compact(&raw);
+        assert!(compact.contains("evidence_list/evidence_search 定位对应 Evidence"));
+        assert!(!compact.contains("tool_call_id"));
+    }
+
+    #[test]
+    fn projected_observation_marks_truncation_with_call_reference() {
+        let raw = "a".repeat(DEFAULT_MODEL_OBSERVATION_CHARS + 10);
+        let projected = ObservationProjector::default().project(&item("nmap", true, &raw));
+        assert!(
+            projected
+                .model_content
+                .contains("tool_call_id=\"call-1\", tool=\"nmap\"")
+        );
+        assert!(projected.model_content.contains("中间已省略"));
     }
 
     #[test]

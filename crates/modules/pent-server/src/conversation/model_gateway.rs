@@ -69,41 +69,6 @@ fn select_model_binding<'a>(
         .map(|(_, binding)| binding)
 }
 
-pub(crate) async fn resolve_default_chat_model(
-    pool: &PgPool,
-    tenant_id: i64,
-) -> anyhow::Result<(i64, f64, u32)> {
-    let binding: Option<(i64, f64, i32)> = sqlx::query_as(
-        "SELECT b.model_config_id, COALESCE(b.temperature, 0.7)::float8,
-                COALESCE(b.max_output_tokens, 4096)
-         FROM pent_model_role_bindings b
-         JOIN ai.model_configs m ON m.id=b.model_config_id
-         WHERE b.model_role='conversation' AND b.enabled=true
-           AND b.tenant_id IN ($1, 0)
-           AND b.project_id IN ('', '0')
-           AND m.type='chat' AND m.status=0 AND m.deleted=false
-         ORDER BY CASE WHEN b.tenant_id=$1 THEN 0 ELSE 1 END,
-                  CASE WHEN b.project_id='' THEN 0 ELSE 1 END,
-                  b.model_config_id
-         LIMIT 1",
-    )
-    .bind(tenant_id)
-    .fetch_optional(pool)
-    .await?;
-
-    binding
-        .map(|(id, temperature, max_tokens)| {
-            (
-                id,
-                temperature,
-                conversation_output_token_limit(max_tokens.max(1) as u32),
-            )
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("默认对话模型已删除或未配置，请前往“平台设置 → 基本设置”重新选择并保存")
-        })
-}
-
 impl AiModelGateway {
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -420,14 +385,31 @@ impl ConversationModelGateway for AiModelGateway {
         if let Some(compaction) = context_compaction::prepare(&api_messages, context_token_budget) {
             let fallback = context_compaction::fallback_summary(&compaction.older);
             let transcript = serde_json::to_string(&compaction.older).unwrap_or_default();
-            let summary = self.factory.chat(model_id, ChatRequest {
-                model: String::new(),
-                messages: vec![
-                    ChatMessage { role: "system".into(), content: "压缩 Agent 历史上下文。必须保留目标、授权范围、已执行动作、Evidence ID、发现、失败原因、未完成步骤和用户约束；不得虚构。只输出摘要。".into() },
-                    ChatMessage { role: "user".into(), content: transcript.chars().take(160_000).collect() },
-                ],
-                temperature: Some(0.0), max_tokens: Some(4000),
-            }).await.ok().map(|response| response.content).filter(|v| !v.trim().is_empty()).unwrap_or(fallback);
+            let summary = self
+                .factory
+                .chat(
+                    model_id,
+                    ChatRequest {
+                        model: String::new(),
+                        messages: vec![
+                            ChatMessage {
+                                role: "system".into(),
+                                content: context_compaction::SUMMARY_SYSTEM_PROMPT.into(),
+                            },
+                            ChatMessage {
+                                role: "user".into(),
+                                content: transcript.chars().take(160_000).collect(),
+                            },
+                        ],
+                        temperature: Some(0.0),
+                        max_tokens: Some(4000),
+                    },
+                )
+                .await
+                .ok()
+                .map(|response| response.content)
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or(fallback);
             api_messages = context_compaction::merge(summary, compaction);
             sanitize_tool_message_groups(&mut api_messages);
         }
