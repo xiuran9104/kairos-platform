@@ -733,6 +733,7 @@ impl ConversationRuntime {
             let mut plan_action_success = true;
             let mut plan_action_evidence = Vec::new();
             let mut plan_action_error: Option<String> = None;
+            let mut plan_step_closed: Option<(String, String)> = None;
 
             // ── Phase 3: process all results (SSE + evidence + traffic + summary) ──
             for item in &tool_results {
@@ -786,6 +787,13 @@ impl ConversationRuntime {
                 );
                 if item.tool_name == "record_finding" {
                     scan_progress.record_finding_arguments(&item.arguments, succeeded);
+                }
+                if tool_name == "plan_update"
+                    && succeeded
+                    && let Some(closed) =
+                        super::agent_pipeline::plan_terminal_update(&item.arguments)
+                {
+                    plan_step_closed = Some(closed);
                 }
                 if succeeded {
                     executed_call_signatures
@@ -951,6 +959,34 @@ impl ConversationRuntime {
                     content: hint,
                     format: "text".into(),
                 });
+            }
+            // Plan-Execute replan checkpoint: a closed or blocked step must be
+            // followed by an explicit continue / adjust / re-plan decision
+            // instead of silently rushing into the next step.
+            if orchestration == super::agent_pipeline::OrchestrationMode::PlanExecute {
+                if let Some((node_id, status)) = plan_step_closed.take() {
+                    context.recent_messages.push(AgentMessage {
+                        message_id: format!("runtime_replan_checkpoint:round_{round}"),
+                        role: "user".into(),
+                        content: format!(
+                            "重规划检查点：计划步骤 {node_id} 已标记为 {status}。推进前必须完成一次显式重规划决策：\n\
+                             1. 评估本步骤产出是否满足成功标准；新发现的端点/参数/指纹线索应固化为后续步骤（plan_create 重排或 plan_update 补充）。\n\
+                             2. 明确三选一：继续执行下一步（说明剩余计划仍然成立的依据）/ plan_update 调整后续步骤 / plan_create 重排剩余计划。\n\
+                             3. 若连续步骤无有效证据产出，优先重排计划而不是机械推进。"
+                        ),
+                        format: "text".into(),
+                    });
+                } else if plan_action.is_some() && !plan_action_success {
+                    context.recent_messages.push(AgentMessage {
+                        message_id: format!("runtime_replan_blocked:round_{round}"),
+                        role: "user".into(),
+                        content: "重规划检查点：当前计划步骤因工具执行失败被标记为 blocked。必须立即重规划：\
+                                  plan_update 将本步骤置为 ready 并换工具/换参数重试、标记 failed 后推进、\
+                                  或 plan_create 重排剩余计划。blocked 步骤悬置时普通工具会被编排闸门拒绝。"
+                            .into(),
+                        format: "text".into(),
+                    });
+                }
             }
             if let Some(diagnostic) = loop_diagnostic {
                 context.recent_messages.push(AgentMessage {

@@ -41,7 +41,7 @@ impl OrchestrationMode {
                 "编排模式为 deep：主代理负责分解目标，可按需并行委派专业子代理，并汇总可验证证据。"
             }
             Self::PlanExecute => {
-                "编排模式为 plan_execute：先形成可检查的步骤计划；每次只执行当前步骤，依据结果更新或重排剩余计划，完成后统一答复。"
+                "编排模式为 plan_execute：先形成可检查的步骤计划；每次只执行当前步骤；每步结束（plan_update 标记完成/失败/跳过，或步骤被阻塞）后必须按重规划检查点显式决策——继续、调整或 plan_create 重排，依据结果更新剩余计划，完成后统一答复。"
             }
             Self::Supervisor => {
                 "编排模式为 supervisor：主代理只负责路由、监督和汇总；专业任务优先通过 agent_spawn 委派，并用 agent_collect 收集结果。"
@@ -200,6 +200,25 @@ fn looks_like_host(token: &str) -> bool {
             .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()))
 }
 
+/// Detect a `plan_update` call that closes a step with a terminal status.
+/// Returns `(node_id, status)` so the runtime can emit a replan checkpoint
+/// forcing an explicit continue / adjust / re-plan decision before the agent
+/// moves on — the piece DesRed's Planner→Executor→Replanner loop enforces
+/// with a dedicated model call after every step.
+pub fn plan_terminal_update(arguments: &str) -> Option<(String, String)> {
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    let status = args.get("status").and_then(Value::as_str)?;
+    matches!(status, "completed" | "failed" | "skipped").then(|| {
+        (
+            args.get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            status.to_string(),
+        )
+    })
+}
+
 pub fn supervisor_completion_rejection(agents: &[RuntimeSubAgent]) -> Option<String> {
     if agents.is_empty() {
         return Some(
@@ -331,6 +350,24 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn plan_terminal_update_detects_only_step_closing_statuses() {
+        assert_eq!(
+            plan_terminal_update(r#"{"node_id":"step-2","status":"completed"}"#),
+            Some(("step-2".to_string(), "completed".to_string()))
+        );
+        assert_eq!(
+            plan_terminal_update(r#"{"node_id":"step-3","status":"failed","reason":"blocked"}"#)
+                .map(|(_, status)| status),
+            Some("failed".to_string())
+        );
+        assert_eq!(
+            plan_terminal_update(r#"{"node_id":"step-1","status":"ready"}"#),
+            None
+        );
+        assert_eq!(plan_terminal_update("not json"), None);
     }
 
     #[test]
