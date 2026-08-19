@@ -413,6 +413,57 @@ async fn applies_all_migrations_to_empty_postgres() {
         "every bootstrapped Skill must have a description"
     );
 
+    let vulnerability_playbooks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pent_skills
+         WHERE id IN (
+             'skill-seed-playbook-sqli',
+             'skill-seed-playbook-xss',
+             'skill-seed-playbook-ssrf',
+             'skill-seed-playbook-ssti',
+             'skill-seed-playbook-xxe',
+             'skill-seed-playbook-command-injection',
+             'skill-seed-playbook-path-traversal',
+             'skill-seed-playbook-file-upload',
+             'skill-seed-playbook-auth-bypass',
+             'skill-seed-playbook-idor',
+             'skill-seed-playbook-jwt',
+             'skill-seed-playbook-sensitive-info',
+             'skill-seed-playbook-directory-enum',
+             'skill-seed-playbook-open-redirect'
+         )
+           AND status = 'published'
+           AND category = 'playbook'
+           AND char_length(content) <= 12000
+           AND content LIKE '%## 触发时机%'
+           AND content LIKE '%## 探测矩阵%'
+           AND content LIKE '%## 指纹路由%'
+           AND content LIKE '%## 验证步骤（证据标准）%'
+           AND content LIKE '%## 负结果处理%'
+           AND jsonb_array_length(manifest->'required_tools') > 0
+           AND jsonb_array_length(manifest->'expected_evidence') > 0
+           AND jsonb_array_length(manifest->'constraints') > 0",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect bootstrapped vulnerability Playbooks");
+    assert_eq!(
+        vulnerability_playbooks, 14,
+        "all 14 structured vulnerability Playbooks must be published"
+    );
+
+    let searchable_sqli_playbook: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pent_skills
+         WHERE status='published'
+           AND (name ILIKE '%sqli%' OR title ILIKE '%sqli%' OR description ILIKE '%sqli%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("search bootstrapped SQL injection Playbook");
+    assert!(
+        searchable_sqli_playbook > 0,
+        "skill_list query=sqli must discover a published Playbook"
+    );
+
     let oversized_tool_catalog_policies: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pent_runtime_policies
          WHERE COALESCE((agent_config->>'tool_search_top_k')::integer, 0) <> 12",
