@@ -885,14 +885,25 @@ fn bind_ro_dir(args: &mut Vec<String>, dir: &Path) {
 }
 
 #[cfg(target_os = "linux")]
-fn bind_external_tool_runtime(args: &mut Vec<String>, program: &str) -> Result<(), String> {
-    let program = Path::new(program);
-    if program.starts_with("/usr") || program.starts_with("/opt") {
-        return Ok(());
-    }
-    let program = program
+/// Decide where an external tool's runtime must be bind-mounted, if at all.
+/// Canonicalize BEFORE the /usr|/opt shortcut: a symlinked binary
+/// (e.g. /usr/local/bin/dalfox -> /home/user/go/bin/dalfox) lives under /usr
+/// only by name — its real file is outside the wholesale /usr bind and would
+/// dangle inside the sandbox (exit 127).
+fn external_tool_bind_target(program: &Path) -> Result<Option<PathBuf>, String> {
+    let canonical = program
         .canonicalize()
         .map_err(|error| format!("无法解析工具路径 {}: {error}", program.display()))?;
+    if canonical.starts_with("/usr") || canonical.starts_with("/opt") {
+        return Ok(None);
+    }
+    Ok(Some(canonical))
+}
+
+fn bind_external_tool_runtime(args: &mut Vec<String>, program: &str) -> Result<(), String> {
+    let Some(program) = external_tool_bind_target(Path::new(program))? else {
+        return Ok(());
+    };
     let prefix = std::fs::read(&program)
         .ok()
         .filter(|bytes| bytes.starts_with(b"#!"))
@@ -1230,6 +1241,30 @@ impl WorkerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_tool_bind_target_follows_symlinks_escaping_usr() {
+        // 模拟 /usr/local/bin/dalfox -> $HOME/go/bin/dalfox 的逃逸符号链接:
+        // 名字在“类 /usr”前缀下,真实文件在其外,必须挂载真实路径。
+        let dir = std::env::temp_dir().join(format!("kairos-bind-{}", uuid::Uuid::new_v4()));
+        let real_dir = dir.join("home/user/go/bin");
+        let link_dir = dir.join("usr/local/bin");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let real = real_dir.join("dalfox");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        let link = link_dir.join("dalfox");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let target = external_tool_bind_target(&link).unwrap();
+        assert_eq!(target, Some(real.canonicalize().unwrap()));
+
+        // 真实位于 /usr 下的程序不需要额外挂载。
+        let system = external_tool_bind_target(Path::new("/usr/bin/sh")).unwrap();
+        assert_eq!(system, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn run_id_header_is_injected_for_curl_recipes_only() {
