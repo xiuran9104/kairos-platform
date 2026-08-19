@@ -63,7 +63,10 @@ pub async fn load_conversation_tool_definitions(
                         "parameters": parameters
                     }
                 });
-                tool_definition(super::tool_guidance::enhance_tool_schema(schema), execution_class)
+                tool_definition(
+                    super::tool_guidance::enhance_tool_schema(schema),
+                    execution_class,
+                )
             },
         )
         .collect::<Vec<_>>();
@@ -445,7 +448,7 @@ fn finding_tool_definitions() -> Vec<Value> {
         "type": "function",
         "function": {
             "name": "record_finding",
-            "description": "验证确认漏洞后立即写入当前 Run。必须引用支撑结论的 Evidence ID；重复的 title+target 会按 fingerprint 幂等忽略。仅记录已验证漏洞，疑似结果不要调用。",
+            "description": "验证确认漏洞后立即写入当前 Run。必须引用支撑结论的 Evidence ID；重复的 title+target 会按 fingerprint 幂等忽略。target 必须是具体 URL 或主机:端口；description 按仅看本记录即可复现的标准填写，至少说明触发点、有效 payload/动作和响应特征。仅记录已验证漏洞，疑似结果不要调用。",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
@@ -453,8 +456,8 @@ fn finding_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "title": {"type": "string", "minLength": 1, "maxLength": 500},
                     "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
-                    "target": {"type": "string", "description": "确认受影响的 URL、端点或资产"},
-                    "description": {"type": "string", "description": "简明说明验证方法、实际结果和安全影响"},
+                    "target": {"type": "string", "minLength": 1, "description": "确认受影响的具体 URL 或主机:端口"},
+                    "description": {"type": "string", "minLength": 20, "description": "按可独立复现标准说明触发点、有效 payload/动作、响应特征和安全影响"},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                     "evidence_ids": {
                         "type": "array",
@@ -744,8 +747,8 @@ mod tests {
         knowledge_search_definition, load_tools_for_intent, tool_search_definition,
         tool_search_result_names,
     };
-    use crate::conversation::tool_guidance::enhance_tool_schema;
     use crate::conversation::tool_executor::has_conversation_handler;
+    use crate::conversation::tool_guidance::enhance_tool_schema;
     use kairos_platform_pent_runtime::ports::ToolExecutionClass;
 
     #[test]

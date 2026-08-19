@@ -264,6 +264,14 @@ impl FindingProjectionState {
             }
         }
 
+        let evidence_summary = bounded_evidence_summary(&raw);
+        for finding in &mut findings {
+            let Some(description) = finding.get("description").and_then(Value::as_str) else {
+                continue;
+            };
+            finding["description"] =
+                format!("{} Evidence 摘要：{}", description.trim(), evidence_summary).into();
+        }
         findings
     }
 }
@@ -286,10 +294,8 @@ fn finding(
 }
 
 fn target(arguments: &Value, content: &Value) -> String {
-    let target = ["url", "target"]
-        .iter()
-        .find_map(|name| arguments.get(name).and_then(Value::as_str))
-        .or_else(|| content.get("url").and_then(Value::as_str))
+    let target = find_target(arguments)
+        .or_else(|| find_target(content))
         .unwrap_or_default()
         .to_string();
     if target.contains("/vulnerabilities/")
@@ -300,6 +306,35 @@ fn target(arguments: &Value, content: &Value) -> String {
         return url.to_string();
     }
     target
+}
+
+fn find_target(value: &Value) -> Option<&str> {
+    for name in ["url", "target", "endpoint"] {
+        if let Some(target) = value.get(name).and_then(Value::as_str).map(str::trim)
+            && !target.is_empty()
+        {
+            return Some(target);
+        }
+    }
+    for name in ["request", "result", "response"] {
+        if let Some(target) = value.get(name).and_then(find_target) {
+            return Some(target);
+        }
+    }
+    value
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find_map(find_target))
+}
+
+fn bounded_evidence_summary(raw: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        compact
+    } else {
+        format!("{}…", compact.chars().take(MAX_CHARS).collect::<String>())
+    }
 }
 
 fn observation_text(value: &Value) -> String {
@@ -317,11 +352,13 @@ fn scanner_confirmed_injection(tool_name: &str, raw_lower: &str) -> bool {
 }
 
 fn scanner_confirmed_xss(tool_name: &str, raw_lower: &str) -> bool {
-    matches!(tool_name, "dalfox" | "web_xss_scan" | "xss_validate" | "xsser")
-        && (raw_lower.contains("vulnerable")
-            || raw_lower.contains("verified xss")
-            || raw_lower.contains("poc:")
-            || raw_lower.contains("[v]"))
+    matches!(
+        tool_name,
+        "dalfox" | "web_xss_scan" | "xss_validate" | "xsser"
+    ) && (raw_lower.contains("vulnerable")
+        || raw_lower.contains("verified xss")
+        || raw_lower.contains("poc:")
+        || raw_lower.contains("[v]"))
 }
 
 fn contains_xss_payload(argument_lower: &str) -> bool {
@@ -349,8 +386,8 @@ fn response_contains_xss(raw_lower: &str) -> bool {
         "javascript:alert",
         "kairosxss",
     ]
-        .iter()
-        .any(|marker| raw_lower.contains(marker))
+    .iter()
+    .any(|marker| raw_lower.contains(marker))
 }
 
 fn collect_observation_text(value: &Value, output: &mut Vec<String>) {
@@ -396,20 +433,48 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["severity"], "high");
         assert_eq!(findings[0]["evidence_ids"][0], "ev-1");
+        assert!(!findings[0]["target"].as_str().unwrap().trim().is_empty());
+        assert!(
+            findings[0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Evidence 摘要")
+        );
+        assert!(findings[0]["description"].as_str().unwrap().chars().count() >= 20);
+    }
+
+    #[test]
+    fn projection_recovers_target_from_nested_result() {
+        let findings = FindingProjectionState::default().observe(
+            "sqlmap_scan",
+            r#"{}"#,
+            &json!({
+                "results":[{
+                    "url":"http://dvwa/vulnerabilities/sqli/?id=1",
+                    "stdout":"sqlmap identified the following injection point"
+                }]
+            })
+            .to_string(),
+            "ev-1",
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["target"], "http://dvwa/vulnerabilities/sqli/");
     }
 
     #[test]
     fn weak_session_requires_two_distinct_cookie_values() {
         let mut state = FindingProjectionState::default();
         let args = r#"{"url":"http://dvwa/vulnerabilities/weak_id/"}"#;
-        assert!(state
-            .observe(
-                "http-framework-test",
-                args,
-                &json!({"stdout":"Set-Cookie: dvwaSession=1; path=/"}).to_string(),
-                "ev-1"
-            )
-            .is_empty());
+        assert!(
+            state
+                .observe(
+                    "http-framework-test",
+                    args,
+                    &json!({"stdout":"Set-Cookie: dvwaSession=1; path=/"}).to_string(),
+                    "ev-1"
+                )
+                .is_empty()
+        );
         assert_eq!(
             state
                 .observe(

@@ -229,6 +229,10 @@ async fn append_event(
     Ok(())
 }
 
+/// Server-side minimum length (in characters) for a finding description, so
+/// a record stays reproducible on its own instead of being a one-line claim.
+const MIN_FINDING_DESCRIPTION_CHARS: usize = 20;
+
 /// A vulnerability extracted from the conversation transcript.
 struct FindingDraft {
     title: String,
@@ -248,10 +252,7 @@ fn finding_fingerprint(title: &str, target: &str) -> String {
                 canonical_target_scope(target)
             )
         });
-    format!(
-        "{:x}",
-        Sha256::digest(semantic_key.as_bytes())
-    )
+    format!("{:x}", Sha256::digest(semantic_key.as_bytes()))
 }
 
 fn dvwa_module_key(target: &str) -> Option<&'static str> {
@@ -308,11 +309,25 @@ fn canonical_target_scope(target: &str) -> String {
 fn normalized_vulnerability_kind(title: &str) -> String {
     let normalized = title.to_ascii_lowercase();
     let kinds = [
-        (&["command injection", "os command", "命令注入"][..], "command-injection"),
+        (
+            &["command injection", "os command", "命令注入"][..],
+            "command-injection",
+        ),
         (&["blind sql", "盲注", "盲 sql"][..], "blind-sql-injection"),
         (&["sql injection", "sql 注入"][..], "sql-injection"),
-        (&["local file inclusion", "lfi", "本地文件包含", "任意本地文件读取"][..], "file-inclusion"),
-        (&["weak session", "session id", "会话标识符"][..], "weak-session-id"),
+        (
+            &[
+                "local file inclusion",
+                "lfi",
+                "本地文件包含",
+                "任意本地文件读取",
+            ][..],
+            "file-inclusion",
+        ),
+        (
+            &["weak session", "session id", "会话标识符"][..],
+            "weak-session-id",
+        ),
         (&["stored xss", "存储型 xss"][..], "stored-xss"),
         (&["reflected xss", "反射型 xss"][..], "reflected-xss"),
         (&["dom xss", "dom-xss"][..], "dom-xss"),
@@ -321,7 +336,12 @@ fn normalized_vulnerability_kind(title: &str) -> String {
     ];
     kinds
         .into_iter()
-        .find_map(|(aliases, kind)| aliases.iter().any(|alias| normalized.contains(alias)).then_some(kind))
+        .find_map(|(aliases, kind)| {
+            aliases
+                .iter()
+                .any(|alias| normalized.contains(alias))
+                .then_some(kind)
+        })
         .map(str::to_string)
         .unwrap_or_else(|| normalized.split_whitespace().collect::<Vec<_>>().join("-"))
 }
@@ -332,8 +352,9 @@ async fn persist_finding(
     finding: &FindingDraft,
     evidence_ids: &[String],
 ) -> Result<bool, String> {
-    if evidence_ids.is_empty() {
-        return Err("漏洞记录必须至少引用一条 Evidence".to_string());
+    let issues = finding_quality_issues(finding, evidence_ids);
+    if !issues.is_empty() {
+        return Err(format!("finding 质量校验失败：{}", issues.join("；")));
     }
 
     let evidence_count: i64 =
@@ -404,37 +425,21 @@ pub(crate) async fn record_finding(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
-    if title.is_empty() {
-        return Err("title 不能为空".to_string());
-    }
-    if title.chars().count() > 500 {
-        return Err("title 不能超过 500 个字符".to_string());
-    }
     let severity = value
         .get("severity")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(
-        severity.as_str(),
-        "critical" | "high" | "medium" | "low" | "info"
-    ) {
-        return Err("severity 必须是 critical/high/medium/low/info".to_string());
-    }
     let evidence_ids = value
         .get("evidence_ids")
         .and_then(Value::as_array)
-        .ok_or_else(|| "evidence_ids 必须是非空字符串数组".to_string())?
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if evidence_ids.is_empty() {
-        return Err("evidence_ids 必须是非空字符串数组".to_string());
-    }
-
     let finding = FindingDraft {
         title: title.to_string(),
         severity,
@@ -456,6 +461,13 @@ pub(crate) async fn record_finding(
             .unwrap_or(1.0)
             .clamp(0.0, 1.0) as f32,
     };
+    let issues = finding_quality_issues(&finding, &evidence_ids);
+    if !issues.is_empty() {
+        return Err(format!(
+            "record_finding 参数校验失败：{}",
+            issues.join("；")
+        ));
+    }
     let fingerprint = finding_fingerprint(&finding.title, &finding.target);
     let inserted = persist_finding(pool, run_id, &finding, &evidence_ids).await?;
     Ok(json!({
@@ -511,7 +523,7 @@ pub(crate) async fn extract_and_persist_findings(
                 messages: vec![
                     ChatMessage {
                         role: "system".into(),
-                        content: "你是渗透测试漏洞提取器。从下面的渗透测试对话记录中提取所有「已确认」的漏洞，只输出 JSON 数组。每个元素字段：title（漏洞名）、severity（只能是 critical/high/medium/low/info）、target（目标 URL 或端点）、description（一句话证据）、confidence（0~1 浮点数）。没有漏洞时输出 []。只输出 JSON，不要任何解释。".into(),
+                        content: "你是渗透测试漏洞提取器。从下面的渗透测试对话记录中提取所有「已确认」的漏洞，只输出 JSON 数组。每个元素字段：title（漏洞名）、severity（只能是 critical/high/medium/low/info）、target（必填，具体 URL 或主机:端口）、description（至少 20 字符，必须写清触发点、有效 payload/动作、响应特征与影响，使记录可独立复现）、confidence（0~1 浮点数）。缺少具体目标或复现证据的线索不要输出；没有合格漏洞时输出 []。只输出 JSON，不要任何解释。".into(),
                     },
                     ChatMessage {
                         role: "user".into(),
@@ -568,6 +580,35 @@ pub(crate) async fn extract_and_persist_findings(
     Ok(inserted)
 }
 
+fn finding_quality_issues(finding: &FindingDraft, evidence_ids: &[String]) -> Vec<String> {
+    let mut issues = Vec::new();
+    let title_chars = finding.title.trim().chars().count();
+    if title_chars == 0 {
+        issues.push("title 不能为空".to_string());
+    } else if title_chars > 500 {
+        issues.push("title 不能超过 500 个字符".to_string());
+    }
+    if !matches!(
+        finding.severity.as_str(),
+        "critical" | "high" | "medium" | "low" | "info"
+    ) {
+        issues.push("severity 必须是 critical/high/medium/low/info".to_string());
+    }
+    if finding.target.trim().is_empty() {
+        issues.push("target 不能为空，必须是具体 URL 或主机:端口".to_string());
+    }
+    let description_chars = finding.description.trim().chars().count();
+    if description_chars < MIN_FINDING_DESCRIPTION_CHARS {
+        issues.push(format!(
+            "description 至少需要 {MIN_FINDING_DESCRIPTION_CHARS} 个字符，且应包含触发点、payload/动作和响应特征（当前 {description_chars}）"
+        ));
+    }
+    if evidence_ids.is_empty() {
+        issues.push("evidence_ids 必须是非空字符串数组".to_string());
+    }
+    issues
+}
+
 fn parse_findings_json(content: &str) -> Vec<FindingDraft> {
     let mut text = content.trim();
     if text.starts_with("```") {
@@ -611,7 +652,7 @@ fn parse_findings_json(content: &str) -> Vec<FindingDraft> {
                 .map(|s| s.to_ascii_lowercase())
                 .filter(|s| matches!(s.as_str(), "critical" | "high" | "medium" | "low" | "info"))
                 .unwrap_or_else(|| "info".to_string());
-            Some(FindingDraft {
+            let finding = FindingDraft {
                 title,
                 severity,
                 target: item
@@ -631,7 +672,13 @@ fn parse_findings_json(content: &str) -> Vec<FindingDraft> {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.5)
                     .clamp(0.0, 1.0) as f32,
-            })
+            };
+            // Terminal extraction is a safety net, not a license to create
+            // incomplete claims. Only pass drafts that satisfy the same
+            // target/description contract as explicit record_finding calls.
+            finding_quality_issues(&finding, &["terminal-extraction".into()])
+                .is_empty()
+                .then_some(finding)
         })
         .collect()
 }
@@ -656,14 +703,58 @@ mod tests {
     #[test]
     fn fingerprints_keep_distinct_dvwa_modules_separate() {
         assert_ne!(
-            finding_fingerprint(
-                "DVWA finding",
-                "http://127.0.0.1:18080/vulnerabilities/fi/"
-            ),
+            finding_fingerprint("DVWA finding", "http://127.0.0.1:18080/vulnerabilities/fi/"),
             finding_fingerprint(
                 "DVWA finding",
                 "http://127.0.0.1:18080/vulnerabilities/exec/"
             )
         );
+    }
+
+    fn draft(target: &str, description: &str) -> FindingDraft {
+        FindingDraft {
+            title: "SQL Injection".into(),
+            severity: "high".into(),
+            target: target.into(),
+            description: description.into(),
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn finding_quality_reports_missing_target_and_short_description_together() {
+        let issues = finding_quality_issues(&draft("", "too short"), &[]);
+        assert_eq!(issues.len(), 3);
+        assert!(issues.iter().any(|issue| issue.contains("target 不能为空")));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("description 至少"))
+        );
+        assert!(issues.iter().any(|issue| issue.contains("evidence_ids")));
+    }
+
+    #[test]
+    fn finding_quality_accepts_reproducible_record() {
+        let issues = finding_quality_issues(
+            &draft(
+                "https://shop.test/api/users?id=1",
+                "参数 id 使用 payload 1 OR 1=1 后返回多条用户记录，确认存在 SQL 注入。",
+            ),
+            &["ev-1".into()],
+        );
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn terminal_extraction_drops_incomplete_findings() {
+        let findings = parse_findings_json(
+            r#"[
+                {"title":"SQLi","severity":"high","target":"","description":"confirmed","confidence":1},
+                {"title":"XSS","severity":"medium","target":"https://shop.test/search","description":"搜索参数反射 payload <svg/onload=alert(1)>，响应保留事件处理器并可执行。","confidence":0.9}
+            ]"#,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "XSS");
     }
 }
