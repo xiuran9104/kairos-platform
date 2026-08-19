@@ -813,8 +813,8 @@ impl ScanProgress {
         {
             return Some(
                 "FINAL 包含“已验证/确认存在/验证成功”等事实性漏洞结论，但没有引用本 Run \
-                 的 Evidence ID。请逐项引用真实 Evidence（如 ev-xxx）；没有充分证据的内容\
-                 必须降级为未验证线索。"
+                 的 Evidence ID。请逐项引用工具结果中返回的完整 Evidence ID（UUID 全称，\
+                 不得缩写、改写或加前缀）；没有充分证据的内容必须降级为未验证线索。"
                     .into(),
             );
         }

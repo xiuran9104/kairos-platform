@@ -823,11 +823,17 @@ recipes:
   parameters:
   - name: target
     type: string
-    description: 目标 IP 或主机名
+    description: 目标 IP 或主机名（仅填写目标本身，不要在此字段拼接 -p 等扫描参数）
     required: true
     target: true
     position: 4
     format: positional
+  - name: ports
+    type: string
+    description: 可选的端口范围，例如 80,443 或 1-1000
+    required: false
+    flag: -p
+    format: flag
 - tool_id: sqlmap_scan
   version: 1.0.0
   manifest_version: 1
