@@ -623,7 +623,7 @@ fn agent_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent_spawn",
-                "description": "派生子代理并行扫描独立目标或子任务。每个子代理独立运行工具循环，完成后结果通过 agent_collect 获取。适用于多目标并行扫描或多漏洞类型并行验证。",
+                "description": "派生子代理并行扫描独立目标或子任务。每个子代理独立运行工具循环，完成后结果通过 agent_collect 获取。适用于多目标并行扫描或多漏洞类型并行验证。子代理不继承父上下文：委派必须自洽，prompt 需写明具体目标（或用 target 字段）、要验证的漏洞类型/动作与成功标准，交接包不完整会被拒绝。",
                 "parameters": {
                     "type": "object",
                     "required": ["description", "prompt"],

@@ -2138,6 +2138,10 @@ impl ConversationRuntime {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&description)
             .to_string();
+        // Validate against the caller-supplied prompt before any role prefix
+        // is prepended, so a bare description cannot inherit substance from
+        // the role instruction.
+        let handoff_prompt = prompt.clone();
         let role = args
             .get("role")
             .and_then(serde_json::Value::as_str)
@@ -2161,6 +2165,19 @@ impl ConversationRuntime {
             .get("target")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+
+        if let Some(rejection) = super::agent_pipeline::delegation_handoff_rejection(
+            &description,
+            &handoff_prompt,
+            target.as_deref(),
+        ) {
+            return super::tool_executor::ConversationToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "agent_spawn".into(),
+                content: serde_json::json!({"error": rejection}).to_string(),
+                success: false,
+            };
+        }
 
         let active = agent_session.active_count().await;
         let max_concurrent = std::env::var("PENTA_MAX_AGENTS")

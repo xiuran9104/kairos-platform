@@ -134,6 +134,72 @@ pub fn plan_completion_rejection(progress: &PlanProgress) -> Option<String> {
     })
 }
 
+/// Minimum prompt length for a delegation handoff. Shorter prompts almost
+/// never carry the action, verification method and success criteria a
+/// sub-agent needs to act without guessing.
+const MIN_DELEGATION_PROMPT_CHARS: usize = 40;
+
+/// Validate that an `agent_spawn` delegation carries an actionable handoff
+/// package: a concrete target (inline URL/IP/domain, or the explicit `target`
+/// field) plus a substantive task description. Sub-agents run without parent
+/// context, so a vague delegation makes them guess targets instead of
+/// executing — this mirrors DesRed's "return the missing-info list instead of
+/// guessing" rule, enforced at the spawn boundary.
+pub fn delegation_handoff_rejection(
+    description: &str,
+    prompt: &str,
+    target: Option<&str>,
+) -> Option<String> {
+    let mut missing = Vec::new();
+    if prompt.trim().chars().count() < MIN_DELEGATION_PROMPT_CHARS {
+        missing.push("任务描述过短（需说明要执行的验证动作与成功标准）");
+    }
+    let has_inline_target =
+        contains_concrete_target(description) || contains_concrete_target(prompt);
+    if target.map(str::trim).unwrap_or_default().is_empty() && !has_inline_target {
+        missing.push("缺少具体目标（URL、IP 或域名；也可用 target 字段单独传入）");
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "委派交接包不完整：{}。子代理不继承父上下文，禁止猜测目标；请补齐后重试。\
+             示例：target=\"http://host/login\"，prompt 写明要验证的漏洞类型、使用的工具与成功标准（怎样的证据算确认）",
+            missing.join("；")
+        ))
+    }
+}
+
+fn contains_concrete_target(text: &str) -> bool {
+    if text.contains("http://") || text.contains("https://") {
+        return true;
+    }
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':'))
+        .any(|token| looks_like_host(token.trim_matches(['.', ':'])))
+}
+
+fn looks_like_host(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let host = token.split(':').next().unwrap_or(token);
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() == 4
+        && labels
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
+    labels.len() >= 2
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        && labels
+            .last()
+            .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()))
+}
+
 pub fn supervisor_completion_rejection(agents: &[RuntimeSubAgent]) -> Option<String> {
     if agents.is_empty() {
         return Some(
@@ -216,6 +282,53 @@ mod tests {
                 failed: 1,
                 ..Default::default()
             })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn delegation_handoff_requires_substance_and_concrete_target() {
+        // 过短 + 无目标:两个缺失一起报
+        let rejection =
+            delegation_handoff_rejection("扫描一下", "继续测试", None).expect("must reject");
+        assert!(rejection.contains("任务描述过短"));
+        assert!(rejection.contains("缺少具体目标"));
+
+        // 引用了"主目标"但无具体目标:拒绝(禁止猜测)
+        assert!(
+            delegation_handoff_rejection(
+                "验证 SQL 注入",
+                "对主目标登录接口验证 SQL 注入,记录证据",
+                None,
+            )
+            .is_some()
+        );
+
+        // target 字段单独传入即可满足目标要求
+        assert!(
+            delegation_handoff_rejection(
+                "验证登录接口 SQL 注入",
+                "使用 sqlmap_scan 对登录接口 username 参数做只读验证,稳定差异即确认",
+                Some("http://target.local/login"),
+            )
+            .is_none()
+        );
+
+        // prompt 内联 URL / IP 也算具体目标
+        assert!(
+            delegation_handoff_rejection(
+                "枚举目录",
+                "对 https://shop.example.com/admin 做低速定向字典枚举,先建立 404 基线",
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            delegation_handoff_rejection(
+                "端口复核",
+                "对 10.0.0.8:8080 的 HTTP 服务做指纹复核，验证常见管理端点并记录响应证据",
+                None,
+            )
             .is_none()
         );
     }
