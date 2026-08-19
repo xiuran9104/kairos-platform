@@ -1302,7 +1302,7 @@ async fn get_tool_call_result(
         "total_lines": total_lines,
         "total_pages": total_pages,
         "lines": lines,
-        "redacted": true,
+        "redacted": !redaction_disabled(),
     }))))
 }
 
@@ -2953,6 +2953,9 @@ async fn get_traffic(
     .map_err(|e| AppError::internal(e.to_string()))?
     .ok_or_else(|| AppError::not_found("not found"))?;
     let mut sanitized = v.clone();
+    if redaction_disabled() {
+        return Ok(Json(ApiResponse::new(sanitized)));
+    }
     if let Some(obj) = sanitized.as_object_mut() {
         for field in ["request_body", "response_body"] {
             if let Some(text) = obj.get(field).and_then(Value::as_str) {
@@ -3171,8 +3174,24 @@ async fn download_artifact(
         .unwrap())
 }
 
+/// Sensitive-field redaction is on by default. Set `PENTA_REDACT_SENSITIVE=false`
+/// (single-operator / lab deployments) to return full Authorization/Cookie/
+/// token material in evidence, traffic and report views. Redaction is applied
+/// at read time only, so stored data is always complete either way.
+pub(crate) fn redaction_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("PENTA_REDACT_SENSITIVE")
+            .map(|value| matches!(value.trim(), "false" | "0" | "off" | "no"))
+            .unwrap_or(false)
+    })
+}
+
 /// Filter sensitive data (tokens, passwords, keys) from evidence text.
 pub(crate) fn sanitize_sensitive_data(text: &str) -> String {
+    if redaction_disabled() {
+        return text.to_string();
+    }
     let patterns: &[(&str, &str)] = &[
         ("Authorization", "Authorization: ***REDACTED***"),
         ("Cookie", "Cookie: ***REDACTED***"),

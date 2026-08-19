@@ -26,6 +26,7 @@
 | `PENTA_SANDBOX_ALLOWED_ROOTS` | 否 | 无 | 额外允许读写挂载到沙箱的绝对目录，逗号分隔 |
 | `PENTA_TOOL_DIR` | 否 | `~/.kairos/tools/bin` | 受控工具目录，pent-agent 启动时把 PATH 上发现的工具软链至此，并只读挂载进沙箱、前置到沙箱 PATH |
 | `PENTA_TRAFFIC_CAPTURE` | 否 | `true` | 启用任务 HTTP/HTTPS MITM 流量记录；仅显式设为 `false`/`0`/`no`/`off` 时关闭 |
+| `PENTA_REDACT_SENSITIVE` | 否 | `true` | 证据/流量/报告读取视图对 Authorization、Cookie、Token、密钥等敏感字段脱敏；设为 `false`/`0`/`off`/`no` 返回全量原文（仅限单人自用环境）。脱敏只在读取时发生，库存储始终完整 |
 | `PENTA_TRAFFIC_PROXY` | 否 | `http://127.0.0.1:8085` | pent-agent 内置 MITM 的本地 IPv4 代理地址 |
 | `PENTA_FORCE_WEB_PROXY` | 否 | `true` | 为 Web 工具启用 ProxyChains 连接拦截；启用时缺少运行库会使 pent-agent 拒绝启动 |
 | `PENTA_PROXYCHAINS_LIBRARY` | 否 | 自动探测 | 自定义 `libproxychains.so.4` 绝对路径 |
