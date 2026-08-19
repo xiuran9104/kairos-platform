@@ -136,6 +136,10 @@ impl AgentOrchestrator {
         self.loop_engine.record_tool_result(success, effective);
     }
 
+    pub fn record_policy_block(&mut self) {
+        self.loop_engine.record_policy_block();
+    }
+
     pub fn directive(&self, content: &str) -> AgentDirective {
         parse_agent_directive(content)
     }

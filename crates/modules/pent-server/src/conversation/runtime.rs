@@ -829,14 +829,26 @@ impl ConversationRuntime {
                     }
                 }
                 let effective_observation = processed.effective_observation;
-                runner.record_tool_result(succeeded, effective_observation);
-                if let Some(diagnostic) = scan_progress.record_tool_result(
-                    observed_tool_name,
-                    succeeded,
-                    effective_observation,
-                    observed_content,
-                ) {
-                    loop_diagnostic = Some(diagnostic);
+                // Policy-blocked calls (orchestration gate, approval reject)
+                // are not target failures: they must not feed the stall or
+                // same-tool-failure counters, otherwise gate friction alone
+                // can exhaust the run before any real tool executes.
+                let policy_blocked = serde_json::from_str::<serde_json::Value>(observed_content)
+                    .ok()
+                    .and_then(|value| value.get("blocked").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(false);
+                if policy_blocked {
+                    runner.record_policy_block();
+                } else {
+                    runner.record_tool_result(succeeded, effective_observation);
+                    if let Some(diagnostic) = scan_progress.record_tool_result(
+                        observed_tool_name,
+                        succeeded,
+                        effective_observation,
+                        observed_content,
+                    ) {
+                        loop_diagnostic = Some(diagnostic);
+                    }
                 }
                 if tool_name == "traffic_replay" && succeeded {
                     scan_progress.record_traffic_replay();

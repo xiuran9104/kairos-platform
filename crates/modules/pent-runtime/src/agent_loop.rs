@@ -201,6 +201,14 @@ impl AgentLoopEngine {
             self.state.consecutive_failures = self.state.consecutive_failures.saturating_add(1);
         }
     }
+
+    /// A policy-blocked call is neither progress nor failure: the agent was
+    /// stopped by an orchestration/approval gate, not by the target. Count
+    /// the call but leave the stall streak untouched so gate friction (e.g.
+    /// plan_execute rejecting batched parallel calls) cannot exhaust the run.
+    pub fn record_policy_block(&mut self) {
+        self.state.tool_call_count = self.state.tool_call_count.saturating_add(1);
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +257,18 @@ mod tests {
         assert_eq!(engine.checkpoint().effective_observations, 1);
         assert_eq!(engine.checkpoint().consecutive_failures, 0);
         engine.begin_round(0).unwrap();
+    }
+
+    #[test]
+    fn policy_blocks_do_not_count_toward_stall() {
+        let mut engine = AgentLoopEngine::new(limits());
+        for _ in 0..5 {
+            engine.record_policy_block();
+        }
+        // 5 blocked calls with stall_limit 2 must not trigger Stalled.
+        engine.begin_round(0).unwrap();
+        assert_eq!(engine.checkpoint().tool_call_count, 5);
+        assert_eq!(engine.checkpoint().consecutive_failures, 0);
     }
 
     #[test]

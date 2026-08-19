@@ -393,6 +393,12 @@ impl AgentRunner {
         self.orchestrator.record_tool_result(success, effective);
     }
 
+    /// Forward policy-block accounting: counts the call without touching the
+    /// stall streak. See `AgentLoopEngine::record_policy_block`.
+    pub fn record_policy_block(&mut self) {
+        self.orchestrator.record_policy_block();
+    }
+
     pub fn directive(&self, content: &str) -> AgentDirective {
         self.orchestrator.directive(content)
     }
