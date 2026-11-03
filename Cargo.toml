@@ -45,7 +45,7 @@ bcrypt = "0.17"
 axum = { version = "0.8", features = ["multipart"] }
 calamine = "0.36"
 chrono = { version = "0.4", features = ["serde"] }
-jsonwebtoken = "9.3"
+jsonwebtoken = "10.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 futures-util = "0.3"
 hex = "0.4"
